@@ -1,0 +1,9 @@
+# configuration for linters and project
+[project]
+name = "nuclei-serverless-app"
+dependencies = [
+    "chalice",
+    "pytest",
+    "requests"
+]
+version = "0.1"
