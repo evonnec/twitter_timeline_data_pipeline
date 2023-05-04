@@ -2,8 +2,10 @@
 [project]
 name = "nuclei-serverless-app"
 dependencies = [
+    "boto3",
     "chalice",
     "pytest",
-    "requests"
+    "requests",
+    "python-twitter-v2"
 ]
 version = "0.1"
