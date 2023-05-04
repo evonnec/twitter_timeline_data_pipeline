@@ -1,7 +1,6 @@
 import os
 import time
 import requests
-from requests.auth import HTTPBasicAuth
 from pytwitter import Api
 import argparse
 
@@ -93,7 +92,6 @@ def get_tweets(tweet_id):
         resp_data = r.json()
     except Exception as e:
         print('error', str(e))
-        print(resp_data)
     return resp_data
     
 dTweets = dict()
@@ -102,7 +100,7 @@ for item in timeline_response.data:
     tweet_id = item.id
     tweet_text = item.text
     tweet_params = get_tweets(tweet_id)
-    dTweets[tweet_id] = [tweet_text] # add tweet_params
+    dTweets[tweet_id] = [tweet_text] # TODO: add tweet_params
 
         
 # next: `created_at`, `text`, `referenced_tweets` , `media`, 
