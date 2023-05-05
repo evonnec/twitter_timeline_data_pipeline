@@ -89,6 +89,8 @@ if __name__ == 'main':
 # set up Lambda: set up basic deploy with Chalice --> [REST done]
 # SQS --> [SQS created, SQS Chalice in progress]
 # S3 --> [S3 created, S3 Chalice in progress]
-# metadata goes to dynamo db, media to S3.
 # i.e. get the Chalice readme working
+# create cloudformation for dyanamo db set up with table.
+# create a schema in source code for dyanmo db.
+# metadata goes to dynamo db, media to S3.
 # keep work commited in git
