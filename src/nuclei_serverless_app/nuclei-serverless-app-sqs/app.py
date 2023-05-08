@@ -1,4 +1,5 @@
 from chalice import Chalice
+import boto3
 
 app = Chalice(app_name='nuclei-serverless-app-sqs')
 
@@ -14,3 +15,6 @@ Returns:
 def handler_sqs(event):
     for record in event:
         print("Message body: %s" % record.body)
+        
+        
+# https://boto3.amazonaws.com/v1/documentation/api/latest/guide/sqs.html
