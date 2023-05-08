@@ -77,19 +77,25 @@ def collect_tweets(resp: dict) -> dict:
         tweet_params = get_tweet(tweet_id)
         d_tweets[tweet_id] = [tweet_params]
         time.sleep(1)
-    
+        # instead of sleep, perhaps use retries
+        # https://stackoverflow.com/questions/15431044/can-i-set-max-retries-for-requests-request
+        # https://boto3.amazonaws.com/v1/documentation/api/latest/guide/retries.html
+        
     return d_tweets
 
 if __name__ == 'main':
-    collect_tweets(timeline_response)
-        
+    dynamo_client = boto3.client('dynamodb')
+    # DynamoDB.Client.batch_execute_statement(**kwargs)
+    dynamo_client.batch_write_item(collect_tweets(timeline_response))        
+
+
 # next: `created_at`, `text`, `referenced_tweets` , `media`, [done]
 # use perhaps a get_tweet or similar function on each of the tweets [done]
 # then: after pull of twitter data is working 
 # set up Lambda: set up basic deploy with Chalice --> [REST done]
-# SQS --> [SQS created, SQS Chalice in progress]
-# S3 --> [S3 created, S3 Chalice in progress]
-# i.e. get the Chalice readme working
+# SQS --> [SQS created, SQS Chalice] [done]
+# S3 --> [S3 created, S3 Chalice] [done]
+# i.e. get the Chalice readme working [done]
 # create cloudformation for dyanamo db set up with table.
 # create a schema in source code for dyanmo db.
 # metadata goes to dynamo db, media to S3.
