@@ -1,5 +1,6 @@
 #!/bin/bash
 S3_BUCKET=twitter-media.nuclei-serverless-app
+aws s3 mb s3://$S3_BUCKET
 #declare S3 bucket
 chalice package --merge-template resources.yaml out/
 #create sam.yaml and additional artifacts in out/ folder

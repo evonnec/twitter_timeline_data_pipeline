@@ -1,9 +1,11 @@
 import time
 import requests
+import boto3
 from pytwitter import Api
 import argparse
 import access_twitter
 
+print("HERE1")
 twitter_access_token = access_twitter.get_twitter_secret()['twitter_access_token']
 
 twitter_api = Api(bearer_token=twitter_access_token)
@@ -83,10 +85,12 @@ def collect_tweets(resp: dict) -> dict:
         
     return d_tweets
 
-if __name__ == 'main':
+if __name__ == '__main__':
     dynamo_client = boto3.client('dynamodb')
     # DynamoDB.Client.batch_execute_statement(**kwargs)
-    dynamo_client.batch_write_item(collect_tweets(timeline_response))        
+    tweet_data = collect_tweets(timeline_response)
+    print(tweet_data)
+    # dynamo_client.batch_write_item(tweet_data)        
 
 
 # next: `created_at`, `text`, `referenced_tweets` , `media`, [done]
