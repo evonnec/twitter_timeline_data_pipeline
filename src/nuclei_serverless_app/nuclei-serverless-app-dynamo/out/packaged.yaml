@@ -1,0 +1,175 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Globals:
+  Function:
+    Environment:
+      Variables:
+        TABLE_NAME:
+          Ref: TweetsTable
+Outputs:
+  APIHandlerArn:
+    Value:
+      Fn::GetAtt:
+      - APIHandler
+      - Arn
+  APIHandlerName:
+    Value:
+      Ref: APIHandler
+  EndpointURL:
+    Value:
+      Fn::Sub: https://${RestAPI}.execute-api.${AWS::Region}.${AWS::URLSuffix}/api/
+  RestAPIId:
+    Value:
+      Ref: RestAPI
+Resources:
+  APIHandler:
+    Properties:
+      CodeUri: s3://twitter-media.nuclei-serverless-app/d30e5f33c98b7971c9bc0dd50ced972b
+      Handler: app.app
+      MemorySize: 128
+      Role:
+        Fn::GetAtt:
+        - DefaultRole
+        - Arn
+      Runtime: python3.9
+      Tags:
+        aws-chalice: version=1.28.0:stage=dev:app=nuclei-serverless-app-dynamo
+      Timeout: 60
+      Tracing: PassThrough
+    Type: AWS::Serverless::Function
+  APIHandlerInvokePermission:
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName:
+        Ref: APIHandler
+      Principal: apigateway.amazonaws.com
+      SourceArn:
+        Fn::Sub:
+        - arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${RestAPIId}/*
+        - RestAPIId:
+            Ref: RestAPI
+    Type: AWS::Lambda::Permission
+  DefaultRole:
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Action: sts:AssumeRole
+          Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Sid: ''
+        Version: '2012-10-17'
+      Policies:
+      - PolicyDocument:
+          Statement:
+          - Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            Effect: Allow
+            Resource: arn:*:logs:*:*:*
+          Version: '2012-10-17'
+        PolicyName: DefaultRolePolicy
+    Type: AWS::IAM::Role
+  DynamoDBAccess:
+    Properties:
+      PolicyDocument:
+        Statement:
+        - Action:
+          - dynamodb:PutItem
+          - dynamodb:GetItem
+          Effect: Allow
+          Resource:
+            Fn::Sub: arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TweetsTable}
+        Version: '2012-10-17'
+      PolicyName: AddDDBAccess
+      Roles:
+      - Ref: DefaultRole
+    Type: AWS::IAM::Policy
+  RestAPI:
+    Properties:
+      DefinitionBody:
+        definitions:
+          Empty:
+            title: Empty Schema
+            type: object
+        info:
+          title: nuclei-serverless-app-dynamo
+          version: '1.0'
+        paths:
+          /item/{id}:
+            get:
+              consumes:
+              - application/json
+              parameters:
+              - in: path
+                name: id
+                required: true
+                type: string
+              produces:
+              - application/json
+              responses:
+                '200':
+                  description: 200 response
+                  schema:
+                    $ref: '#/definitions/Empty'
+              x-amazon-apigateway-integration:
+                contentHandling: CONVERT_TO_TEXT
+                httpMethod: POST
+                passthroughBehavior: when_no_match
+                responses:
+                  default:
+                    statusCode: '200'
+                type: aws_proxy
+                uri:
+                  Fn::Sub: arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${APIHandler.Arn}/invocations
+            put:
+              consumes:
+              - application/json
+              parameters:
+              - in: path
+                name: id
+                required: true
+                type: string
+              produces:
+              - application/json
+              responses:
+                '200':
+                  description: 200 response
+                  schema:
+                    $ref: '#/definitions/Empty'
+              x-amazon-apigateway-integration:
+                contentHandling: CONVERT_TO_TEXT
+                httpMethod: POST
+                passthroughBehavior: when_no_match
+                responses:
+                  default:
+                    statusCode: '200'
+                type: aws_proxy
+                uri:
+                  Fn::Sub: arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${APIHandler.Arn}/invocations
+        schemes:
+        - https
+        swagger: '2.0'
+        x-amazon-apigateway-binary-media-types:
+        - application/octet-stream
+        - application/x-tar
+        - application/zip
+        - audio/basic
+        - audio/ogg
+        - audio/mp4
+        - audio/mpeg
+        - audio/wav
+        - audio/webm
+        - image/png
+        - image/jpg
+        - image/jpeg
+        - image/gif
+        - video/ogg
+        - video/mpeg
+        - video/webm
+      EndpointConfiguration: EDGE
+      StageName: api
+    Type: AWS::Serverless::Api
+  TweetsTable:
+    Type: AWS::Serverless::SimpleTable
+Transform: AWS::Serverless-2016-10-31
