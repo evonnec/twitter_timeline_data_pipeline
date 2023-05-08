@@ -4,10 +4,11 @@ name = "nuclei-serverless-app"
 dependencies = [
     "boto3",
     "chalice",
-    "chalice[cdkv2]",
+    # "chalice[cdkv2]",
     "pytest",
     "requests",
     "python-twitter-v2",
-    "awscli"
+    "awscli",
+    "httpie"
 ]
 version = "0.1"
