@@ -102,7 +102,7 @@ Resources:
               - application/json
               parameters:
               - in: path
-                tweet_metadata: id
+                name: id
                 required: true
                 type: string
               produces:
@@ -127,7 +127,7 @@ Resources:
               - application/json
               parameters:
               - in: path
-                tweet_metadata: id
+                name: id
                 required: true
                 type: string
               produces:

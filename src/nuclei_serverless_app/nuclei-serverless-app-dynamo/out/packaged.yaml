@@ -23,7 +23,7 @@ Outputs:
 Resources:
   APIHandler:
     Properties:
-      CodeUri: s3://twitter-media.nuclei-serverless-app/d30e5f33c98b7971c9bc0dd50ced972b
+      CodeUri: s3://twitter-media.nuclei-serverless-app/da1e41e8d1908312635333ac1d3a0f67
       Handler: app.app
       MemorySize: 128
       Role:

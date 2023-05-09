@@ -1,19 +1,26 @@
-Nuclei Take home
+Nuclei Take Home: Serverless App
 ================
 
 Status
 ------
 
 * What is working
-    * If we follow the instructions below, we have a lambda service which creates a   DynamoDB table, and provides endpoints for modifying and retrieving data from that table
-    * A local script which can collect tweet information 
-    * Secrets management - we use the AWS secrets management service to store and provide the Twitter Bearer token
-* What is work in progress
-    * Push tweet data and media to AWS
+    * If we follow the instructions below, we have a lambda service which 
+        * creates a DynamoDB Table with a schema of `id: metadata`
+        * provides endpoints for modifying and retrieving data from that table
+    * A local python script which can use the bearer token provided to 
+        * call the Twitter API, 
+        * request the last tweets from a user's timeline
+        * collect tweet information from each of those last tweets from a user's timeline
+        * take in a user as an argument
+        * Push tweet media if it exists to S3
+    * Provides a way to store the Twitter API bearer token in AWS Secrets Manager such that it can be pulled by the service created
+* What is currently work in progress
+    * Push tweet metadata
+    * Push to SQS queue
 * What is not yet started
-    * Get all historic tweet information (not clear if this is a requirement)
-    * Creating an SQS queue
-    * Put tweet media into S3
+    * Get all historic tweet information (unclear if this is a requirement)
+    * Put Tweet Media into S3 from SQS Queue
     * Add tests
     * Some way of making sure that we don't add duplicate tweet information
 
@@ -23,12 +30,13 @@ Decisions made
 Tooling:
 
 * Chalice
-    * I am familiar with Python and Flask, and this is a small and simple tool.
     * Chose to use ``chalice package`` as it seems like the simplest way to add resources using CloudFormation
+* python: requests and python-twitter-v2 used. not enough time to figure out attachments, includes, media from python-twitter-v2.
+* toml for easy virtual env set up
 
-## Deploy the App
+# Deploy the App
 
-### Create a virtual environment
+## Create a virtual environment
 
 * Run:
 - ```python3 -m venv nuceli```  -- to create the python virtual environment  
@@ -36,52 +44,55 @@ Tooling:
   
 Do ```pip install -e .```
 
-### Create an S3 bucket
+Do ```aws configure``` to set up AWS credentials
 
-* Create an S3 bucket
-    * I did this in the AWS CLI but if I had some time I would automate that in a different way
+## Create the AWS secret for the Twitter API token
 
-    ```
-    aws s3 mb s3://twitter-media.nuclei-serverless-app
-    ```
+We do this by creating the bearer token secret in AWS Secrets Manager.  
+Go to `create_bearer_token_secret.sh` and export the bearer token in the terminal or enter into the script prior to running.
 
-### Create the AWS stack
+## Create the AWS stack
 
-This currently brings up a Lambda service and a DyanmoDB table.
+This currently:
+- brings up a Lambda service
+- a DyanmoDB table with GET and PUT endpoints
+- makes a S3 bucket
 
 - ```chmod +x deploy.sh``` in `src/nuclei_serverless_app/nuclei-serverless-app-dynamo/`
-- ```./deploy.sh``` to run the deploy
+- ```./deploy.sh``` to run the deploy of the app
     - this will declare the S3 bucket
-    - create `sam.yaml` and additional artifacts in out/ folder
-    - change to out/ directory
+    - make bucket for the declared S3 bucket
+    - create `sam.yaml` and additional artifacts in `out/` folder
     - create a `packaged.yaml` from `sam.yaml`
     - deploy `packaged.yaml` as a stack
 - the stack is now live. 
-- to bring down the stack do `chalice destroy`
 
-### Create the AWS secret for the Twitter API token
+- to bring down the stack do:
+```chmod +x delete.sh``` in `src/nuclei_serverless_app/nuclei-serverless-app-dynamo/`
+- ```./delete.sh``` to delete resources of the app
 
-We use the AWS Secrets Manager
+TODO:
+- logs can be used to set up CloudWatch
 
-```
-TODO
-```
+## Run the script to fetch tweet data
 
-### Run a script to fetch tweet data
+Currently this is a simple Python script that we run locally and prints data.
 
-Currently this is just a Python script that we run locally and prints data.
 This is a proof of concept for the finished application which would send the tweet data to SQS/DynamoDB/S3.
 
+TODO: To separate out the SQS Queue, the Dynamo DB PUT, the S3 upload object, so that each lambda has its Python instructions
+
 ```
-python3 src/
+python3 src/nuclei_serverless_app/get_twitter_info.py --username 'who'
 ```
 
 ## Test the App
 
-In production I would like to use unit tests, maybe with a mock of AWS.
-I used the `httpie` CLI for testing the REST endpoints.
+To develop, I manually tested the endpoints. Next, write these as well as other functional tests as unit tests, with a mock deploy of AWS.
 
-### Considerations and Options
+I used the library `httpie` as a CLI for testing the REST endpoints.
+
+## Considerations and Options
 
 If I were to deploy this to production, I would look at the following options:
 

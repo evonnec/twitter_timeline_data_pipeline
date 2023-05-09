@@ -2,6 +2,7 @@ import time
 import requests
 import boto3
 import io
+import os
 import argparse
 from pytwitter import Api
 import access_twitter
@@ -85,14 +86,14 @@ def get_tweet(tweet_id: str) -> dict:
             except Exception as e:
                 print(bypass_exception, str(e)) 
             try:
-                d_tweet['referenced_tweets'] = resp_data['data'][0]['referenced_tweets']
+                d_tweet['referenced_tweets'] = resp_data['data'][0]['referenced_tweets'][0]
             except Exception as e:
                 print(bypass_exception, str(e)) 
     except Exception as e:
         print('error: ', str(e))    
     return d_tweet
 
-def get_media_from_tweet(tweets: dict) -> None:
+def get_media_from_tweet_push_s3(tweets: dict) -> None:
     """Retrieve Media From Tweet
     if it exists and push to S3, use the tweet_id as the folder
 
@@ -116,6 +117,33 @@ def get_media_from_tweet(tweets: dict) -> None:
             )
         except Exception as e:
             print(bypass_exception, str(e))
+            
+def get_metadata_from_tweet_push_dynamo_db(tweets: dict) -> None:
+    """Retrieve metadata from Tweet and PUT to Dynamo DB
+
+    Args:
+        tweets (dict): tweets dict as input
+    Return: None
+    """
+    dynamo_client = boto3.client('dynamodb')
+    dynamo_table = "TweetsTable"
+    #TODO: get environment variable for table_name
+    payload = tweets
+    # api_url = os.getenv('API_URL')
+    # TODO: need to pull API_URL from put.sh after deploying cloudformation
+    # DynamoDB.Client.batch_execute_statement(**kwargs)
+    for item in tweets:
+        try:
+            dynamo_client.put_item(
+                TableName=dynamo_table, 
+                Item={item: {'M': tweets[item]}}
+            )
+            # response = requests.put(api_url, data=payload) 
+            # To use requests.put, learn how to create `id` of PUT request 
+            # to set id == item
+        except Exception as e:
+            print('error: ', str(e))
+            
     
 def collect_tweets(resp: dict) -> dict:
     """Collect tweets from the input of a Tweet timeline
@@ -131,7 +159,7 @@ def collect_tweets(resp: dict) -> dict:
     for item in resp.data:
         tweet_id = item.id
         tweet_params = get_tweet(tweet_id)
-        d_tweets[tweet_id] = [tweet_params]
+        d_tweets[tweet_id] = tweet_params
         time.sleep(1)
         # Sleep in order to avoid Too Many Requests error for now
         # TODO: However instead of sleep, perhaps use retries
@@ -142,10 +170,9 @@ def collect_tweets(resp: dict) -> dict:
 
 if __name__ == '__main__':
     tweet_data = collect_tweets(timeline_response)
-    tweet_media = get_media_from_tweet(tweet_data)
+    tweet_media = get_media_from_tweet_push_s3(tweet_data)
+    # tweets_metadata = get_metadata_from_tweet_push_dynamo_db(tweet_data)
     print(tweet_data)
     print(tweet_media)
-        
-    # dynamo_client = boto3.client('dynamodb')
-    # DynamoDB.Client.batch_execute_statement(**kwargs)
-    # dynamo_client.batch_write_item(tweet_data)
+    # print(tweets_metadata)
+    # TODO: get metadata push to dynamo db working
