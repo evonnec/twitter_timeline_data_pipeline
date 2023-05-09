@@ -1,0 +1,25 @@
+Transform: AWS::Serverless-2016-10-31
+Globals:
+  Function:
+    Environment:
+      Variables:
+        TABLE_NAME:
+          Ref: TweetsTable
+Resources:
+  TweetsTable:
+    Type: AWS::Serverless::SimpleTable
+  DynamoDBAccess:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: AddDDBAccess
+      Roles:
+        - Ref: DefaultRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Action:
+          - dynamodb:PutItem
+          - dynamodb:GetItem
+          Effect: Allow
+          Resource:
+            Fn::Sub: arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TweetsTable}

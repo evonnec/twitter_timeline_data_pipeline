@@ -1,0 +1,14 @@
+# configuration for linters and project
+[project]
+name = "nuclei-serverless-app"
+dependencies = [
+    "boto3",
+    "chalice",
+    # "chalice[cdkv2]",
+    "pytest",
+    "requests",
+    "python-twitter-v2",
+    "awscli",
+    "httpie"
+]
+version = "0.1"
