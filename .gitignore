@@ -159,5 +159,5 @@ cython_debug/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
-nuclei/
-src/nuclei-serverless-app-*/.chalice/deployments/
+twitterpipeline/
+src/serverless-app-*/.chalice/deployments/

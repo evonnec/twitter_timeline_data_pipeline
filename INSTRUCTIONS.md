@@ -1,4 +1,4 @@
-Nuclei Take Home: Serverless App
+Take Home: Serverless App
 ================
 
 Status
@@ -39,8 +39,8 @@ Tooling:
 ## Create a virtual environment
 
 * Run:
-- ```python3 -m venv nuceli```  -- to create the python virtual environment  
-- ```source nuclei/bin/activate```  -- to activate the python virtual environment  
+- ```python -m venv twitterpipeline```  -- to create the python virtual environment  
+- ```source twitterpipeline/bin/activate```  -- to activate the python virtual environment  
   
 Do ```pip install -e .```
 
@@ -58,7 +58,7 @@ This currently:
 - a DyanmoDB table with GET and PUT endpoints
 - makes a S3 bucket
 
-- ```chmod +x deploy.sh``` in `src/nuclei_serverless_app/nuclei-serverless-app-dynamo/`
+- ```chmod +x deploy.sh``` in `src/serverless_app/serverless-app-dynamo/`
 - ```./deploy.sh``` to run the deploy of the app
     - this will declare the S3 bucket
     - make bucket for the declared S3 bucket
@@ -68,7 +68,7 @@ This currently:
 - the stack is now live. 
 
 - to bring down the stack do:
-```chmod +x delete.sh``` in `src/nuclei_serverless_app/nuclei-serverless-app-dynamo/`
+```chmod +x delete.sh``` in `src/serverless_app/serverless-app-dynamo/`
 - ```./delete.sh``` to delete resources of the app
 
 TODO:
@@ -83,7 +83,7 @@ This is a proof of concept for the finished application which would send the twe
 TODO: To separate out the SQS Queue, the Dynamo DB PUT, the S3 upload object, so that each lambda has its Python instructions
 
 ```
-python3 src/nuclei_serverless_app/get_twitter_info.py --username 'who'
+python3 src/serverless_app/get_twitter_info.py --username 'who'
 ```
 
 ## Test the App

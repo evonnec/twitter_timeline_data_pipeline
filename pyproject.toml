@@ -1,6 +1,6 @@
 # configuration for linters and project
 [project]
-name = "nuclei-serverless-app"
+name = "serverless-app-twitter"
 dependencies = [
     "boto3",
     "chalice",
@@ -9,6 +9,17 @@ dependencies = [
     "requests",
     "python-twitter-v2",
     "awscli",
-    "httpie"
+    "httpie",
+    "pyproject-toml",
+    "mypy",
+    "black",
+    "ruff",
+    "types-boto3",
+    "types-requests"
 ]
 version = "0.1"
+
+[tool.mypy]
+[[tool.mypy.overrides]]
+module = ["python-twitter-v2", "pytwitter.Api"]
+ignore_missing_imports = true
