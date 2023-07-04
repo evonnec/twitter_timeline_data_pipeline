@@ -1,0 +1,8 @@
+Transform: AWS::Serverless-2016-10-31
+Globals:
+  Function:
+    Environment:
+      Variables:
+        TABLE_NAME:
+          Ref: TweetsTable
+Resources:

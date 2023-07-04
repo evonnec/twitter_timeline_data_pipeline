@@ -160,4 +160,4 @@ cython_debug/
 #.idea/
 
 nuclei/
-src/nuclei-serverless-app-*/.chalice/deployments/
+src/serverless-app-*/.chalice/deployments/
