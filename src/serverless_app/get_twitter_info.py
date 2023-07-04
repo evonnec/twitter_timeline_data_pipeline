@@ -106,15 +106,12 @@ def get_tweet(tweet_id: str) -> dict:
             d_tweet["created_at"] = resp_data["data"][0]["created_at"]
             try:
                 d_tweet["media_key"] = resp_data["includes"]["media"][0]["media_key"]
-                d_tweet["media_url"] = resp_data["includes"]["media"][0]["variants"][0][
-                    "url"
-                ]
+                d_tweet["media_url"] = resp_data["includes"]["media"][0]["variants"][0]["url"]
+                d_tweet["media_type"] = resp_data["includes"]["media"][0]["variants"][0]["type"]
             except Exception as e:
                 print(bypass_exception, str(e))
             try:
-                d_tweet["referenced_tweets"] = resp_data["data"][0][
-                    "referenced_tweets"
-                ][0]
+                d_tweet["referenced_tweets"] = resp_data["data"][0]["referenced_tweets"][0]
             except Exception as e:
                 print(bypass_exception, str(e))
     except Exception as e:
@@ -143,17 +140,24 @@ def get_media_from_tweet_push_to_s3(tweets: dict, storage_bucket: str) -> None:
         try:
             import pdb
             pdb.set_trace()
-
+            # first test if it has media_url, if not keep going. if it does, pull url
+            # and push type to S3
             tweet_id = requests.get(tweets[item]["tweet_id"])
+            # should not have to use requests to get
             filename = f"{username}_{random_name}_{timestamp}_{tweet_id}"
             response = requests.get(tweets[item][0]["media_url"])
-            filetype = requests.get(tweets[item][0]["file_type"])
+            filetype = requests.get(tweets[item][0]["media_type"]) 
+            # should not have to use requests to get response or filetype 
+            # should be able to get from tweets dict, needs to be verified
             with open(response) as f_resp:
                 s3.meta.client.put_object(
                     Body=f_resp.read(), #io.BytesIO(f_resp.content)
+                    # would have to test with file vs bytes for body
                     Key=filename + "_" + item,
                     Bucket=storage_bucket,
-                    ContentType=filetype, # "application/json"
+                    ContentType=filetype, 
+                    # would have to specify what filetype, i.e. "application/json" 
+                    # or something else
                 )
             logging.info('File "%s" is transferred', filename)
         except Exception as e:
@@ -162,7 +166,9 @@ def get_media_from_tweet_push_to_s3(tweets: dict, storage_bucket: str) -> None:
 
 def get_metadata_from_tweet_push_dynamo_db(tweets: dict, dynamo_table: str) -> None:
     """Retrieve metadata from Tweet and PUT to Dynamo DB
-
+    This should be done by def lambda_handler(event, context)
+    check for 200 -- status_code = response['ResponseMetadata']['HTTPStatusCode']
+    https://adex.ltd/insert-data-into-dynamodb-table/
     Args:
         tweets (dict): tweets dict as input
     Return: None
@@ -172,6 +178,7 @@ def get_metadata_from_tweet_push_dynamo_db(tweets: dict, dynamo_table: str) -> N
         aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
     )
     dynamo = session.resource("dynamodb")
+    table = dynamo.Table(dynamo_table)
 
     # TODO: get environment variable for table_name
     # api_url = os.getenv('API_URL')
@@ -179,7 +186,12 @@ def get_metadata_from_tweet_push_dynamo_db(tweets: dict, dynamo_table: str) -> N
     # DynamoDB.Client.batch_execute_statement(**kwargs)
     for item in tweets:
         try:
-            dynamo.put_item(TableName=dynamo_table, Item={item: {"M": tweets[item]}})
+            table.put_item( 
+                Item=item
+                    # {
+                    #     item: {"M": tweets[item]}
+                    # }
+                )
             # response = requests.put(api_url, data=payload)
             # To use requests.put, learn how to create `id` of PUT request
             # to set id == item

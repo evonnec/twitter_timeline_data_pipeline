@@ -2,7 +2,7 @@ import os
 import boto3
 from chalice import Chalice, NotFoundError
 
-app = Chalice(app_name='nuclei-serverless-app-dynamo')
+app = Chalice(app_name='serverless-app-dynamo')
 
 app.debug = True
 _TABLE = None
