@@ -229,9 +229,12 @@ if __name__ == "__main__":
     dynamo_tablename = args.dynamotablename
     timeline_response = twitter_username_timelines(uname=username)
     tweet_data = collect_tweets(resp=timeline_response)
+    logging.info("Starting to push media to S3 for '%s'", tweet_data)
     get_media_from_tweet_push_to_s3(tweets=tweet_data, storage_bucket=bucket_name)
-    # get_metadata_from_tweet_push_dynamo_db( \
-    #     tweets=tweet_data, \
-    #     dynamo_table=dynamo_tablename \
-    # )
-    print(tweet_data)
+    logging.info("Finished pushing media to S3 for '%s'", tweet_data)
+    logging.info("Starting to push metadata to DynamoDB for '%s'", tweet_data)
+    get_metadata_from_tweet_push_dynamo_db( \
+        tweets=tweet_data, \
+        dynamo_table=dynamo_tablename \
+    )
+    logging.info("Finished pushing metadata to DynamoDB for '%s'", tweet_data)
