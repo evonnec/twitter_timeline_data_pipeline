@@ -40,7 +40,7 @@ You final solution should at least have the following artifacts:
     - Lambda for processing messages from the SQS queue (triggered by a new message in the SQS queue)
 - A README file containing detailed instructions on how to deploy and test the data pipeline, as well as any assumptions made during the implementation.
 
-You may also *optionally* use a serverless framework for completing this exercise. Nuclei regularly uses [AWS Chalice](https://aws.github.io/chalice/index.html), which is lightweight and makes it very easy to build and [quickly deploy](https://aws.github.io/chalice/quickstart.html) serverless applications. Familiarity with the AWS Chalice framework is not required for this exercise, and you are free to:
+You may also *optionally* use a serverless framework for completing this exercise. We often use [AWS Chalice](https://aws.github.io/chalice/index.html), which is lightweight and makes it very easy to build and [quickly deploy](https://aws.github.io/chalice/quickstart.html) serverless applications. Familiarity with the AWS Chalice framework is not required for this exercise, and you are free to:
 
 - Use a different serverless framework of your choice.
 - Deploy your Lambda functions using your CloudFormation template.
@@ -75,7 +75,7 @@ You can sign up for a free AWS account here that can be used to deploy and test 
 You will need to use the following Bearer token to communicate with the Twitter API v2:
 
 ```
-AAAAAAAAAAAAAAAAAAAAACMbnAEAAAAAy%2FYCSnrBg1sa3hM8rq8nGOMyTa4%3DCEd5n1KOX6ITr37gmjPWDAoiIqXufr4eqkdObzO06E5WGg2ukh
+AAAAAAAAAAAAAAAAAAAAA____
 ```
 
 This is a throwaway, rate-limited token that provides read-only access to already public data.
@@ -83,13 +83,14 @@ This is a throwaway, rate-limited token that provides read-only access to alread
 To check if the token is working from a bash terminal:
 
 ```bash
-curl -H "Authorization: Bearer $ACCESS_TOKEN" https://api.twitter.com/2/users/by/username/NucleiAI
+export ACCESS_TOKEN='AAAAAAAAAAAAAAAAAAAAA____'
+curl -H "Authorization: Bearer $ACCESS_TOKEN" https://api.twitter.com/2/users/by/username/SnowEcho
 ```
 
 Example: successful response:
 
 ```bash
-{"data":{"id":"1075929753503363077","name":"Nuclei","username":"NucleiAI"}}
+{"data":{"id":<big_int>,"name":"SnowEcho","username":"SnowEcho"}}
 ```
 
 Example: unsuccessful response (malformed or expired token):
@@ -103,7 +104,7 @@ Example: unsuccessful response (malformed or expired token):
 }
 ```
 
-Upon completion of the test Nuclei will expire the token to prevent accidental re-use.
+Upon completion of the assignment, we'll expire the token to prevent accidental re-use.
 
 #### Documentation
 
