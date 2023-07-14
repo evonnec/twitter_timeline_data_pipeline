@@ -160,4 +160,5 @@ cython_debug/
 #.idea/
 
 twitterpipeline/
+twitter/
 src/serverless-app-*/.chalice/deployments/

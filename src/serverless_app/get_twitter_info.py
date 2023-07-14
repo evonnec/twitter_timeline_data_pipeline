@@ -4,6 +4,7 @@ import uuid
 import boto3
 import argparse
 import logging
+import mimetypes
 import os
 from pytwitter import Api
 
@@ -41,7 +42,6 @@ parser.add_argument(
 
 args = parser.parse_args()
 
-
 def twitter_username_timelines(uname: str) -> dict:
     # bearer_token = access_twitter.get_twitter_secret()['twitter_access_token']
     twitter_api = Api(bearer_token=TWITTER_ACCESS_TOKEN)  # bearer_token=bearer_token
@@ -66,7 +66,8 @@ def twitter_username_timelines(uname: str) -> dict:
 
 
 def get_tweet(tweet_id: str) -> dict:
-    """get_tweet
+    """
+    get_tweet, gets text from a tweet_id
     gets the `tweet_fields` for a tweet_id: created_at and referenced_tweets
     additionally expands attachments.media_keys in `expansions`
     to get `includes` items in `media_fields`
@@ -106,29 +107,29 @@ def get_tweet(tweet_id: str) -> dict:
             d_tweet["created_at"] = resp_data["data"][0]["created_at"]
             try:
                 d_tweet["media_key"] = resp_data["includes"]["media"][0]["media_key"]
-                d_tweet["media_url"] = \
-                    resp_data["includes"]["media"][0]["variants"][0]["url"]
-                d_tweet["media_type"] = \
-                    resp_data["includes"]["media"][0]["variants"][0]["type"]
+                d_tweet["media_url"] = resp_data["includes"]["media"][0]["variants"][0]["url"]
+                d_tweet["media_type"] = resp_data["includes"]["media"][0]["variants"][0]["content_type"]
             except Exception as e:
                 print(bypass_exception, str(e))
             try:
-                d_tweet["referenced_tweets"] = \
-                    resp_data["data"][0]["referenced_tweets"][0]
+                d_tweet["referenced_tweets"] = resp_data["data"][0]["referenced_tweets"][0]
             except Exception as e:
                 print(bypass_exception, str(e))
     except Exception as e:
-        print("error: ", str(e))
+        print("get_tweet error: ", str(e))
     return d_tweet
 
 
 def get_media_from_tweet_push_to_s3(tweets: dict, storage_bucket: str) -> None:
     """Retrieve Media From Tweet
-    if it exists and push to S3, use the tweet_id as the folder
-
+    If media exists, push to S3
+    https://developer.twitter.com/en/docs/twitter-api/data-dictionary/object-model/media
+    media: media_key, type (photo, GIF, or video, i.e. "type": "video")
+    variants: "variants" = [{"bit_rate", "content_type", "url"}] 
+    i.e. "content_type": "video/mp4", "url": "https://video.twimg.com/ext_tw_video/1527322141724532740/pu/vid/320x568/lnBaR2hCqE-R_90a.mp4?tag=12"
+    or "url": "https://video.twimg.com/amplify_video/1644277669272461315/vid/1080x1080/7BteoCvo6Qb1HXHQ.mp4?tag=16"
     Args:
         tweets (dict):
-
     Returns: None
     """
     session = boto3.Session(
@@ -138,27 +139,23 @@ def get_media_from_tweet_push_to_s3(tweets: dict, storage_bucket: str) -> None:
     s3 = session.resource("s3")
     bypass_exception = "Does Not Exist for Tweet ID, thus bypassing: "
     for item in tweets:
+        random_name = uuid.uuid4().hex
+        timestamp = time.strftime("%Y%m%d-%H%M%S")
+        tweet_id = item.get("tweet_id")
+        filename = f"{timestamp}_{username}_{tweet_id}_{random_name}"
+        response = item.get("media_url", None)
         try:
-            # first test if it has media_url, if not keep going. if it does, pull url
-            # and push type to S3
-            random_name = uuid.uuid4().hex
-            timestamp = time.strftime("%Y%m%d-%H%M%S")
-            tweet_id = item.get("tweet_id")
-            filename = f"{username}_{random_name}_{timestamp}_{tweet_id}"
-            response = item.get("media_url", None)
-            filetype = item.get("media_type") 
-            # get response or filetype 
-            # should be able to get filetype from tweets dict, needs to be verified
-            with open(response) as f_resp:
-                s3.meta.client.put_object(
-                    Body=f_resp.read(), #io.BytesIO(f_resp.content)
-                    # would have to test with file vs bytes for body
-                    Key=filename + "_" + item,
-                    Bucket=storage_bucket,
-                    ContentType=filetype, 
-                    # would have to specify what filetype, i.e. "application/json" 
-                    # or something else
-                )
+            # if url is available in tweets dict, push to S3
+            media_response = requests.get(response, stream=True).raw
+            content_type = media_response.headers["Content-Type"]
+            extension = mimetypes.guess_extension(content_type)
+            # filetype = item.get("media_type")
+            # could get filetype from tweets dict, or use mimetypes to guess the extension
+            s3.meta.client.upload_fileobj(
+                Fileobj=media_response, 
+                Bucket=storage_bucket, 
+                Key=filename + extension
+            )
             logging.info('File "%s" is transferred', filename)
         except Exception as e:
             logging.info(f"{bypass_exception} '%s'", str(e))
@@ -188,17 +185,16 @@ def get_metadata_from_tweet_push_dynamo_db(tweets: dict, dynamo_table: str) -> N
             created_at = item.get("created_at")
             referenced_tweets = item.get("referenced_tweets", [])
             # must be one of: S, N, B, SS, NS, BS, M, L, NULL, BOOL
-            table.put_item( 
-                Item=
-                    {
-                        "tweet_id": {"S": tweet_id},
-                        "text": {"S": tweet_text},
-                        "created_at": {"S": created_at},
-                        "referenced_tweets": {"L": referenced_tweets},
-                        "timestamp": {"S": timestamp},
-                        "username": {"S": username},
-                    }
-                )
+            table.put_item(
+                Item={
+                    "tweet_id": {"S": tweet_id},
+                    "text": {"S": tweet_text},
+                    "created_at": {"S": created_at},
+                    "referenced_tweets": {"L": referenced_tweets},
+                    "timestamp": {"S": timestamp},
+                    "username": {"S": username},
+                }
+            )
         except Exception as e:
             logging.info("Dynamo DB insertion error: '%s'", str(e))
 
@@ -233,17 +229,13 @@ if __name__ == "__main__":
     dynamo_tablename = args.dynamotablename
     timeline_response = twitter_username_timelines(uname=username)
     tweet_data = collect_tweets(resp=timeline_response)
-    
+
     logging.info("Starting to push media to S3 for '%s'", tweet_data)
-    get_media_from_tweet_push_to_s3(
-        tweets=tweet_data, 
-        storage_bucket=bucket_name
-    )
+    get_media_from_tweet_push_to_s3(tweets=tweet_data, storage_bucket=bucket_name)
     logging.info("Finished pushing media to S3 for '%s'", tweet_data)
-    
+
     logging.info("Starting to push metadata to DynamoDB for '%s'", tweet_data)
-    get_metadata_from_tweet_push_dynamo_db( \
-        tweets=tweet_data, \
-        dynamo_table=dynamo_tablename \
+    get_metadata_from_tweet_push_dynamo_db(
+        tweets=tweet_data, dynamo_table=dynamo_tablename
     )
     logging.info("Finished pushing metadata to DynamoDB for '%s'", tweet_data)
