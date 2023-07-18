@@ -156,7 +156,11 @@ def get_media_from_tweet_push_to_s3(tweets: dict, storage_bucket: str) -> None:
                 Bucket=storage_bucket, 
                 Key=filename + extension
             )
-            logging.info('File "%s" is transferred', filename)
+            try:
+                s3.Object(Bucket=storage_bucket, Key=filename + extension).wait_until_exists()
+                logging.info('File "%s" is transferred', filename)
+            except Exception:
+                logging.info('File "%s" is NOT transferred', filename)
         except Exception as e:
             logging.info(f"{bypass_exception} '%s'", str(e))
 
