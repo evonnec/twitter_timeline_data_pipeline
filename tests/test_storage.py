@@ -1214,12 +1214,12 @@ def test_merge_gaps_past_the_limit_joins_the_closest_neighbours() -> None:
     )
 
 
-def test_a_hundred_and_fifty_gaps_are_capped_without_losing_coverage() -> None:
-    gaps = [Gap(str(i * 10 + 5), str(i * 10)) for i in range(150)]
+def test_more_gaps_than_the_cap_are_capped_without_losing_coverage() -> None:
+    gaps = [Gap(str(i * 10 + 5), str(i * 10)) for i in range(MAX_GAPS + 50)]
 
     merged = merge_gaps(gaps)
 
-    assert len(merged) == MAX_GAPS == 100
+    assert len(merged) == MAX_GAPS == 1500
     assert all(
         any(m.first <= g.first and g.last <= m.last for m in merged) for g in gaps
     )

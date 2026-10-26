@@ -42,7 +42,8 @@ class FakeTimeline:
     Quirks the real API shows: ``short_pages`` returns fewer than ``max_results``
     Tweets per page, ``trailing_token`` adds a ``next_token`` to the last page with
     data (the next request is then empty), and ``empty_token_every=k`` answers every
-    k-th request with an empty page that still carries a ``next_token``.
+    k-th request with an empty page that still carries a ``next_token``. ``stride``
+    spaces consecutive IDs apart, as snowflake IDs are.
     """
 
     def __init__(
@@ -54,12 +55,14 @@ class FakeTimeline:
         short_pages: bool = False,
         trailing_token: bool = False,
         empty_token_every: int = 0,
+        stride: int = 1,
     ) -> None:
         self.window = window
         self.inject = inject
         self.short_pages = short_pages
         self.trailing_token = trailing_token
         self.empty_token_every = empty_token_every
+        self.stride = stride
         self.ids: list[int] = []
         self.timeline_calls: list[dict[str, str]] = []
         self._stub = XApiStub()
@@ -67,8 +70,8 @@ class FakeTimeline:
 
     def add(self, count: int) -> list[int]:
         """Post ``count`` new Tweets; returns their IDs, oldest first."""
-        start = (self.ids[-1] if self.ids else 0) + 1
-        new = list(range(start, start + count))
+        start = (self.ids[-1] if self.ids else 0) + self.stride
+        new = list(range(start, start + count * self.stride, self.stride))
         self.ids += new
         return new
 

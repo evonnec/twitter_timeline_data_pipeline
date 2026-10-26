@@ -702,8 +702,12 @@ def _check_id(value: str | None) -> None:
         raise ValueError(f"Tweet ID must be numeric, got {value!r}")
 
 
-MAX_GAPS = 100
-"""Upper bound on the gap list, far below DynamoDB's 400 KB item limit."""
+MAX_GAPS = 1500
+"""Upper bound on the gap list. A trailing ``next_token`` leaves one empty gap per run,
+and each waits 24 h before it can drop, so a 1-minute schedule (the EventBridge
+minimum) needs 1,440. At about 110 bytes a gap that is roughly 165 KB, under
+DynamoDB's 400 KB item limit. Within the cap nothing is merged away, so waiting
+gaps are never joined to (and never delay) gaps that have work to do."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -712,7 +716,8 @@ class Gap:
 
     A missing ``since_id`` means "down to the end of what the API serves"; a missing
     ``until_id`` means "up from the newest Tweet". ``empty_runs`` counts consecutive
-    runs whose first request for this gap came back cleanly empty and
+    runs in which no page for this gap carried data and the walk ended on a clean
+    empty response, and
     ``first_empty_at`` (ISO-8601 UTC, ``...Z``) is when the first of them happened;
     the gap is only dropped after several runs *and* a minimum age (see
     ``handlers.fetch``). Both are unset while ``empty_runs`` is 0. IDs are

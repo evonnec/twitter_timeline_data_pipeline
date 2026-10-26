@@ -12,7 +12,7 @@ import functools
 import logging
 import time
 from collections.abc import Callable, Iterable, Iterator, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
@@ -184,6 +184,10 @@ class _Run:
     tweets: int = 0
     enqueued: int = 0
     deferred_error: Exception | None = None
+    observed: set[tuple[str | None, str | None]] = field(default_factory=set)
+    """Ranges (``since_id``, ``until_id``) already seen empty in this run."""
+    ended_empty: bool = False
+    """The last walk ended on a clean empty response (no data, token or errors)."""
 
     @property
     def budget(self) -> int:
@@ -200,6 +204,7 @@ class _Run:
         """
         walked = 0
         last: TimelinePage | None = None
+        self.ended_empty = False
         try:
             for page in self.x_client.iter_timeline(
                 self.user_id,
@@ -218,6 +223,7 @@ class _Run:
             raise
         if walked < budget and (last is None or last.next_token):
             self.requests += 1  # ended on a clean empty response
+            self.ended_empty = True
 
     def enqueue(self, page: TimelinePage) -> list[int]:
         """Send the page's messages; returns its Tweet IDs."""
@@ -255,6 +261,7 @@ class _Run:
         """
         others = list(self.state.gaps)
         lowest: int | None = None
+        open_gap: Gap | None = None
         for page in self.walk(since_id=since_id, until_id=None, budget=budget):
             ids = self.enqueue(page)
             if ids:
@@ -268,25 +275,92 @@ class _Run:
                 else None
             )
             self.commit(ids, [*others, *([open_gap] if open_gap else [])])
+        if open_gap is not None and self.ended_empty:
+            # The request that ended the walk asked for exactly this gap's range and
+            # came back clean empty: that is its first empty observation, so record
+            # it now instead of spending a request on it again in the gap phase.
+            self.observed.add((open_gap.since_id, open_gap.until_id))
+            self.commit(
+                [],
+                [
+                    *others,
+                    replace(open_gap, empty_runs=1, first_empty_at=_iso(self.now())),
+                ],
+            )
+
+    def waiting(self, gap: Gap) -> bool:
+        """An empty gap serving out its minimum age. One more empty answer would be
+        the one that could drop it, but not before it is old enough: until then a
+        request is wasted."""
+        return (
+            gap.empty_runs >= EMPTY_RUNS_TO_DROP - 1
+            and gap.first_empty_at is not None
+            and self.now() - datetime.fromisoformat(gap.first_empty_at)
+            < GAP_DROP_MIN_AGE
+        )
+
+    def due(self, gap: Gap) -> bool:
+        """An empty gap old enough to drop on its next clean-empty response."""
+        return (
+            gap.empty_runs >= EMPTY_RUNS_TO_DROP - 1
+            and gap.first_empty_at is not None
+            and not self.waiting(gap)
+        )
+
+    @property
+    def pending(self) -> bool:
+        """Whether any gap could use a request this run (waiting ones can't)."""
+        return any(not self.waiting(g) for g in self.state.gaps)
+
+    @property
+    def outstanding(self) -> bool:
+        """Whether a gap is known to be unfinished: not one that is only being
+        re-checked after coming back empty."""
+        return any(g.empty_runs == 0 for g in self.state.gaps)
 
     def fill_gaps(self) -> None:
         """Phase 2: spend what is left of the budget on the recorded gaps.
 
-        Newest gap first: its Tweets are the ones adjacent to the live stream, and the
-        API serves only the most recent ~3,200 posts, so the oldest gaps are the ones
-        that age out of reach anyway. But the oldest gap is always left one request, so
-        it keeps being advanced or pruned however busy the newer ones are. A failure in
-        one gap is remembered and re-raised at the end of the run, so the older gaps
-        still get their turn.
+        Gaps waiting out their 24 h age are skipped: they cost nothing until due, so
+        the standing empty gaps a trailing ``next_token`` leaves behind can't eat the
+        budget. A gap that is due gets one request first, so it drops promptly. The
+        rest go newest first: their Tweets are the ones adjacent to the live stream,
+        and the API serves only the most recent ~3,200 posts, so the oldest gaps are
+        the ones that age out of reach anyway. But the oldest working gap is always
+        left one request, so it keeps being advanced however busy the newer ones are.
+        Gaps that already came back empty are checked after the ones that may still
+        hold Tweets, so a burst isn't starved by them. A failure in one gap is
+        remembered and re-raised at the end of the run, so the others still get their
+        turn.
         """
-        ordered = sorted(self.state.gaps, key=lambda g: g.sort_key, reverse=True)
-        for gap in ordered:
+        due = [g for g in self.state.gaps if self.due(g)]
+        checked = [
+            g
+            for g in self.state.gaps
+            if (g.since_id, g.until_id) not in self.observed
+            and g not in due
+            and not self.waiting(g)
+        ]
+        # Gaps that may hold Tweets go before gaps that only keep coming back empty.
+        working = sorted(
+            checked, key=lambda g: (g.empty_runs == 0, g.sort_key), reverse=True
+        )
+        for gap in [*due, *working]:
             if self.budget <= 0:
                 return
             if gap not in self.state.gaps:  # merged into another by an earlier save
                 continue
-            oldest = all(g.sort_key >= gap.sort_key for g in self.state.gaps)
-            budget = self.budget - (0 if oldest else 1)
+            if gap in due:
+                budget = min(2, self.budget)
+            else:
+                live = [
+                    g
+                    for g in self.state.gaps
+                    if (g.since_id, g.until_id) not in self.observed
+                    and not self.waiting(g)
+                ]
+                oldest = all(g.sort_key >= gap.sort_key for g in live)
+                budget = self.budget - (0 if oldest else 1)
             if budget <= 0:
                 continue
             try:
@@ -306,15 +380,15 @@ class _Run:
     def fill_gap(self, gap: Gap, budget: int) -> None:
         others = list(self.state.gaps)
         others.remove(gap)
-        pages = 0
+        data = False
         for page in self.walk(
             since_id=gap.since_id, until_id=gap.until_id, budget=budget
         ):
-            pages += 1
             ids = self.enqueue(page)
             if not ids:  # an empty page pointing onward: nothing learned
                 continue
             # Data came back, so the range is alive: reset the empty-response count.
+            data = True
             remaining = (
                 [Gap(until_id=str(min(ids)), since_id=gap.since_id)]
                 if page.next_token
@@ -324,9 +398,11 @@ class _Run:
             # contain a Tweet that arrived after this run's new-Tweets check, and
             # moving newest_id past it would leave it above no cursor and below none.
             self.commit([], [*others, *remaining])
-        if pages:
+        if data or not self.ended_empty:
             return
-        # The first request came back cleanly empty (no data, no token, no errors).
+        # No page carried data and the walk ended on a clean empty response (no data,
+        # no token, no errors). Empty pages that still pointed onward don't prevent
+        # this from counting, but a walk cut short by the budget says nothing yet.
         now = self.now()
         runs = gap.empty_runs + 1
         first = gap.first_empty_at or _iso(now)
@@ -419,11 +495,11 @@ def run_fetch(
         backfill = _anchored(backfill, run.state.newest_id)
         if backfill and backfill not in run.state.gaps:
             run.commit([], [*run.state.gaps, backfill])
-        if run.state.gaps:
+        if run.pending:
             # One request checks for new Tweets and one goes to the oldest gap, so
             # neither can starve the other even with MAX_PAGES=1.
             run.max_pages = max(max_pages, 2)
-        run.fetch_new(since_id, run.max_pages - (1 if run.state.gaps else 0))
+        run.fetch_new(since_id, run.max_pages - (1 if run.pending else 0))
         run.fill_gaps()
     except RateLimitError as exc:
         logger.warning("rate limited, stopping early; progress is saved: %s", exc)
@@ -439,7 +515,7 @@ def run_fetch(
     if run.deferred_error:
         raise run.deferred_error
     gaps_open = len(run.state.gaps)
-    if stopped_reason is None and gaps_open:
+    if stopped_reason is None and run.outstanding:
         stopped_reason = "page_cap" if run.budget <= 0 else "gaps_pending"
     if gaps_open:
         logger.info("open gaps for %s: %s", username, run.state.gaps)

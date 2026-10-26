@@ -55,6 +55,7 @@ def run(
     username: str = USERNAME,
     max_results: int = 100,
     max_pages: int = 5,
+    checkpoints: CheckpointStore | None = None,
     **kwargs: Any,
 ) -> FetchResult:
     with x_client(timeline) as client:
@@ -63,7 +64,7 @@ def run(
             x_client=client,
             sqs=sqs.client,
             queue_url=aws.queue_url,
-            checkpoints=CheckpointStore(aws.state_table),
+            checkpoints=checkpoints or CheckpointStore(aws.state_table),
             max_results=max_results,
             max_pages=max_pages,
             sleep=lambda _s: None,
@@ -185,14 +186,14 @@ def test_a_gap_beyond_the_apis_window_is_dropped_after_three_runs_over_a_day(
 
     with caplog.at_level(logging.INFO, logger=fetch.logger.name):
         results = [run(aws, timeline, FakeSqs(), now=at(h)) for h in (0, 1, 2)]
-        assert state(aws).gaps == (Gap("30", "5", 3, iso(0)),)  # too young to drop
+        assert state(aws).gaps == (Gap("30", "5", 2, iso(0)),)  # too young to drop
         results.append(run(aws, timeline, FakeSqs(), now=at(24)))
 
     assert [r.gaps_open for r in results] == [1, 1, 1, 0]
     warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert [r.getMessage() for r in warnings] == [
         f"dropping gap for {USERNAME} (since_id=5, until_id=30): out of the API's "
-        f"reach (empty 4 runs since {iso(0)})"
+        f"reach (empty 3 runs since {iso(0)})"
     ]
     assert state(aws).gaps == ()
 
@@ -204,7 +205,7 @@ def test_many_empty_runs_in_less_than_a_day_never_drop_the_gap(aws: Aws) -> None
     for i in range(30):
         run(aws, timeline, FakeSqs(), now=at(i * 0.75))  # 0 .. 21.75 hours
 
-    assert state(aws).gaps == (Gap("30", "5", 30, iso(0)),)
+    assert state(aws).gaps == (Gap("30", "5", 2, iso(0)),)  # waiting, not re-asked
 
 
 def test_a_short_api_incident_does_not_drop_a_gap_that_still_has_data(
@@ -215,11 +216,13 @@ def test_a_short_api_incident_does_not_drop_a_gap_that_still_has_data(
     timeline.inject = lambda n, _r: EMPTY_OK if n >= 1 else None
     for h in (0, 1, 2, 3):
         run(aws, timeline, FakeSqs(), now=at(h))
-    assert state(aws).gaps == (Gap("60", "40", 4, iso(0)),)
+    assert state(aws).gaps == (Gap("60", "40", 2, iso(0)),)  # waiting out the day
 
     timeline.inject = None
     sqs = FakeSqs()
-    run_until_done(aws, timeline, sqs, now=at(4))
+    run(aws, timeline, sqs, now=at(4))
+    assert sent_ids(sqs) == []  # still waiting: delayed, not lost
+    run_until_done(aws, timeline, sqs, now=at(25))
     assert sorted(sent_ids(sqs)) == list(range(41, 60))
 
 
@@ -232,7 +235,7 @@ def test_data_returning_resets_both_empty_fields(aws: Aws) -> None:
     assert state(aws).gaps == (Gap("60", "40", 2, iso(0)),)
 
     timeline.inject = None
-    run(aws, timeline, FakeSqs(), max_results=5, max_pages=2, now=at(2))
+    run(aws, timeline, FakeSqs(), max_results=5, max_pages=2, now=at(25))
 
     assert state(aws).gaps == (Gap("55", "40"),)
     assert state(aws).gaps[0].first_empty_at is None
@@ -560,6 +563,126 @@ def test_backfill_top_is_clamped_to_newest_id(
     assert fetch._anchored(backfill, newest) == expected
 
 
+# ---- empty gaps wait instead of piling up ---------------------------------------
+
+
+def _empty_token_then_empty(_n: int, request: httpx.Request) -> httpx.Response | None:
+    """Gap requests: an empty page with a token, then a clean empty one."""
+    params = request.url.params
+    if "until_id" not in params:
+        return None
+    if "pagination_token" in params:
+        return EMPTY_OK
+    return httpx.Response(200, json={"meta": {"result_count": 0, "next_token": "more"}})
+
+
+def test_empty_pages_with_tokens_then_a_clean_empty_one_still_count_as_empty(
+    aws: Aws,
+) -> None:
+    timeline = FakeTimeline(100, inject=_empty_token_then_empty)
+    seed(aws, 100, Gap(until_id="60", since_id="40"))
+
+    for h in (0, 1, 2):
+        run(aws, timeline, FakeSqs(), now=at(h))
+    assert state(aws).gaps == (Gap("60", "40", 2, iso(0)),)
+
+    run(aws, timeline, FakeSqs(), now=at(24))
+    assert state(aws).gaps == ()
+
+
+def test_a_walk_cut_short_inside_empty_pages_does_not_count(aws: Aws) -> None:
+    timeline = FakeTimeline(
+        100,
+        inject=lambda n, r: (
+            httpx.Response(200, json={"meta": {"result_count": 0, "next_token": "m"}})
+            if "until_id" in r.url.params
+            else None
+        ),
+    )
+    seed(aws, 100, Gap(until_id="60", since_id="40"))
+
+    run(aws, timeline, FakeSqs(), max_pages=3)
+
+    assert state(aws).gaps == (Gap("60", "40"),)  # never saw an end: not counted
+
+
+def test_a_waiting_gap_is_not_requested_and_does_not_count_as_pending(
+    aws: Aws,
+) -> None:
+    timeline = FakeTimeline(100)
+    seed(
+        aws, 100, Gap(until_id="60", since_id="40", empty_runs=2, first_empty_at=iso(0))
+    )
+
+    result = run(aws, timeline, FakeSqs(), now=at(5))
+
+    assert len(timeline.timeline_calls) == 1  # only the new-Tweets check
+    assert (result.gaps_open, result.stopped_reason) == (1, None)
+
+
+def test_a_due_gap_is_served_first_with_one_request_so_it_drops_promptly(
+    aws: Aws,
+) -> None:
+    timeline = FakeTimeline(70, window=30)  # serves 41..70
+    due = Gap(until_id="20", since_id="10", empty_runs=2, first_empty_at=iso(0))
+    seed(aws, 70, Gap(until_id="68", since_id="55"), due)
+
+    run(aws, timeline, FakeSqs(), max_pages=2, now=at(25))
+
+    # One request checks for new Tweets and the other drops the due gap; the working
+    # gap, though newer, has to wait for the next run.
+    assert state(aws).gaps == (Gap("68", "55"),)
+
+
+def stride_timeline(count: int) -> FakeTimeline:
+    return FakeTimeline(count, trailing_token=True, stride=1000)
+
+
+def test_hourly_runs_with_trailing_tokens_keep_the_open_gaps_small(aws: Aws) -> None:
+    timeline = stride_timeline(200)
+    sqs = RecordingSqs()
+    sent: list[int] = []
+    peak = 0
+    requests: list[int] = []
+    results: list[FetchResult] = []
+    for n in range(72):  # three days, one run an hour
+        timeline.add(1 + n % 3)
+        sqs = RecordingSqs()
+        before = len(timeline.timeline_calls)
+        results.append(run(aws, timeline, sqs, max_pages=5, now=at(n)))
+        requests.append(len(timeline.timeline_calls) - before)
+        sent += sqs.accepted
+        peak = max(peak, results[-1].gaps_open)
+
+    assert peak <= 27  # a day's worth of empty gaps waiting, plus a few in progress
+    assert all(r.stopped_reason is None for r in results[-12:])  # nothing pending
+    assert max(requests[-24:]) <= 4  # steady state: not the whole budget of 5
+    assert len(sent) == len(set(sent))  # no Tweet sent twice
+    assert set(timeline.served) <= set(sent)
+
+
+def test_a_burst_completes_in_a_few_runs_despite_standing_empty_gaps(
+    aws: Aws,
+) -> None:
+    timeline = stride_timeline(200)
+    sent: set[int] = set()
+    burst: list[int] = []
+    finished_after = None
+    for n in range(72):
+        if n == 40:
+            burst = timeline.add(1200)  # more than one run's budget
+        else:
+            timeline.add(1 + n % 3)
+        sqs = RecordingSqs()
+        run(aws, timeline, sqs, max_pages=5, now=at(n))
+        sent |= set(sqs.accepted)
+        if burst and finished_after is None and set(burst) <= sent:
+            finished_after = n - 40 + 1
+
+    assert finished_after is not None
+    assert finished_after <= 8  # 12 pages; before gaps could wait it took 31 runs
+
+
 # ---- legacy state ----------------------------------------------------------------
 
 
@@ -770,6 +893,7 @@ _round = st.tuples(
     short_pages=st.booleans(),
     trailing_token=st.booleans(),
     empty_token_every=st.sampled_from([0, 0, 3, 4, 5]),
+    stride=st.sampled_from([1, 1000]),  # dense IDs, and snowflake-like sparse ones
 )
 def test_no_tweet_above_the_initial_checkpoint_is_ever_missed(
     aws: Aws,
@@ -781,6 +905,7 @@ def test_no_tweet_above_the_initial_checkpoint_is_ever_missed(
     short_pages: bool,
     trailing_token: bool,
     empty_token_every: int,
+    stride: int,
 ) -> None:
     username = USERNAME  # the fake API only knows this account; start from clean state
     aws.state_table.delete_item(Key={"username": username})
@@ -794,14 +919,16 @@ def test_no_tweet_above_the_initial_checkpoint_is_ever_missed(
         short_pages=short_pages,
         trailing_token=trailing_token,
         empty_token_every=empty_token_every,
+        stride=stride,
     )
-    checkpoint = initial if has_checkpoint else 0
-    if has_checkpoint:
+    checkpoint = timeline.ids[-1] if timeline.ids and has_checkpoint else 0
+    if checkpoint:
         CheckpointStore(aws.state_table).save(
-            username, CheckpointState(str(initial)), expected_version=0
+            username, CheckpointState(str(checkpoint)), expected_version=0
         )
     accepted: list[int] = []
     enqueue_failures = 0
+    runs_made = 0
 
     def attempt(
         max_pages: int, plan: list[tuple[int, str]], fail_on_batch: int | None
@@ -814,6 +941,8 @@ def test_no_tweet_above_the_initial_checkpoint_is_ever_missed(
             # 500s are retried by the client, so fail enough requests in a row.
             for n in range(k, k + (4 if kind == "500" else 1)):
                 failing[base + n] = answers[kind]
+        nonlocal runs_made
+        runs_made += 1
         sqs = RecordingSqs(fail_on_batch)
         try:
             return run(
@@ -823,6 +952,7 @@ def test_no_tweet_above_the_initial_checkpoint_is_ever_missed(
                 username=username,
                 max_results=max_results,
                 max_pages=max_pages,
+                now=at(runs_made * 6),  # empty gaps get to wait and to come due
             )
         except EnqueueError:
             enqueue_failures += 1
@@ -840,7 +970,7 @@ def test_no_tweet_above_the_initial_checkpoint_is_ever_missed(
     timeline.empty_token_every = 0
     for _ in range(300):
         result = attempt(3, [], None)
-        if result is not None and result.stopped_reason is None:
+        if result is not None and result.gaps_open == 0:
             break
     else:  # pragma: no cover
         raise AssertionError("did not converge")
@@ -861,8 +991,9 @@ def test_no_tweet_above_the_initial_checkpoint_is_ever_missed(
     has_checkpoint=False,
     window=15,
     arrivals=11,
+    stride=1,
     runs=[(1, 5, 0, 0, 0, 0, 0), (3, 5, 2, 0, 2, 0, 0)],
-    backfill=Gap(until_id="14", since_id="12"),
+    backfill=(12, 14),
 )
 @settings(
     max_examples=EXAMPLES,
@@ -874,6 +1005,7 @@ def test_no_tweet_above_the_initial_checkpoint_is_ever_missed(
     has_checkpoint=st.booleans(),
     window=st.integers(15, 200),
     arrivals=st.integers(0, 60),
+    stride=st.sampled_from([1, 1000]),
     runs=st.lists(
         st.tuples(
             st.integers(1, 4),  # max_pages
@@ -890,7 +1022,7 @@ def test_no_tweet_above_the_initial_checkpoint_is_ever_missed(
     backfill=st.one_of(
         st.none(),
         st.tuples(st.integers(0, 40), st.integers(0, 60)).map(
-            lambda t: Gap(since_id=str(t[0]), until_id=str(t[0] + t[1] + 1))
+            lambda t: (t[0], t[0] + t[1] + 1)
         ),
     ),
 )
@@ -900,49 +1032,33 @@ def test_nested_overlapping_runs_never_leave_a_hole_at_any_save(
     has_checkpoint: bool,
     window: int,
     arrivals: int,
+    stride: int,
     runs: list[tuple[int, int, int, int, int, int, int]],
-    backfill: Gap | None,
+    backfill: tuple[int, int] | None,
 ) -> None:
     """Runs start inside each other (mid-request, mid-enqueue), so their saves
     interleave. After every successful save, each Tweet the API serves is either
     enqueued already, above ``newest_id``, or inside a recorded gap."""
     aws.state_table.delete_item(Key={"username": USERNAME})
-    store = CheckpointStore(aws.state_table)
-    timeline = FakeTimeline(initial, window=window)
-    checkpoint = initial if has_checkpoint else 0
-    if has_checkpoint:
-        store.save(USERNAME, CheckpointState(str(initial)), expected_version=0)
+    timeline = FakeTimeline(initial, window=window, stride=stride)
+    store = CheckedStore(aws.state_table, timeline)
+    checkpoint = timeline.ids[-1] if timeline.ids and has_checkpoint else 0
+    store.floor = checkpoint
+    if checkpoint:
+        CheckpointStore(aws.state_table).save(
+            USERNAME, CheckpointState(str(checkpoint)), expected_version=0
+        )
     timeline.add(arrivals)
-    accepted: set[int] = set()
-    history: list[CheckpointState] = []
-    violations: list[str] = []
-    original_save = store.save
-
-    def checked_save(
-        username: str, new: CheckpointState, *, expected_version: int
-    ) -> bool:
-        ok = original_save(username, new, expected_version=expected_version)
-        if ok:
-            if (
-                history
-                and history[-1].newest_id
-                and (
-                    new.newest_id is None
-                    or int(new.newest_id) < int(history[-1].newest_id)
-                )
-            ):
-                violations.append(f"newest_id regressed {history[-1]} -> {new}")
-            history.append(new)
-            for i in timeline.served:
-                if i > checkpoint and i not in accepted and not covered(i, new):
-                    violations.append(f"hole at {i}: {new}")
-                    break
-        return ok
-
-    store.save = checked_save  # type: ignore[assignment]
+    gap = (
+        None
+        if backfill is None
+        else Gap(since_id=str(backfill[0] * stride), until_id=str(backfill[1] * stride))
+    )
     pending = list(runs)
+    runs_made = 0
 
     def start_run(extra_backfill: Gap | None = None) -> None:
+        nonlocal runs_made
         if not pending:
             return
         max_pages, max_results, nest_http, nest_sqs, arrive, rate_at, fail_at = (
@@ -950,6 +1066,8 @@ def test_nested_overlapping_runs_never_leave_a_hole_at_any_save(
         )
         nested = False
         base = len(timeline.timeline_calls)
+        runs_made += 1
+        hours = runs_made * 6
 
         def nest() -> None:
             nonlocal nested
@@ -968,6 +1086,7 @@ def test_nested_overlapping_runs_never_leave_a_hole_at_any_save(
                 nest()  # between this run's fetch and its save
 
         sqs = RecordingSqs(fail_at - 1 if fail_at else None, before_batch)
+        store.sqss.append(sqs)
         previous = timeline.inject
         timeline.inject = inject
         try:
@@ -978,26 +1097,95 @@ def test_nested_overlapping_runs_never_leave_a_hole_at_any_save(
                 max_results=max_results,
                 max_pages=max_pages,
                 backfill=extra_backfill,
+                checkpoints=store,
+                now=at(hours),
             )
         except EnqueueError, XApiError:
             pass
         finally:
             timeline.inject = previous
-            accepted.update(sqs.accepted)
         nest()
 
     while pending:
-        start_run(backfill)
-        backfill = None
+        start_run(gap)
+        gap = None
 
-    for _ in range(300):
+    for i in range(300):
         sqs = RecordingSqs()
-        result = run(aws, timeline, sqs, max_results=5, max_pages=3)
-        accepted.update(sqs.accepted)
-        if result.stopped_reason is None:
+        store.sqss.append(sqs)
+        result = run(
+            aws,
+            timeline,
+            sqs,
+            max_results=5,
+            max_pages=3,
+            checkpoints=store,
+            now=at((runs_made + i + 1) * 6),
+        )
+        if result.gaps_open == 0:
             break
     else:  # pragma: no cover
         raise AssertionError("did not converge")
 
-    assert not violations, violations[:3]
-    assert {i for i in timeline.served if i > checkpoint} <= accepted
+    assert store.saves > 0 or not timeline.ids
+    assert not store.violations, store.violations[:3]
+    assert {i for i in timeline.served if i > checkpoint} <= store.accepted()
+
+
+class CheckedStore(CheckpointStore):
+    """A store that checks the cursor invariant after every successful save: each
+    Tweet the API serves is enqueued already (by any run, live), above ``newest_id``
+    or inside a gap, and ``newest_id`` never moves backwards."""
+
+    def __init__(self, table: Any, timeline: FakeTimeline) -> None:
+        super().__init__(table)
+        self.timeline = timeline
+        self.sqss: list[RecordingSqs] = []
+        self.floor = 0  # IDs at or below this were never ours to fetch
+        self.saves = 0
+        self.violations: list[str] = []
+        self._last: CheckpointState | None = None
+
+    def accepted(self) -> set[int]:
+        return {i for sqs in self.sqss for i in sqs.accepted}
+
+    def save(
+        self, username: str, state: CheckpointState, *, expected_version: int
+    ) -> bool:
+        ok = super().save(username, state, expected_version=expected_version)
+        if not ok:
+            return ok
+        self.saves += 1
+        last = self._last
+        if (
+            last
+            and last.newest_id
+            and (state.newest_id is None or int(state.newest_id) < int(last.newest_id))
+        ):
+            self.violations.append(f"newest_id regressed {last} -> {state}")
+        self._last = state
+        sent = self.accepted()
+        for i in self.timeline.served:
+            if i > self.floor and i not in sent and not covered(i, state):
+                self.violations.append(f"hole at {i}: {state}")
+                break
+        return ok
+
+
+def test_the_per_save_check_runs_and_can_fail(aws: Aws) -> None:
+    timeline = FakeTimeline(30)
+    store = CheckedStore(aws.state_table, timeline)
+    sqs = RecordingSqs()
+    store.sqss.append(sqs)
+
+    run(aws, timeline, sqs, max_results=5, max_pages=2, checkpoints=store)
+
+    assert store.saves == 2
+    assert store.violations == []
+    # A cursor that hides unfetched Tweets (newest_id past them, no gap) is caught.
+    store.save(
+        USERNAME,
+        CheckpointState(newest_id="30", gaps=(), version=store.load(USERNAME).version),
+        expected_version=store.load(USERNAME).version,
+    )
+    assert store.violations and store.violations[0].startswith("hole at")

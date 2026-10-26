@@ -361,10 +361,15 @@ def test_next_token_followed_by_an_empty_page_keeps_the_gap_for_the_gap_phase(
     result = run(aws, api, since_id="1", max_pages=2)
 
     assert result.pages == 1
-    assert (result.gaps_open, result.stopped_reason) == (1, "page_cap")
-    assert CheckpointStore(aws.state_table).load(USERNAME).gaps == (
-        Gap(until_id="1700000000000000001", since_id="1"),
+    # The empty answer is the gap's first empty observation, so nothing is pending.
+    assert (result.gaps_open, result.stopped_reason) == (1, None)
+    (gap,) = CheckpointStore(aws.state_table).load(USERNAME).gaps
+    assert (gap.until_id, gap.since_id, gap.empty_runs) == (
+        "1700000000000000001",
+        "1",
+        1,
     )
+    assert gap.first_empty_at
 
 
 def test_empty_string_next_token_leaves_no_gap(aws: Aws) -> None:
