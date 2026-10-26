@@ -160,23 +160,30 @@ class XClient:
         user_id: str,
         *,
         since_id: str | None = None,
+        until_id: str | None = None,
         max_results: int = 100,
         max_pages: int = 5,
     ) -> Iterator[TimelinePage]:
         """Yield timeline pages, newest first, following ``meta.next_token``.
 
         Stops when there is no ``next_token`` or after ``max_pages`` pages. With
-        ``since_id`` only Tweets newer than it are returned. A page with
+        ``since_id`` only Tweets newer than it are returned, with ``until_id`` only
+        Tweets older than it (both bounds are exclusive). A page with
         ``meta.result_count == 0`` yields nothing.
         """
         if not 5 <= max_results <= 100:
             raise ValueError(f"max_results must be 5..100, got {max_results}")
         if max_pages < 1:
             raise ValueError(f"max_pages must be >= 1, got {max_pages}")
-        return self._iter_timeline(user_id, since_id, max_results, max_pages)
+        return self._iter_timeline(user_id, since_id, until_id, max_results, max_pages)
 
     def _iter_timeline(
-        self, user_id: str, since_id: str | None, max_results: int, max_pages: int
+        self,
+        user_id: str,
+        since_id: str | None,
+        until_id: str | None,
+        max_results: int,
+        max_pages: int,
     ) -> Iterator[TimelinePage]:
         params: dict[str, str | int] = {
             "max_results": max_results,
@@ -186,6 +193,8 @@ class XClient:
         }
         if since_id:
             params["since_id"] = since_id
+        if until_id:
+            params["until_id"] = until_id
         for page_number in range(1, max_pages + 1):
             body = self._request(f"/users/{user_id}/tweets", params)
             meta: Mapping[str, Any] = body.get("meta") or {}

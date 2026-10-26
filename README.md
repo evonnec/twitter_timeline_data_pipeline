@@ -20,7 +20,7 @@ flowchart LR
     EB[EventBridge schedule] -->|invoke| F[FetchFunction]
     F -->|GET users and tweets| X[X API v2]
     F <-->|read token| SM[Secrets Manager<br/>bearer token]
-    F <-->|checkpoint: newest Tweet ID| ST[(State table)]
+    F <-->|cursor: newest Tweet ID and gaps| ST[(State table)]
     F -->|SendMessageBatch, one message per Tweet| Q[TweetsQueue]
     Q -->|batches of up to 10| P[ProcessFunction]
     Q -.->|after 5 failed receives| DLQ[TweetsDeadLetterQueue]
@@ -35,13 +35,15 @@ flowchart LR
 A run, step by step:
 
 1. EventBridge invokes `FetchFunction` on the schedule (`rate(1 hour)` by default). The event may carry `{"username": "..."}`; otherwise the `TWITTER_USERNAME` setting is used. The name is normalized once (leading `@` removed, lower-cased) and used everywhere below.
-2. The function reads the bearer token from Secrets Manager (cached in memory for 15 minutes), resolves the username to a user ID, and reads the account's checkpoint (the newest Tweet ID already fetched) from the state table.
-3. It pages through `GET /2/users/:id/tweets` with `since_id` set to the checkpoint, up to `MAX_PAGES` pages of `MAX_RESULTS` Tweets, newest first.
+2. The function reads the bearer token from Secrets Manager (cached in memory for 15 minutes), resolves the username to a user ID, and reads the account's cursor from the state table: the newest Tweet ID already fetched, plus any *gaps* (ID ranges known to be unfetched; see the [state table](#state-table-statetable)).
+3. New Tweets first. It pages through `GET /2/users/:id/tweets` with `since_id` set to the newest ID, newest first, in pages of `MAX_RESULTS` Tweets. A first run has no `since_id`.
 4. Each page becomes one message per Tweet, sent to the queue with `SendMessageBatch` (10 at a time; only entries SQS reports as failed are retried).
-5. Only after every message of the run is enqueued does it advance the checkpoint.
-6. SQS invokes `ProcessFunction` with batches of up to 10 messages (up to 10 seconds of batching, at most 5 concurrent invocations).
-7. For each message it downloads the media and uploads it to S3, then writes the Tweet item to DynamoDB. Media goes first so a stored Tweet never points at missing media.
-8. Messages that fail are reported back individually. SQS redelivers them and, after 5 receives, moves them to the dead-letter queue, which has an alarm.
+5. After each page is fully enqueued, the cursor is saved. While the page still has a `next_token`, the not-yet-fetched rest is recorded as a gap just below the lowest ID seen; a page without `next_token` closes it. So a run that hits the cap, a rate limit or an error leaves a gap, never a hole.
+6. Then the gaps. Whatever remains of the shared `MAX_PAGES` budget goes to the gaps, newest gap first, with `since_id` and `until_id` set to the gap's bounds. Each saved page lowers the gap's `until_id`, and the gap is removed when a page has no `next_token`. If the API returns no Tweets for a gap, the range has aged out of its 3,200-post window; the gap is dropped with a warning.
+7. A 429 that resets later than the function will wait ends the run cleanly (`stopped_reason` is `rate_limited`) after saving; any other error fails the invocation, with progress up to the last full page saved. The next run resumes from the cursor and re-sends at most the page that was in flight.
+8. SQS invokes `ProcessFunction` with batches of up to 10 messages (up to 10 seconds of batching, at most 5 concurrent invocations).
+9. For each message it downloads the media and uploads it to S3, then writes the Tweet item to DynamoDB. Media goes first so a stored Tweet never points at missing media.
+10. Messages that fail are reported back individually. SQS redelivers them and, after 5 receives, moves them to the dead-letter queue, which has an alarm.
 
 ## Data model
 
@@ -121,7 +123,16 @@ Each `media` entry has `media_key`, `type`, `status` (`stored` and `exists` for 
 
 ### State table (`StateTable`)
 
-One item per account: partition key `username` (S, lower case), `newest_id` (N, the newest Tweet ID enqueued) and `updated_at` (S). The checkpoint only ever moves forward, through a conditional write.
+One item per account: partition key `username` (S, lower case) and
+
+| Attribute | Type | Meaning |
+| --- | --- | --- |
+| `newest_id` | N | Highest Tweet ID enqueued. Never decreases. Absent until a Tweet has been enqueued. |
+| `gaps` | L of M | Exclusive ID ranges known to be unfetched, each `{until_id, since_id}` (N). A missing `since_id` means "down to the end of what the API serves" (about the 3,200 most recent posts); a missing `until_id` means "up from the newest Tweet". |
+| `version` | N | Optimistic lock, incremented on every write. |
+| `updated_at` | S | UTC timestamp of the last write. |
+
+Every write is conditional on the `version` that run read (a missing `version` counts as 0, so items written before gaps existed are read as they are and upgraded on the first write). If another run got there first, the write fails, the run stops fetching, logs a warning and returns `stopped_reason: "state_conflict"`. Anything it already enqueued is a harmless duplicate, `newest_id` never moves backwards, and no gap is dropped.
 
 ### S3 media bucket
 
@@ -139,8 +150,8 @@ Each object has the `Content-Type` of the source and user metadata `tweet-id`, `
 
 - **`GET /2/users/:id/tweets`.** It returns an account's own Tweets and works with an app-only bearer token (the home timeline endpoint needs user-context OAuth). One request returns up to 100 Tweets with their media expanded, instead of one lookup per Tweet, which keeps API usage low.
 - **At-least-once, with repeatable writes.** SQS can deliver a message twice, and a failed fetch run is re-run from the old checkpoint. Tweets are written with `PutItem` keyed by `tweet_id`, so a repeat overwrites the same item. Writes are last-write-wins, not conditional: a stale redelivery (for example a DLQ redrive of an old message) overwrites newer data such as `public_metrics`. Media keys are deterministic and existing objects are not downloaded again.
-- **Checkpoint after enqueue.** If a run fails midway, the next run re-sends some Tweets (harmless duplicates) rather than losing any. Loss and delay cases are listed under limitations: the page-cap gap loses Tweets, and a batch that fails repeatedly (for example a media timeout) ends in the DLQ without its metadata being written.
-- **Overlapping fetch runs are harmless.** The fetch function has no reserved concurrency. The checkpoint write is conditional, so it never moves backwards, and duplicate messages are handled by idempotent processing.
+- **Cursor after enqueue, per page.** The cursor is saved only after a page's messages are enqueued, so a failed run re-sends at most the page in flight (harmless duplicates) rather than losing any, and a capped or failed run leaves a recorded gap instead of a hole. Remaining delay case: a batch that fails repeatedly (for example a media timeout) ends in the DLQ without its metadata being written.
+- **Overlapping fetch runs are harmless.** The fetch function has no reserved concurrency. The cursor write is conditional on a version, so a run that lost a race stops instead of overwriting, and duplicate messages are handled by idempotent processing.
 - **Partial batch responses, DLQ and alarms.** `ProcessFunction` returns the IDs of failed records, so one bad message does not retry the other nine. Transient media errors (timeouts, 429, 5xx) fail the record for retry. Malformed messages and unexpected errors fail it too and end up in the DLQ after 5 receives (kept 14 days). Alarms cover a non-empty DLQ, fetch errors (1 hour window) and whole-invocation process errors (5 minute window). Because of partial batch responses, a failed record is not a Lambda `Errors` datapoint, so the DLQ alarm is the signal for record-level failures. DLQ messages expire after 14 days. Set `AlarmTopicArn` to get notified through SNS.
 - **Streaming uploads.** Media is downloaded only over https from `pbs.twimg.com` and `video.twimg.com` (message bodies are treated as untrusted), redirects are not followed, and the file is streamed from the CDN straight into S3 `upload_fileobj` through a small file-like adapter, so a large video is never held in memory.
 - **Least-privilege IAM.** The fetch function can send to its queue, read one secret, and get/put items in the state table. The process function can write to the tweets table, put/get objects in the bucket and list it (so a missing key is a 404, not a 403). Neither can touch the other's resources.
@@ -337,7 +348,7 @@ aws lambda invoke --function-name "$FETCH" \
 # or: sam remote invoke FetchFunction --stack-name "$STACK" --event-file events/fetch.json
 ```
 
-The response is the run summary (`pages`, `tweets`, `enqueued`, `newest_id`, `truncated`). `events/fetch.json` is `{"username": "NASA"}`; change it to fetch another account.
+The response is the run summary (`pages`, `tweets`, `enqueued`, `newest_id`, `gaps_open`, `stopped_reason`). `events/fetch.json` is `{"username": "NASA"}`; change it to fetch another account.
 
 **2. Check the queues** (the process function drains the main queue within seconds):
 
@@ -383,7 +394,7 @@ done
 # or: sam logs --stack-name "$STACK" --name FetchFunction
 ```
 
-A second invocation right away should enqueue nothing new, because the checkpoint is set.
+A second invocation right away should enqueue nothing new, because the cursor is set (unless `gaps_open` was above 0, in which case it keeps working through the gaps).
 
 **Local container runs.** With Docker running, `sam local invoke` runs the functions from the built bundle (`build/lambda/`, so run `scripts/build_lambda.sh` first). These use real AWS resources if you give them credentials and environment values:
 
@@ -407,7 +418,22 @@ aws sqs start-message-move-task --source-arn "$DLQ_ARN"   # defaults to the orig
 aws sqs list-message-move-tasks --source-arn "$DLQ_ARN"   # progress
 ```
 
-**Backfill or re-fetch.** The scheduled run only reads Tweets newer than the checkpoint, and a first run reads at most `MAX_PAGES x MAX_RESULTS`. To fetch a specific range, run the CLI against the real stack (it needs the stack's `QUEUE_URL` and `STATE_TABLE`, a token and AWS credentials), with `--since-id` set to the Tweet ID before the range and a higher `--max-pages`:
+**Backfill or re-fetch.** Nothing needs to be done for the normal cases. A first run, a run capped by `MAX_PAGES`, and a run cut short by a rate limit or an error all leave gaps in the state item, and each scheduled run spends its page budget on them after the new Tweets, so the account is backfilled over several runs (the 3,200-post window takes `ceil(32 / MAX_PAGES)` runs at `MAX_RESULTS=100`). Check progress in the run summary: `gaps_open` above 0 with `stopped_reason: "page_cap"` means more to fetch; `null` means done. To look at the cursor:
+
+```bash
+aws dynamodb get-item --table-name "$(out StateTableName)" --consistent-read \
+  --key '{"username": {"S": "nasa"}}'
+```
+
+To fetch a specific range, add a gap with a manual event (either bound may be left out, IDs must be numeric; the bounds are exclusive). The run records it, then fetches it after the new Tweets:
+
+```bash
+aws lambda invoke --function-name "$FETCH" --cli-binary-format raw-in-base64-out \
+  --payload '{"username": "NASA", "backfill": {"since_id": "1850000000000000000", "until_id": "1860000000000000000"}}' \
+  /dev/stdout
+```
+
+Or run the CLI against the real stack (it needs the stack's `QUEUE_URL` and `STATE_TABLE`, a token and AWS credentials). `--since-id` replaces the stored newest ID as the lower bound for the new-Tweets phase, and a higher `--max-pages` fetches more per run:
 
 ```bash
 export QUEUE_URL=$QUEUE STATE_TABLE=$(out StateTableName)
@@ -415,7 +441,7 @@ export BEARER_TOKEN_SECRET_ARN=$(out BearerTokenSecretArn)
 uv run twitter-pipeline fetch --username NASA --since-id 1850000000000000000 --max-pages 32
 ```
 
-Re-sent Tweets are written again over the same items, so a backfill is safe to repeat. Add `--dry-run` to preview without sending. The API exposes only an account's 3,200 most recent Tweets (800 with `exclude=replies`), so nothing older can be backfilled.
+Re-sent Tweets are written again over the same items, so a backfill is safe to repeat. Add `--dry-run` to preview without sending. The API exposes only an account's 3,200 most recent Tweets (800 with `exclude=replies`), so nothing older can be backfilled; a gap that has aged out of that window is dropped with a warning. A `state_conflict` stop only means two runs overlapped: the next scheduled run carries on.
 
 **Rotate the token.** Run `scripts/put_secret.sh` with the new token. Running fetch containers keep the old token for up to 15 minutes (the cache TTL) and drop it earlier on a 401/403, so no redeploy is needed. To switch immediately, invoke the fetch function after the 15 minutes or update its configuration to recycle the containers.
 
@@ -432,8 +458,7 @@ The script reads the table and bucket names from the stack outputs, runs `sam de
 ## Assumptions and limitations
 
 - X API access now requires a paid plan. Billing is currently pay-per-use, charged per post read, and rate limits depend on the plan; check current pricing before deploying. Cost scales with Tweets read per run, which is bounded by `MaxPages x MaxResults` and multiplied by the schedule frequency, so lower `MaxPages` or run less often to spend less.
-- The first run backfills at most `MAX_PAGES x MAX_RESULTS` Tweets (500 by default). The API itself only exposes an account's 3,200 most recent Tweets (800 with `exclude=replies`).
-- Tweets can be lost in the page-cap case: if a run reaches the page cap while a checkpoint is set, Tweets older than those fetched but newer than the checkpoint are skipped, and a warning is logged. Raise `MaxPages` or run more often.
+- Each run fetches at most `MAX_PAGES x MAX_RESULTS` Tweets (500 by default), but nothing is skipped when that is not enough: the remainder is kept as a gap and fetched by later runs, so a first run backfills over several runs. The API itself only exposes an account's 3,200 most recent Tweets (800 with `exclude=replies`); Tweets that age out of that window before they are fetched are unreachable, and the gap covering them is dropped with a warning. If `MAX_PAGES x MAX_RESULTS` per run is lower than the account's posting rate, gaps accumulate; raise `MaxPages` or run more often.
 - Large videos have no size or time budget yet. A batch that times out is retried and can end up in the DLQ, and the Tweets in it have no metadata stored until it is redriven. DLQ messages expire after 14 days, after which they are gone.
 - A media key that is missing from the response's `includes` (deleted or withheld media) is dropped with a warning, so the Tweet is stored without that media entry.
 - Writes are last-write-wins: a stale redelivery or DLQ redrive overwrites a newer item.
@@ -442,7 +467,7 @@ The script reads the table and bucket names from the stack outputs, runs `sam de
 - Metrics (`public_metrics`) are a snapshot at fetch time and are not refreshed.
 - Videos that only have HLS variants (no `video/mp4`) are recorded with status `skipped` and nothing is downloaded.
 - Media whose download returns a 4xx other than 429, or a redirect, is recorded as `unavailable`; the Tweet is still stored. Media at a non-https URL or a host other than the two X CDN hosts is recorded as `skipped`. 429 and 5xx responses and timeouts are retried.
-- One account is fetched per stack through `TwitterUsername`. The fetch event can override the username; names are normalized to lower case, with each account keeping its own checkpoint.
+- One account is fetched per stack through `TwitterUsername`. The fetch event can override the username; names are normalized to lower case, with each account keeping its own cursor.
 - The bearer token is app-only, so protected accounts and private data are not available.
 
 ## Python 3.14 features used

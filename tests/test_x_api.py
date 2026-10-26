@@ -544,6 +544,29 @@ def test_iter_timeline_sends_since_id_on_every_page() -> None:
     ] * 2
 
 
+def test_iter_timeline_sends_until_id_on_every_page() -> None:
+    stub = XApiStub()
+
+    with x_client(stub) as client:
+        list(
+            client.iter_timeline(USER_ID, since_id="10", until_id="1700000000000000000")
+        )
+
+    assert [
+        (r.url.params["since_id"], r.url.params["until_id"])
+        for r in stub.timeline_requests
+    ] == [("10", "1700000000000000000")] * 2
+
+
+def test_iter_timeline_omits_until_id_by_default() -> None:
+    stub = XApiStub()
+
+    with x_client(stub) as client:
+        list(client.iter_timeline(USER_ID))
+
+    assert all("until_id" not in r.url.params for r in stub.timeline_requests)
+
+
 def test_iter_timeline_empty_page_yields_nothing() -> None:
     stub = XApiStub()
 

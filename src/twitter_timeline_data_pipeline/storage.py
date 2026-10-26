@@ -262,37 +262,111 @@ class TweetStore:
         self._table.put_item(Item=self.to_item(message, media))
 
 
+def _check_id(value: str | None) -> None:
+    if value is not None and not (value.isascii() and value.isdecimal()):
+        raise ValueError(f"Tweet ID must be numeric, got {value!r}")
+
+
+@dataclass(frozen=True, slots=True)
+class Gap:
+    """An exclusive range of Tweet IDs, ``since_id < id < until_id``, not fetched yet.
+
+    A missing ``since_id`` means "down to the end of what the API serves"; a missing
+    ``until_id`` means "up from the newest Tweet".
+    """
+
+    until_id: TweetId | None = None
+    since_id: TweetId | None = None
+
+    def __post_init__(self) -> None:
+        _check_id(self.until_id)
+        _check_id(self.since_id)
+
+    @property
+    def sort_key(self) -> float:
+        """Upper bound as a number; an open top sorts above every ID."""
+        return float("inf") if self.until_id is None else int(self.until_id)
+
+    def to_item(self) -> dict[str, int]:
+        # Numbers, not strings: IDs compare as integers.
+        return {
+            name: int(value)
+            for name, value in (
+                ("until_id", self.until_id),
+                ("since_id", self.since_id),
+            )
+            if value is not None
+        }
+
+    @classmethod
+    def from_item(cls, item: Any) -> Gap:
+        def tweet_id(name: str) -> TweetId | None:
+            value = item.get(name)
+            return None if value is None else str(int(value))
+
+        return cls(until_id=tweet_id("until_id"), since_id=tweet_id("since_id"))
+
+
+@dataclass(frozen=True, slots=True)
+class CheckpointState:
+    """What one account's state item says.
+
+    ``newest_id`` is the highest Tweet ID enqueued. ``gaps`` are ranges below it (or
+    manual backfills) still to fetch. ``version`` is the optimistic-lock counter; items
+    written before gaps existed have none and count as version 0.
+    """
+
+    newest_id: TweetId | None = None
+    gaps: tuple[Gap, ...] = ()
+    version: int = 0
+
+
 class CheckpointStore:
-    """Per-username high-water mark (newest Tweet ID enqueued) in the state table."""
+    """Per-username fetch cursor in the state table, written with an optimistic lock."""
 
     def __init__(self, table: Table) -> None:
         self._table = table
 
-    def get(self, username: str) -> TweetId | None:
+    def load(self, username: str) -> CheckpointState:
         response = self._table.get_item(
             Key={"username": username.lower()}, ConsistentRead=True
         )
-        item = response.get("Item")
-        return None if item is None else str(int(cast(Any, item["newest_id"])))
+        item = cast("dict[str, Any] | None", response.get("Item"))
+        if item is None:
+            return CheckpointState()
+        newest = item.get("newest_id")
+        return CheckpointState(
+            newest_id=None if newest is None else str(int(newest)),
+            gaps=tuple(Gap.from_item(g) for g in item.get("gaps", ())),
+            version=int(item.get("version", 0)),
+        )
 
-    def advance(self, username: str, newest_id: TweetId) -> bool:
-        """Store ``newest_id`` only if it's newer than what's stored.
+    def save(
+        self, username: str, state: CheckpointState, *, expected_version: int
+    ) -> bool:
+        """Write ``state`` as version ``expected_version + 1``.
 
-        Uses a conditional write so a slower, older run can't move the mark backwards.
-        Returns whether the item changed.
+        Succeeds only if the stored item is still at ``expected_version`` (or absent,
+        for 0), so a slower run can't overwrite a newer cursor. Returns whether it was
+        written; ``False`` means another run moved the state.
         """
+        item: dict[str, Any] = {
+            "username": username.lower(),
+            "gaps": [g.to_item() for g in state.gaps],
+            "version": expected_version + 1,
+            "updated_at": utc_now_iso(),
+        }
+        if state.newest_id is not None:
+            item["newest_id"] = int(state.newest_id)
+        # A missing version is 0: a new item or one from before versions existed.
+        condition = "version = :expected"
+        if expected_version == 0:
+            condition = f"attribute_not_exists(version) OR {condition}"
         try:
             self._table.put_item(
-                # A Number, not a string: IDs compare as integers.
-                Item={
-                    "username": username.lower(),
-                    "newest_id": int(newest_id),
-                    "updated_at": utc_now_iso(),
-                },
-                ConditionExpression=(
-                    "attribute_not_exists(username) OR newest_id < :new"
-                ),
-                ExpressionAttributeValues={":new": int(newest_id)},
+                Item=item,
+                ConditionExpression=condition,
+                ExpressionAttributeValues={":expected": expected_version},
             )
         except ClientError as exc:
             if exc.response.get("Error", {}).get("Code") == (

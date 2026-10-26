@@ -22,7 +22,9 @@ from mypy_boto3_s3 import S3Client
 from twitter_timeline_data_pipeline.models import Media, TweetMessage
 from twitter_timeline_data_pipeline.storage import (
     ALLOWED_MEDIA_HOSTS,
+    CheckpointState,
     CheckpointStore,
+    Gap,
     MediaStore,
     StoredMedia,
     TransientMediaError,
@@ -546,75 +548,117 @@ def test_put_tweet_twice_replaces_the_item(aws: Aws) -> None:
 # ---- CheckpointStore ---------------------------------------------------------
 
 
-def test_checkpoint_get_missing_is_none(aws: Aws) -> None:
-    assert CheckpointStore(aws.state_table).get("example_user") is None
+def test_load_missing_item_is_the_empty_state(aws: Aws) -> None:
+    assert CheckpointStore(aws.state_table).load("example_user") == CheckpointState()
 
 
-def test_checkpoint_first_advance_writes_a_number(aws: Aws) -> None:
+def test_first_save_writes_numbers_and_version_one(aws: Aws) -> None:
     store = CheckpointStore(aws.state_table)
+    state = CheckpointState(newest_id=TWEET_ID, gaps=(Gap(until_id="9", since_id="3"),))
 
-    assert store.advance("example_user", TWEET_ID) is True
+    assert store.save("example_user", state, expected_version=0) is True
 
     item = ddb_get(aws.state_table, username="example_user")
     assert int(item["newest_id"]) == int(TWEET_ID)
+    assert item["gaps"] == [{"until_id": 9, "since_id": 3}]
+    assert item["version"] == 1
     assert str(item["updated_at"]).endswith("Z")
-    assert store.get("example_user") == TWEET_ID
+    assert store.load("example_user") == CheckpointState(
+        newest_id=TWEET_ID, gaps=state.gaps, version=1
+    )
 
 
-@pytest.mark.parametrize(
-    ("stored", "new", "expected_changed", "expected_value"),
-    [
-        ("100", "200", True, "200"),
-        ("200", "200", False, "200"),
-        ("200", "100", False, "200"),
-        ("999", "1000", True, "1000"),  # numeric, not lexicographic
-        ("1000", "999", False, "1000"),
-        ("1700000000000000001", "1700000000000000002", True, "1700000000000000002"),
-    ],
-)
-def test_checkpoint_advance_only_moves_forward(
-    aws: Aws,
-    stored: str,
-    new: str,
-    expected_changed: bool,
-    expected_value: str,
-) -> None:
+def test_open_ended_gap_round_trips_without_missing_bounds(aws: Aws) -> None:
     store = CheckpointStore(aws.state_table)
-    store.advance("example_user", stored)
+    gaps = (Gap(until_id="50"), Gap(since_id="7"), Gap())
 
-    assert store.advance("example_user", new) is expected_changed
-    assert store.get("example_user") == expected_value
+    store.save("example_user", CheckpointState(gaps=gaps), expected_version=0)
+
+    item = ddb_get(aws.state_table, username="example_user")
+    assert "newest_id" not in item
+    assert item["gaps"] == [{"until_id": 50}, {"since_id": 7}, {}]
+    assert store.load("example_user").gaps == gaps
+
+
+def test_save_requires_the_expected_version(aws: Aws) -> None:
+    store = CheckpointStore(aws.state_table)
+    store.save("example_user", CheckpointState(newest_id="10"), expected_version=0)
+
+    assert (
+        store.save("example_user", CheckpointState("99"), expected_version=0) is False
+    )
+    assert (
+        store.save("example_user", CheckpointState("99"), expected_version=2) is False
+    )
+    assert store.load("example_user").newest_id == "10"
+
+    assert store.save("example_user", CheckpointState("20"), expected_version=1) is True
+    assert store.load("example_user") == CheckpointState("20", (), 2)
+
+
+def test_legacy_item_without_version_loads_as_version_zero_and_upgrades(
+    aws: Aws,
+) -> None:
+    aws.state_table.put_item(
+        Item={"username": "example_user", "newest_id": 500, "updated_at": "x"}
+    )
+    store = CheckpointStore(aws.state_table)
+
+    state = store.load("example_user")
+
+    assert state == CheckpointState(newest_id="500", gaps=(), version=0)
+    assert store.save("example_user", state, expected_version=0) is True
+    assert store.load("example_user").version == 1
+    assert store.save("example_user", state, expected_version=0) is False
 
 
 def test_checkpoint_preserves_snowflake_precision(aws: Aws) -> None:
     store = CheckpointStore(aws.state_table)
-    store.advance("example_user", "1999999999999999999")
+    state = CheckpointState("1999999999999999999", (Gap("1999999999999999998"),))
+    store.save("example_user", state, expected_version=0)
 
-    assert store.get("example_user") == "1999999999999999999"
+    loaded = store.load("example_user")
+    assert loaded.newest_id == "1999999999999999999"
+    assert loaded.gaps == (Gap("1999999999999999998"),)
 
 
 def test_checkpoint_username_is_case_insensitive(aws: Aws) -> None:
     store = CheckpointStore(aws.state_table)
 
-    store.advance("Example_User", "500")
+    store.save("Example_User", CheckpointState("500"), expected_version=0)
 
-    assert store.get("EXAMPLE_USER") == "500"
-    assert store.get("example_user") == "500"
-    assert store.advance("EXAMPLE_user", "400") is False
+    assert store.load("EXAMPLE_USER").newest_id == "500"
+    assert store.load("example_user").newest_id == "500"
+    assert store.save("EXAMPLE_user", CheckpointState("1"), expected_version=0) is False
     assert aws.state_table.scan()["Count"] == 1
-    assert aws.state_table.get_item(Key={"username": "example_user"}).get("Item")
 
 
 def test_checkpoints_are_per_user(aws: Aws) -> None:
     store = CheckpointStore(aws.state_table)
-    store.advance("alice", "10")
+    store.save("alice", CheckpointState("10"), expected_version=0)
 
-    assert store.get("bob") is None
-    assert store.advance("bob", "5") is True
+    assert store.load("bob") == CheckpointState()
+    assert store.save("bob", CheckpointState("5"), expected_version=0) is True
 
 
-def test_checkpoint_advance_reraises_other_dynamodb_errors(aws: Aws) -> None:
+def test_save_reraises_other_dynamodb_errors(aws: Aws) -> None:
     store = CheckpointStore(aws.dynamodb.Table(f"{STATE_TABLE}-missing"))
 
     with pytest.raises(ClientError):
-        store.advance("example_user", "1")
+        store.save("example_user", CheckpointState("1"), expected_version=0)
+
+
+@pytest.mark.parametrize("bad", ["", "abc", "12a", "-5", "1.5", "١٢"])
+def test_gap_rejects_non_numeric_ids(bad: str) -> None:
+    with pytest.raises(ValueError, match="numeric"):
+        Gap(until_id=bad)
+    with pytest.raises(ValueError, match="numeric"):
+        Gap(since_id=bad)
+
+
+def test_gaps_sort_by_upper_bound_with_an_open_top_first() -> None:
+    gaps = [Gap("9"), Gap(None), Gap("100"), Gap("20")]
+
+    ordered = sorted(gaps, key=lambda g: g.sort_key, reverse=True)
+
+    assert [g.until_id for g in ordered] == [None, "100", "20", "9"]
