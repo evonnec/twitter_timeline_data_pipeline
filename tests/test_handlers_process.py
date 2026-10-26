@@ -22,7 +22,7 @@ from twitter_timeline_data_pipeline.config import ConfigError
 from twitter_timeline_data_pipeline.handlers import process
 from twitter_timeline_data_pipeline.handlers.process import handler, process_records
 from twitter_timeline_data_pipeline.models import TweetMessage
-from twitter_timeline_data_pipeline.storage import MediaStore, TweetStore
+from twitter_timeline_data_pipeline.storage import MediaStore, PutResult, TweetStore
 
 SAMPLE_EVENT = Path(__file__).parent.parent / "events" / "sqs.json"
 SAMPLE_PHOTO_URL = "https://pbs.twimg.com/media/ExamplePhoto1.jpg"
@@ -54,7 +54,7 @@ class ExplodingTweetStore(TweetStore):
         super().__init__(table)
         self._bad = bad_tweet_id
 
-    def put_tweet(self, message: TweetMessage, media: Any) -> bool:
+    def put_tweet(self, message: TweetMessage, media: Any) -> PutResult:
         if message.tweet.id == self._bad:
             raise RuntimeError("simulated DynamoDB outage")
         return super().put_tweet(message, media)
@@ -144,13 +144,17 @@ def test_stale_record_is_skipped_without_failing_and_logged(
 
     assert failed == []
     assert any(
-        m.startswith(f"stale write skipped for tweet {GOOD}") for m in caplog.messages
+        m.startswith(f"stale write skipped for tweet {GOOD}")
+        and f"stored fetched_at {NEW}, schema_version 1" in m
+        for m in caplog.messages
     )
     assert not any(m.startswith("stored tweet") for m in caplog.messages)
     stored = ddb_get(aws.tweets_table, tweet_id=GOOD)
     assert stored["fetched_at"] == NEW
     assert stored["public_metrics"] == {"like_count": 5000}
-    assert len(s3_keys(aws)) == 1  # media for the stale record was still stored
+    assert (
+        len(s3_keys(aws)) == 1
+    )  # known limitation: the stale record's media step still ran
 
 
 def test_all_good_batch_has_no_failures(aws: Aws, cdn: CdnStub) -> None:

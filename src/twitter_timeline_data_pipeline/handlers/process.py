@@ -45,7 +45,7 @@ def process_records(
             stored: list[StoredMedia] = [
                 media_store.store(message, m) for m in message.media
             ]
-            written = tweet_store.put_tweet(message, stored)
+            result = tweet_store.put_tweet(message, stored)
         except MessageError:
             logger.exception("message %s is malformed", message_id)
             failed.append(message_id)
@@ -56,14 +56,17 @@ def process_records(
             logger.exception("message %s failed", message_id)
             failed.append(message_id)
         else:
-            if not written:
+            if not result.written:
                 # Not a failure: a newer version is already stored, so a retry or the
                 # DLQ would only repeat this.
                 logger.info(
-                    "stale write skipped for tweet %s (stored item is newer than "
-                    "fetched_at %s)",
+                    "stale write skipped for tweet %s (message fetched_at %s, "
+                    "schema_version %s; stored fetched_at %s, schema_version %s)",
                     message.tweet.id,
                     message.fetched_at,
+                    message.schema_version,
+                    result.stored_fetched_at,
+                    result.stored_schema_version,
                 )
                 continue
             logger.info(

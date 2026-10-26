@@ -28,6 +28,7 @@ from twitter_timeline_data_pipeline.storage import (
     ALLOWED_MEDIA_HOSTS,
     CheckpointStore,
     MediaStore,
+    PutResult,
     StoredMedia,
     TransientMediaError,
     TweetStore,
@@ -557,8 +558,8 @@ def stored_item(aws: Aws) -> dict[str, Any]:
 def test_put_tweet_newer_then_older_skips_the_older(aws: Aws) -> None:
     store = TweetStore(aws.tweets_table)
 
-    assert store.put_tweet(likes(5000, NEWER), []) is True
-    assert store.put_tweet(likes(10, OLDER), []) is False
+    assert store.put_tweet(likes(5000, NEWER), []).written is True
+    assert store.put_tweet(likes(10, OLDER), []).written is False
 
     item = stored_item(aws)
     assert item["public_metrics"] == {"like_count": 5000}
@@ -568,8 +569,8 @@ def test_put_tweet_newer_then_older_skips_the_older(aws: Aws) -> None:
 def test_put_tweet_older_then_newer_replaces_the_item(aws: Aws) -> None:
     store = TweetStore(aws.tweets_table)
 
-    assert store.put_tweet(likes(10, OLDER), []) is True
-    assert store.put_tweet(likes(5000, NEWER), []) is True
+    assert store.put_tweet(likes(10, OLDER), []).written is True
+    assert store.put_tweet(likes(5000, NEWER), []).written is True
 
     item = stored_item(aws)
     assert item["public_metrics"] == {"like_count": 5000}
@@ -579,9 +580,11 @@ def test_put_tweet_older_then_newer_replaces_the_item(aws: Aws) -> None:
 def test_put_tweet_with_equal_fetched_at_rewrites_idempotently(aws: Aws) -> None:
     store = TweetStore(aws.tweets_table)
 
-    assert store.put_tweet(likes(7, NEWER), []) is True
-    assert store.put_tweet(likes(7, NEWER), []) is True
-    assert store.put_tweet(likes(8, NEWER), []) is True  # the tie rule: last one wins
+    assert store.put_tweet(likes(7, NEWER), []).written is True
+    assert store.put_tweet(likes(7, NEWER), []).written is True
+    assert (
+        store.put_tweet(likes(8, NEWER), []).written is True
+    )  # the tie rule: last one wins
 
     assert stored_item(aws)["public_metrics"] == {"like_count": 8}
 
@@ -591,9 +594,9 @@ def test_put_tweet_older_schema_version_cannot_overwrite_a_newer_one(
 ) -> None:
     store = TweetStore(aws.tweets_table)
 
-    assert store.put_tweet(likes(1, OLDER, schema_version=2), []) is True
+    assert store.put_tweet(likes(1, OLDER, schema_version=2), []).written is True
     # fetched later, but in the old format
-    assert store.put_tweet(likes(2, NEWER, schema_version=1), []) is False
+    assert store.put_tweet(likes(2, NEWER, schema_version=1), []).written is False
 
     item = stored_item(aws)
     assert item["schema_version"] == 2
@@ -603,8 +606,8 @@ def test_put_tweet_older_schema_version_cannot_overwrite_a_newer_one(
 def test_put_tweet_newer_schema_version_can_overwrite_an_older_one(aws: Aws) -> None:
     store = TweetStore(aws.tweets_table)
 
-    assert store.put_tweet(likes(1, OLDER, schema_version=1), []) is True
-    assert store.put_tweet(likes(2, NEWER, schema_version=2), []) is True
+    assert store.put_tweet(likes(1, OLDER, schema_version=1), []).written is True
+    assert store.put_tweet(likes(2, NEWER, schema_version=2), []).written is True
 
     assert stored_item(aws)["schema_version"] == 2
 
@@ -614,11 +617,30 @@ def test_put_tweet_overwrites_a_legacy_item_without_schema_version(aws: Aws) -> 
         Item={"tweet_id": TWEET_ID, "username": "u", "fetched_at": OLDER}
     )
 
-    assert TweetStore(aws.tweets_table).put_tweet(likes(3, NEWER), []) is True
+    assert TweetStore(aws.tweets_table).put_tweet(likes(3, NEWER), []).written
 
     item = stored_item(aws)
     assert item["schema_version"] == 1
     assert item["public_metrics"] == {"like_count": 3}
+
+
+def test_put_tweet_overwrites_an_item_without_fetched_at(aws: Aws) -> None:
+    aws.tweets_table.put_item(Item={"tweet_id": TWEET_ID, "username": "u"})
+
+    assert TweetStore(aws.tweets_table).put_tweet(likes(3, NEWER), []).written
+
+    assert stored_item(aws)["fetched_at"] == NEWER
+
+
+def test_put_tweet_stale_result_reports_the_stored_values(aws: Aws) -> None:
+    store = TweetStore(aws.tweets_table)
+    store.put_tweet(likes(1, NEWER, schema_version=2), [])
+
+    result = store.put_tweet(likes(2, OLDER), [])
+
+    assert result == PutResult(
+        written=False, stored_fetched_at=NEWER, stored_schema_version=2
+    )
 
 
 def test_put_tweet_reraises_other_dynamodb_errors(aws: Aws) -> None:

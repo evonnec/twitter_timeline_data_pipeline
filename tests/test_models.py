@@ -1,6 +1,7 @@
 import json
 import logging
 from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -519,3 +520,49 @@ def test_normalize_username_strips_one_at_and_lowercases(
     given: str, expected: str
 ) -> None:
     assert normalize_username(given) == expected
+
+
+def message_data(**overrides: Any) -> dict[str, Any]:
+    data: dict[str, Any] = json.loads(make_message().to_json())
+    data.update(overrides)
+    return data
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("2026-10-25T01:00:00+01:00", "2026-10-25T00:00:00Z"),
+        ("2026-10-25 23:59:59Z", "2026-10-25T23:59:59Z"),
+        ("2026-10-25T12:00:00.500Z", "2026-10-25T12:00:00Z"),
+        ("2026-10-25T12:00:00Z", "2026-10-25T12:00:00Z"),
+    ],
+)
+def test_from_dict_normalizes_fetched_at_to_utc_seconds(
+    raw: str, expected: str
+) -> None:
+    assert TweetMessage.from_dict(message_data(fetched_at=raw)).fetched_at == expected
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [None, 20261025, ["2026-10-25T00:00:00Z"], "yesterday", "", "2026-10-25T00:00:00"],
+)
+def test_from_dict_rejects_a_bad_fetched_at(raw: object) -> None:
+    with pytest.raises(MessageError, match="fetched_at"):
+        TweetMessage.from_dict(message_data(fetched_at=raw))
+
+
+def test_from_dict_rejects_a_far_future_fetched_at() -> None:
+    with pytest.raises(MessageError, match="future"):
+        TweetMessage.from_dict(message_data(fetched_at="2999-01-01T00:00:00Z"))
+
+
+def test_from_dict_accepts_a_slightly_future_fetched_at() -> None:
+    soon = (datetime.now(UTC) + timedelta(minutes=1)).isoformat()
+
+    assert TweetMessage.from_dict(message_data(fetched_at=soon))
+
+
+def test_from_dict_rejects_a_boolean_schema_version() -> None:
+    with pytest.raises(MessageError, match="unsupported schema_version"):
+        TweetMessage.from_dict(message_data(schema_version=True))
