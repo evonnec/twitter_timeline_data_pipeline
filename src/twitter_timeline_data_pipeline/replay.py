@@ -52,7 +52,8 @@ def without_redactions(page: TimelinePage, redactions: tuple[str, ...]) -> Timel
     used = {key for t in kept for key in t.media_keys}
     dropped = {key for t in page.tweets if t.id in gone for key in t.media_keys}
     media = {k: m for k, m in page.media.items() if k in used or k not in dropped}
-    return replace(page, tweets=kept, media=media)
+    quarantined = tuple(q for q in page.quarantined if q.tweet_id not in gone)
+    return replace(page, tweets=kept, media=media, quarantined=quarantined)
 
 
 def messages_from_raw(
@@ -114,11 +115,13 @@ def run_replay(
     bucket: str,
     prefix: str,
     send: Callable[[list[TweetMessage]], int],
-    quarantine: QuarantineStore | None = None,
+    quarantine: QuarantineStore | None,
     start_after: str | None = None,
 ) -> ReplayResult:
     """Hand the messages of every raw page under ``prefix`` to ``send`` (which returns
-    how many it sent; a dry run prints them and returns 0)."""
+    how many it sent; a dry run prints them and returns 0). ``quarantine`` has no
+    default: pass a store for a real replay, None only for a dry run (items are then
+    just logged)."""
     objects = tweets = enqueued = 0
     last_key = None
     skipped: list[str] = []

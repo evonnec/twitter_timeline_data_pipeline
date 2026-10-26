@@ -102,6 +102,11 @@ def clamp_int(value: int) -> int:
     return max(-MAX_STORED_INT, min(MAX_STORED_INT, value))
 
 
+def valid_tweet_id(value: object) -> bool:
+    """Whether ``value`` is a Tweet ID: a string of ASCII decimal digits."""
+    return isinstance(value, str) and value.isascii() and value.isdecimal()
+
+
 def _opt_int(value: Any) -> int | None:
     return None if value is None else clamp_int(int(value))
 
@@ -214,7 +219,16 @@ class Tweet:
 
     @classmethod
     def from_api(cls, data: Mapping[str, Any]) -> Self:
-        """Build from an API Tweet object (media keys live under ``attachments``)."""
+        """Build from an API Tweet object (media keys live under ``attachments``).
+
+        Raises ``ValueError`` unless ``id`` is a decimal string (or a whole number):
+        an ID the cursor can't use must not get as far as the queue.
+        """
+        raw_id = data["id"]
+        if type(raw_id) is int and raw_id >= 0:
+            raw_id = str(raw_id)  # a JSON number is coerced, a float or null is not
+        if not valid_tweet_id(raw_id):
+            raise ValueError(f"not a Tweet ID: {raw_id!r}")
         attachments = data.get("attachments") or {}
         # X is renaming the field (the docs and OpenAPI spec show ``note_post``).
         note = data.get("note_tweet") or data.get("note_post") or {}
@@ -445,6 +459,28 @@ class TimelinePage:
     """The response this page was parsed from; None for a page built by hand."""
     quarantined: tuple[QuarantinedItem, ...] = ()
     """Items of the page that failed to parse. They are not in ``tweets``/``media``."""
+
+    def cursor_ids(self) -> list[int]:
+        """The Tweet IDs the cursor may treat as seen: the parsed Tweets, plus the IDs
+        of quarantined ones that lie within the page's own ID range (the parsed Tweets
+        and ``meta.oldest_id``/``newest_id``). A bad Tweet's ``id`` is untrusted: one
+        outside that range could skip real Tweets or push ``newest_id`` past them, so
+        it counts as having no ID."""
+        ids = [int(t.id) for t in self.tweets]
+        bounds = [
+            int(i)
+            for i in (self.oldest_id, self.newest_id)
+            if i is not None and valid_tweet_id(i)  # meta is untrusted too
+        ]
+        span = [*ids, *bounds]
+        if span:
+            low, high = min(span), max(span)
+            ids += [
+                int(q.tweet_id)
+                for q in self.quarantined
+                if q.tweet_id and low <= int(q.tweet_id) <= high
+            ]
+        return ids
 
     def messages(
         self,

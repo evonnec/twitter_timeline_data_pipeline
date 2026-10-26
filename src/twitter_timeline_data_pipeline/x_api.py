@@ -27,6 +27,7 @@ from twitter_timeline_data_pipeline.models import (
     RawPage,
     TimelinePage,
     Tweet,
+    valid_tweet_id,
 )
 
 logger = logging.getLogger(__name__)
@@ -86,7 +87,9 @@ class AuthError(XApiError):
 
 
 class NotFoundError(XApiError):
-    """The username doesn't exist, or the account is suspended or protected."""
+    """The username or user ID doesn't exist, or the account is suspended (typed
+    ``resource-not-found`` for a ``user``). A protected account raises ``AccessError``
+    instead."""
 
 
 class AccessError(XApiError):
@@ -118,7 +121,7 @@ def _quarantine(kind: str, item: Any, exc: Exception) -> QuarantinedItem:
     tweet_id = None
     if kind == "tweet" and isinstance(item, Mapping):
         raw_id = item.get("id")
-        if isinstance(raw_id, str) and raw_id.isascii() and raw_id.isdecimal():
+        if valid_tweet_id(raw_id):
             tweet_id = raw_id
     error = f"{type(exc).__name__}: {exc}"
     logger.error(UNPARSEABLE_MESSAGE, kind, tweet_id or "unknown", error)
@@ -139,7 +142,7 @@ def parse_timeline_page(
     next_token = meta.get("next_token")
     if not data:
         return TimelinePage(tweets=(), media={}, next_token=next_token, raw=raw)
-    media_objects = (body.get("includes") or {}).get("media", [])
+    media_objects = (body.get("includes") or {}).get("media") or []
     if not isinstance(data, list) or not isinstance(media_objects, list):
         # No item boundary to quarantine at: fail the page (the cursor keeps it).
         raise ValueError("response has a non-list data or includes.media")
@@ -412,6 +415,12 @@ def _problem_error(message: str, errors: Any) -> XApiError:
     for entry in errors if isinstance(errors, list) else ():
         if isinstance(entry, Mapping) and isinstance(entry.get("type"), str):
             cls = _PROBLEM_ERRORS.get(entry["type"].rstrip("/").rsplit("/", 1)[-1])
+            if cls is NotFoundError and (
+                entry.get("resource_type") != "user" or entry.get("parameter") != "id"
+            ):
+                continue  # some other resource (a Tweet, say): not the account
+            if cls is NotFoundError:
+                return cls(f"user not found: {message}", status_code=200)
             if cls is not None:
                 return cls(message, status_code=200)
     return XApiError(message, status_code=200)

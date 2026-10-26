@@ -1,6 +1,7 @@
 """What the X API can answer that the fetch function must not misread."""
 
 import json
+import logging
 
 import pytest
 
@@ -11,19 +12,16 @@ from system.harness import USER_ID
 OTHER_USER_ID = "2000000002"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="#15: the handle is resolved on every run and never checked against the "
-    "user ID the checkpoint belongs to",
-)
 def test_handle_taken_over_by_another_account_is_not_ingested(
     make_sim: MakeSim,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """The account renames itself and another account registers the old handle and
     posts. (Snowflake IDs are global, so its posts are newer than the checkpoint.)
 
-    Expected: the next run stores none of the other account's posts and fails, so the
-    fetch alarm fires.
+    Expected: none of the other account's posts is ever stored. Within the user-ID TTL
+    the cached ID still reads the original account; once it expires the lookup returns
+    the other account's ID and the run fails, so the fetch alarm fires.
     """
     sim = make_sim()
     x, user = sim.x, sim.username
@@ -33,12 +31,27 @@ def test_handle_taken_over_by_another_account_is_not_ingested(
     x.add_user(user, OTHER_USER_ID)
     for _ in range(2):
         x.post(user)
+    # The original account posts again under its new handle (its ID is still
+    # USER_ID); the new owner of the old handle posts too.
+    mine.append(x.post(f"{user}_renamed"))
 
-    (run,) = sim.run(1)
+    (inside,) = sim.run(1)  # within the TTL: the cached ID reads the original account
 
+    assert inside.outcome == "ok"
+    assert_stored(sim, mine)
+
+    sim.advance(25 * 3600)  # past the 24 h user-ID TTL
+
+    with caplog.at_level(logging.ERROR):
+        (run,) = sim.run(1)
+
+    assert run.outcome == "error"
+    assert (
+        f"identity changed for handle {user.lower()}: stored user_id {USER_ID}"
+        in caplog.text
+    )
     assert_stored(sim, mine)
     assert {i["author_id"] for i in sim.tweets().values()} == {USER_ID}
-    assert run.outcome == "error"
 
 
 def test_errors_only_timeline_fails_the_run(make_sim: MakeSim) -> None:

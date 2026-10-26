@@ -28,7 +28,7 @@ from twitter_timeline_data_pipeline.quarantine import (
 )
 from twitter_timeline_data_pipeline.raw import Envelope, RawPageStore
 from twitter_timeline_data_pipeline.replay import run_replay
-from twitter_timeline_data_pipeline.storage import CheckpointStore
+from twitter_timeline_data_pipeline.storage import CheckpointState, CheckpointStore, Gap
 from twitter_timeline_data_pipeline.x_api import (
     PARTIAL_ERRORS_MESSAGE,
     UNPARSEABLE_MESSAGE,
@@ -148,7 +148,11 @@ def test_one_bad_tweet_is_quarantined_and_the_rest_enqueued(
 
 
 def test_the_cursor_moves_past_a_quarantined_tweet(aws: Aws) -> None:
-    run(aws, body_of([bad_tweet(GOOD1), tweet(GOOD2)]), FakeSqs())
+    run(
+        aws,
+        body_of([bad_tweet(GOOD1), tweet(GOOD2)], newest_id=GOOD1, oldest_id=GOOD2),
+        FakeSqs(),
+    )
 
     state = CheckpointStore(aws.state_table).load(USERNAME)
     assert state.newest_id == GOOD1  # the bad (newest) Tweet counts as seen
@@ -158,7 +162,11 @@ def test_the_cursor_moves_past_a_quarantined_tweet(aws: Aws) -> None:
 def test_a_page_of_only_bad_tweets_still_advances(aws: Aws) -> None:
     sqs = FakeSqs()
 
-    result = run(aws, body_of([bad_tweet(GOOD1), {"no": "id"}]), sqs)
+    result = run(
+        aws,
+        body_of([bad_tweet(GOOD1), {"no": "id"}], newest_id=GOOD1, oldest_id=GOOD1),
+        sqs,
+    )
 
     assert sqs.calls == []
     assert result.enqueued == 0
@@ -262,7 +270,9 @@ def test_replay_without_a_store_only_logs(
     land(aws, body_of([tweet(GOOD1), bad_tweet()]))
 
     with caplog.at_level(logging.ERROR):
-        result = run_replay(s3=aws.s3, bucket=BUCKET, prefix="raw/", send=len)
+        result = run_replay(
+            quarantine=None, s3=aws.s3, bucket=BUCKET, prefix="raw/", send=len
+        )
 
     assert result.tweets == 1
     assert quarantined(aws) == {}
@@ -280,7 +290,7 @@ def test_replay_after_a_parser_fix_recovers_the_quarantined_tweet(
         ids.extend(m.tweet.id for m in ms)
         return len(ms)
 
-    run_replay(s3=aws.s3, bucket=BUCKET, prefix="raw/", send=collect)
+    run_replay(quarantine=None, s3=aws.s3, bucket=BUCKET, prefix="raw/", send=collect)
     assert ids == [GOOD1]
 
     original = models.Tweet.from_api  # the parser fix: ignore null metrics
@@ -290,7 +300,7 @@ def test_replay_after_a_parser_fix_recovers_the_quarantined_tweet(
         classmethod(lambda _cls, d: original({**d, "public_metrics": {}})),
     )
     ids.clear()
-    run_replay(s3=aws.s3, bucket=BUCKET, prefix="raw/", send=collect)
+    run_replay(quarantine=None, s3=aws.s3, bucket=BUCKET, prefix="raw/", send=collect)
     assert ids == [GOOD1, BAD]
 
 
@@ -311,7 +321,12 @@ PROBLEMS = "https://api.twitter.com/2/problems/"
 def test_errors_only_timeline_maps_the_problem_type(
     problem_type: str | None, expected: type[XApiError]
 ) -> None:
-    error: dict[str, Any] = {"title": "Authorization Error", "detail": "protected"}
+    error: dict[str, Any] = {
+        "title": "Authorization Error",
+        "detail": "protected",
+        "resource_type": "user",
+        "parameter": "id",
+    }
     if problem_type:
         error["type"] = problem_type
     handler = serving({"errors": [error], "meta": {"result_count": 0}})
@@ -368,12 +383,163 @@ def test_parse_timeline_page_reports_quarantined_items() -> None:
     assert (q.kind, q.tweet_id, q.item) == ("tweet", BAD, bad_tweet())
 
 
-@pytest.mark.parametrize("bad_id", [None, 5, "abc", "١٢٣"])
-def test_a_quarantined_tweet_without_a_usable_id_has_no_tweet_id(bad_id: Any) -> None:
-    page = parse_timeline_page(body_of([{"id": bad_id}]))
+@pytest.mark.parametrize("bad_id", [None, "", -5, True, 1.5, "abc", "١٢٣", "12 "])
+def test_a_tweet_with_a_garbage_id_is_quarantined_without_a_tweet_id(
+    bad_id: Any,
+) -> None:
+    page = parse_timeline_page(body_of([{"id": bad_id, "text": "t"}, tweet(GOOD1)]))
+
+    assert [t.id for t in page.tweets] == [GOOD1]
 
     (q,) = page.quarantined
     assert q.tweet_id is None
+    assert "not a Tweet ID" in q.error
+
+
+def test_a_garbage_id_does_not_block_the_account(aws: Aws) -> None:
+    sqs = FakeSqs()
+    body = body_of([tweet(GOOD1), {"id": None, "text": "t"}, tweet(GOOD2)])
+
+    run(aws, body, sqs)
+    run(aws, body, sqs)  # the next run is not stuck on it either
+
+    assert sent_ids(sqs)[:2] == [GOOD1, GOOD2]
+    assert CheckpointStore(aws.state_table).load(USERNAME).newest_id == GOOD1
+
+
+@pytest.mark.parametrize("bogus", ["5", "99999999999999999999"])
+def test_a_quarantined_id_outside_the_page_range_is_not_trusted(
+    aws: Aws, bogus: str
+) -> None:
+    """[GOOD1, bad, GOOD2] with more pages behind it and one request: the gap must
+    start just below the lowest *parsed* Tweet, not at the bogus ID."""
+    body = body_of(
+        [tweet(GOOD1), bad_tweet(bogus), tweet(GOOD2)],
+        next_token="more",
+        newest_id=GOOD1,
+        oldest_id=GOOD2,
+    )
+
+    with x_client(serving(body)) as client:
+        run_fetch(
+            username=USERNAME,
+            x_client=client,
+            sqs=FakeSqs().client,
+            queue_url=aws.queue_url,
+            checkpoints=CheckpointStore(aws.state_table),
+            max_results=100,
+            max_pages=1,
+            raw_pages=RawPageStore(aws.s3, BUCKET, run_id=RUN_ID),
+            quarantine=QuarantineStore(aws.s3, BUCKET, run_id=RUN_ID),
+            sleep=lambda _s: None,
+        )
+
+    state = CheckpointStore(aws.state_table).load(USERNAME)
+    assert state.newest_id == GOOD1
+    assert [g.until_id for g in state.gaps] == [GOOD2]
+    assert len(quarantined(aws)) == 1  # still preserved
+
+
+def test_cursor_ids_use_meta_when_there_are_no_parsed_tweets() -> None:
+    page = parse_timeline_page(
+        body_of([bad_tweet(BAD)], newest_id=GOOD1, oldest_id=GOOD2)
+    )
+    assert page.cursor_ids() == [int(BAD)]
+    # no usable range at all: nothing is trusted
+    assert parse_timeline_page(body_of([bad_tweet(BAD)])).cursor_ids() == []
+    junk = parse_timeline_page(body_of([bad_tweet(BAD)], newest_id="x", oldest_id=None))
+    assert junk.cursor_ids() == []
+
+
+def test_a_gap_holding_only_idless_bad_tweets_closes(aws: Aws) -> None:
+    sqs = FakeSqs()
+    body = body_of([{"id": None, "text": "t"}])
+
+    result = run(aws, body, sqs, backfill=Gap(since_id="1", until_id=GOOD1))
+
+    assert result.gaps_open == 0
+    assert CheckpointStore(aws.state_table).load(USERNAME).gaps == ()
+    assert len(quarantined(aws)) >= 1
+
+
+def test_null_includes_media_is_an_empty_list() -> None:
+    page = parse_timeline_page(
+        {"data": [tweet(GOOD1)], "includes": {"media": None}, "meta": {}}
+    )
+    assert [t.id for t in page.tweets] == [GOOD1]
+    assert page.quarantined == ()
+
+
+def test_replay_does_not_requarantine_a_redacted_tweet(aws: Aws) -> None:
+    envelope = Envelope(
+        username="u",
+        user_id="1",
+        fetched_at=STAMP,
+        request={},
+        response=body_of([tweet(GOOD1), bad_tweet()]),
+        redactions=(BAD,),
+    )
+    aws.s3.put_object(Bucket=BUCKET, Key="raw/1/a.json.gz", Body=envelope.to_bytes())
+
+    run_replay(
+        s3=aws.s3,
+        bucket=BUCKET,
+        prefix="raw/",
+        send=len,
+        quarantine=QuarantineStore(aws.s3, BUCKET),
+    )
+
+    assert quarantined(aws) == {}
+
+
+@pytest.mark.parametrize("error", [AccessError("x"), NotFoundError("x")])
+def test_account_wide_errors_in_a_gap_stop_the_run_at_once(
+    aws: Aws, error: XApiError
+) -> None:
+    calls = 0
+
+    def api(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        if request.url.path.endswith("/tweets"):
+            if "until_id" not in request.url.params:  # the new-Tweets phase
+                return httpx.Response(200, json={"meta": {"result_count": 0}})
+            calls += 1
+            body = {"errors": [{"type": PROBLEMS + "not-authorized-for-resource"}]}
+            if isinstance(error, NotFoundError):
+                body = {
+                    "errors": [
+                        {
+                            "type": PROBLEMS + "resource-not-found",
+                            "resource_type": "user",
+                            "parameter": "id",
+                        }
+                    ]
+                }
+            return httpx.Response(200, json=body)
+        return XApiStub()(request)
+
+    state = CheckpointStore(aws.state_table)
+    state.save(
+        USERNAME,
+        CheckpointState(
+            newest_id=GOOD1,
+            gaps=(Gap(since_id="1", until_id="5"), Gap(since_id="6", until_id="9")),
+        ),
+        expected_version=0,
+    )
+    with x_client(api) as client, pytest.raises(type(error)):
+        run_fetch(
+            username=USERNAME,
+            x_client=client,
+            sqs=FakeSqs().client,
+            queue_url=aws.queue_url,
+            checkpoints=state,
+            max_results=100,
+            max_pages=5,
+            sleep=lambda _s: None,
+        )
+
+    assert calls == 1  # the other gap would fail the same way: no second request
 
 
 # ---- SenderFault ------------------------------------------------------------------
