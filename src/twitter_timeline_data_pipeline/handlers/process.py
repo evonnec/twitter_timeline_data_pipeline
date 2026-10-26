@@ -24,12 +24,14 @@ from twitter_timeline_data_pipeline.models import (
     TweetMessage,
 )
 from twitter_timeline_data_pipeline.storage import (
+    MEDIA_HOSTS_OVERRIDE_ENV,
     MediaRetryQueue,
     MediaStore,
     StoredMedia,
     TransientMediaError,
     TweetStore,
     estimated_size,
+    media_hosts_override,
 )
 
 if TYPE_CHECKING:
@@ -260,6 +262,21 @@ def _http_client(timeout: float) -> httpx.Client:
 
 
 @functools.cache
+def _test_media_hosts() -> frozenset[str]:
+    """Hosts from the test-only allowlist override; cached so the warning is logged
+    once per container, on its first invocation."""
+    hosts = media_hosts_override()
+    if hosts:
+        logger.warning(
+            "%s is set: media downloads are also allowed from %s over http or https. "
+            "This is for integration tests and must never be set in a real deployment.",
+            MEDIA_HOSTS_OVERRIDE_ENV,
+            sorted(hosts),
+        )
+    return hosts
+
+
+@functools.cache
 def _tweet_store(table_name: str, bucket: str) -> TweetStore:
     dynamodb = boto3.resource("dynamodb", config=_short_timeouts())
     return TweetStore(dynamodb.Table(table_name), _s3_client(), bucket)
@@ -279,6 +296,7 @@ def handler(event: Any, context: Any) -> dict[str, list[dict[str, str]]]:
             settings.media_bucket,
             _http_client(settings.http_timeout),
             max_bytes=settings.max_media_bytes,
+            test_hosts=_test_media_hosts(),
         ),
         tweet_store=_tweet_store(settings.tweets_table, settings.media_bucket),
         remaining_ms=getattr(context, "get_remaining_time_in_millis", None),

@@ -21,6 +21,7 @@ import io
 import json
 import logging
 import mimetypes
+import os
 import posixpath
 import re
 import time
@@ -65,6 +66,29 @@ a message on the media-retry queue will store it later and replace this status;
 
 # Media is only downloaded from the X CDN; message bodies are untrusted input.
 ALLOWED_MEDIA_HOSTS = frozenset({"pbs.twimg.com", "video.twimg.com"})
+
+# TEST ONLY. Comma-separated hostnames that are also allowed, over http or https, so the
+# integration tests can serve media from a stub. template.yaml never sets it (a template
+# test enforces that), and the handlers log a WARNING when it is active.
+MEDIA_HOSTS_OVERRIDE_ENV = "MEDIA_ALLOWED_HOSTS_OVERRIDE"
+_HOSTNAME_RE = re.compile(r"[a-z0-9]([a-z0-9.-]*[a-z0-9])?")
+
+
+def media_hosts_override(environ: Mapping[str, str] | None = None) -> frozenset[str]:
+    """Extra media hosts from ``MEDIA_ALLOWED_HOSTS_OVERRIDE``; empty when unset.
+
+    Raises ``ValueError`` for an entry that isn't a bare hostname (no scheme, port or
+    path), so a typo can't silently widen the allowlist.
+    """
+    raw = (os.environ if environ is None else environ).get(MEDIA_HOSTS_OVERRIDE_ENV, "")
+    hosts = frozenset(h.strip().lower() for h in raw.split(",") if h.strip())
+    for host in hosts:
+        if not _HOSTNAME_RE.fullmatch(host):
+            raise ValueError(
+                f"{MEDIA_HOSTS_OVERRIDE_ENV}: {host!r} is not a bare hostname"
+            )
+    return hosts
+
 
 _KNOWN_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".gif", ".webp", ".mp4"})
 _MISSING_OBJECT_CODES = frozenset({"404", "NoSuchKey", "NotFound"})
@@ -200,7 +224,11 @@ class MediaStore:
         *,
         max_bytes: int = DEFAULT_MAX_MEDIA_BYTES,
         clock: Callable[[], float] = time.monotonic,
+        test_hosts: frozenset[str] = frozenset(),
     ) -> None:
+        """``test_hosts`` is for the integration tests only: see
+        ``media_hosts_override``."""
+        self._test_hosts = test_hosts
         self._s3 = s3_client
         self._bucket = bucket
         self._http = http_client
@@ -232,7 +260,11 @@ class MediaStore:
             host = parts.hostname
         except ValueError:  # malformed URL, e.g. an unclosed IPv6 bracket
             parts, host = None, None
-        if parts is None or parts.scheme != "https" or host not in ALLOWED_MEDIA_HOSTS:
+        allowed = parts is not None and (
+            (parts.scheme == "https" and host in ALLOWED_MEDIA_HOSTS)
+            or (parts.scheme in ("http", "https") and host in self._test_hosts)
+        )
+        if parts is None or not allowed:
             logger.warning(
                 "media %s skipped: host %r is not an allowed media host",
                 media.media_key,
