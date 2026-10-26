@@ -10,7 +10,8 @@ Endpoints:
 - ``GET /2/users/by/username/<name>``: the user lookup (any name resolves).
 - ``GET /2/users/<id>/tweets``: a three-Tweet timeline, newest first, honouring
   ``since_id`` (exclusive). Needs ``Authorization: Bearer <token>``, else 401.
-- ``GET /media/<name>``: fixed JPEG-like bytes; ``Missing.jpg`` answers 404.
+- ``GET /media/<name>``: fixed JPEG-like bytes; ``Missing.jpg`` answers 404, and
+  ``Flaky.jpg`` answers 503 until ``POST /__flaky/up`` (``/__reset`` undoes that).
 - ``GET /__requests``: every request seen so far, as JSON. ``POST /__reset`` clears it.
 - ``GET /__health``: 200, for readiness checks.
 """
@@ -85,6 +86,7 @@ class StubApi:
     def __init__(self, public_url: str) -> None:
         self.public_url = public_url
         self.seen: list[dict[str, Any]] = []
+        self.flaky_up = False
         self.lock = threading.Lock()
 
     def handle(
@@ -100,7 +102,11 @@ class StubApi:
         if method == "POST" and path == "/__reset":
             with self.lock:
                 self.seen.clear()
+                self.flaky_up = False
             return HTTPStatus.OK, b"reset", "text/plain"
+        if method == "POST" and path == "/__flaky/up":
+            self.flaky_up = True
+            return HTTPStatus.OK, b"up", "text/plain"
         if method != "GET":
             return reply(HTTPStatus.NOT_FOUND, {"title": "Not Found"})
         if path == "/__health":
@@ -120,6 +126,8 @@ class StubApi:
         if path.startswith("/media/"):
             if path.endswith("/Missing.jpg"):
                 return HTTPStatus.NOT_FOUND, b"gone", "text/plain"
+            if path.endswith("/Flaky.jpg") and not self.flaky_up:
+                return HTTPStatus.SERVICE_UNAVAILABLE, b"down", "text/plain"
             return HTTPStatus.OK, PHOTO_BYTES, "image/jpeg"
         if authorization != f"Bearer {TOKEN}":
             return reply(HTTPStatus.UNAUTHORIZED, {"title": "Unauthorized"})
