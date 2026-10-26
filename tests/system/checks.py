@@ -62,9 +62,13 @@ def assert_stored_once(sim: Simulation, tweets: Iterable[FakeTweet]) -> None:
 
 
 def assert_quiet(sim: Simulation) -> None:
-    """Nothing left on the tweets queue (visible or in flight) or in the DLQ."""
+    """Nothing left on the tweets or media-retry queue (visible, delayed or in flight)
+    or in either DLQ."""
     assert sim.depth(sim.queue) == (0, 0)
     assert sim.depth(sim.dlq) == (0, 0), sim.dlq_bodies()
+    assert sim.depth(sim.retry_queue) == (0, 0)
+    assert sim.delayed(sim.retry_queue) == 0
+    assert sim.depth(sim.retry_dlq) == (0, 0), sim.dlq_bodies(sim.retry_dlq)
 
 
 def delivery_counts(sim: Simulation) -> Counter[str | None]:

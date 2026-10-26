@@ -18,6 +18,8 @@ def test_defaults_with_empty_environment() -> None:
     assert settings.max_pages == 5
     assert settings.x_api_base_url == DEFAULT_X_API_BASE_URL
     assert settings.http_timeout == 10.0
+    assert settings.max_media_bytes == 512 * 1024 * 1024
+    assert settings.max_receive_count is None
 
 
 def test_from_env_reads_every_variable() -> None:
@@ -34,6 +36,8 @@ def test_from_env_reads_every_variable() -> None:
             "MAX_PAGES": "2",
             "X_API_BASE_URL": "http://localhost:9999/2",
             "HTTP_TIMEOUT_SECONDS": "2.5",
+            "MAX_MEDIA_BYTES": "1048576",
+            "MAX_RECEIVE_COUNT": "3",
         }
     )
 
@@ -49,6 +53,8 @@ def test_from_env_reads_every_variable() -> None:
         max_pages=2,
         x_api_base_url="http://localhost:9999/2",
         http_timeout=2.5,
+        max_media_bytes=1048576,
+        max_receive_count=3,
     )
 
 
@@ -70,6 +76,8 @@ def test_blank_values_count_as_unset() -> None:
             "MAX_RESULTS": " ",
             "MAX_PAGES": "",
             "HTTP_TIMEOUT_SECONDS": "\t",
+            "MAX_MEDIA_BYTES": " ",
+            "MAX_RECEIVE_COUNT": "",
             "X_API_BASE_URL": "  ",
         }
     )
@@ -91,6 +99,8 @@ def test_values_are_stripped() -> None:
         ("MAX_RESULTS", "10.5", "int"),
         ("MAX_PAGES", "x", "int"),
         ("HTTP_TIMEOUT_SECONDS", "soon", "float"),
+        ("MAX_MEDIA_BYTES", "512MiB", "int"),
+        ("MAX_RECEIVE_COUNT", "3.5", "int"),
     ],
 )
 def test_unparseable_numbers_raise_config_error(
@@ -111,6 +121,9 @@ def test_unparseable_numbers_raise_config_error(
         ({"max_pages": -1}, "MAX_PAGES"),
         ({"http_timeout": 0.0}, "HTTP_TIMEOUT_SECONDS"),
         ({"http_timeout": -1.0}, "HTTP_TIMEOUT_SECONDS"),
+        ({"max_media_bytes": 0}, "MAX_MEDIA_BYTES"),
+        ({"max_media_bytes": -5}, "MAX_MEDIA_BYTES"),
+        ({"max_receive_count": 0}, "MAX_RECEIVE_COUNT"),
     ],
 )
 def test_out_of_range_values_name_the_variable(

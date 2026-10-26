@@ -1,5 +1,6 @@
 import io
 import json
+from collections.abc import Iterator
 from typing import Any, cast
 from urllib.parse import urlsplit
 
@@ -27,12 +28,19 @@ from hypothesis import strategies as st
 from moto import mock_aws
 from mypy_boto3_s3 import S3Client
 
-from twitter_timeline_data_pipeline.models import Media, Tweet, TweetMessage
+from twitter_timeline_data_pipeline.models import (
+    MAX_STORED_INT,
+    Media,
+    MediaRetry,
+    Tweet,
+    TweetMessage,
+)
 from twitter_timeline_data_pipeline.storage import (
     ALLOWED_MEDIA_HOSTS,
     ITEM_LIMIT_BYTES,
     TEXT_PREVIEW_CHARS,
     CheckpointStore,
+    MediaRetryQueue,
     MediaStore,
     PutResult,
     StoredMedia,
@@ -40,6 +48,7 @@ from twitter_timeline_data_pipeline.storage import (
     TweetStore,
     _extension,
     _IterReader,
+    _MediaTooLarge,
     _original_size_url,
     estimate_item_size,
 )
@@ -1054,3 +1063,469 @@ def test_checkpoint_advance_reraises_other_dynamodb_errors(aws: Aws) -> None:
 
     with pytest.raises(ClientError):
         store.advance("example_user", "1")
+
+
+# ---- size cap and time budget ------------------------------------------------
+
+
+class FakeClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def leftover_uploads(aws: Aws) -> list[Any]:
+    uploads = aws.s3.list_multipart_uploads(Bucket=aws.bucket).get("Uploads", [])
+    return list(uploads)
+
+
+def keys_in_bucket(aws: Aws) -> list[str]:
+    contents = aws.s3.list_objects_v2(Bucket=aws.bucket).get("Contents", [])
+    return [o["Key"] for o in contents if "Key" in o]
+
+
+def streaming_cdn(url: str, chunks: Iterator[bytes], **headers: str) -> CdnStub:
+    cdn = CdnStub()
+    cdn.responses[url] = lambda: httpx.Response(
+        200, content=chunks, headers={"Content-Type": "video/mp4", **headers}
+    )
+    return cdn
+
+
+def sized_video(bit_rate: int | None, duration_ms: int | None) -> Media:
+    return Media.from_dict(
+        {
+            "media_key": "7_1",
+            "type": "video",
+            "duration_ms": duration_ms,
+            "variants": [
+                {
+                    "content_type": "video/mp4",
+                    "bit_rate": bit_rate,
+                    "url": VIDEO_HI_URL,
+                },
+                {"content_type": "video/mp4", "bit_rate": 0, "url": GIF_URL},
+            ],
+        }
+    )
+
+
+def test_iter_reader_raises_once_the_next_chunk_passes_the_cap() -> None:
+    reader = _IterReader(iter([b"abcd", b"efgh", b"ijkl"]), max_bytes=10)
+    buffered = io.BufferedReader(reader, buffer_size=4)
+
+    with pytest.raises(_MediaTooLarge) as info:
+        buffered.read()
+
+    assert info.value.size == 12
+
+
+def test_iter_reader_allows_exactly_the_cap() -> None:
+    reader = _IterReader(iter([b"abcd", b"efgh", b"ij"]), max_bytes=10)
+
+    assert io.BufferedReader(reader, buffer_size=4).read() == b"abcdefghij"
+
+
+def test_iter_reader_raises_transient_error_at_the_deadline() -> None:
+    clock = FakeClock()
+
+    def chunks() -> Iterator[bytes]:
+        for _ in range(5):
+            clock.now += 3
+            yield b"x" * 10
+
+    reader = _IterReader(chunks(), deadline=7, clock=clock)
+
+    with pytest.raises(TransientMediaError, match="time budget"):
+        io.BufferedReader(reader, buffer_size=10).read()
+
+    assert reader.size == 30  # the chunk that crossed the deadline was handed out
+
+
+def test_store_aborts_a_small_stream_past_the_cap(aws: Aws) -> None:
+    chunks = iter([b"x" * 512] * 100)
+    cdn = streaming_cdn(VIDEO_HI_URL, chunks)
+    item = video()
+    store = MediaStore(aws.s3, aws.bucket, cdn.client(), max_bytes=1000)
+
+    stored = store.store(make_message(media=(item,)), item)
+
+    assert stored.status == "too_large"
+    assert stored.size_bytes == 1024  # the second chunk passed the cap
+    assert stored.s3_key is None
+    assert keys_in_bucket(aws) == []
+    assert leftover_uploads(aws) == []
+    assert len(list(chunks)) == 98  # the rest of the body was never read
+
+
+def test_store_aborts_a_multipart_upload_past_the_cap(aws: Aws) -> None:
+    chunk = b"\x00" * 65536
+    cdn = streaming_cdn(VIDEO_HI_URL, iter([chunk] * 192))  # 12 MiB, past 9 MiB
+    item = video()
+    store = MediaStore(aws.s3, aws.bucket, cdn.client(), max_bytes=9 * 1024 * 1024)
+
+    stored = store.store(make_message(media=(item,)), item)
+
+    assert stored.status == "too_large"
+    assert stored.size_bytes == 9 * 1024 * 1024 + 65536
+    assert keys_in_bucket(aws) == []
+    assert leftover_uploads(aws) == []
+
+
+def test_store_skips_on_the_bit_rate_estimate_without_a_request(aws: Aws) -> None:
+    cdn = CdnStub()
+    item = sized_video(bit_rate=8_000_000, duration_ms=10_000)  # 10 MB
+    store = MediaStore(aws.s3, aws.bucket, cdn.client(), max_bytes=1_000_000)
+
+    stored = store.store(make_message(media=(item,)), item)
+
+    assert stored.status == "too_large"
+    assert stored.size_bytes == 10_000_000
+    assert stored.source_url == VIDEO_HI_URL
+    assert cdn.requests == []
+    assert keys_in_bucket(aws) == []
+
+
+@pytest.mark.parametrize(
+    ("bit_rate", "duration_ms"),
+    [(None, 10_000), (8_000_000, None), (0, 10_000), (800_000, 10_000)],
+)
+def test_store_downloads_when_there_is_no_usable_estimate_or_it_fits(
+    aws: Aws, bit_rate: int | None, duration_ms: int | None
+) -> None:
+    cdn = CdnStub()
+    cdn.serve(VIDEO_HI_URL, b"mp4", "video/mp4")
+    item = sized_video(bit_rate, duration_ms)
+    store = MediaStore(aws.s3, aws.bucket, cdn.client(), max_bytes=1_000_000)
+
+    assert store.store(make_message(media=(item,)), item).status == "stored"
+
+
+def test_store_estimate_ignores_other_variants_and_photos(aws: Aws) -> None:
+    cdn = CdnStub()
+    cdn.serve(PHOTO_URL, b"jpg", "image/jpeg")
+    store = MediaStore(aws.s3, aws.bucket, cdn.client(), max_bytes=10)
+    photo_item = Media.from_dict(
+        {"media_key": "3_1", "type": "photo", "url": PHOTO_URL, "duration_ms": 10**9}
+    )
+
+    stored = store.store(make_message(media=(photo_item,)), photo_item)
+
+    assert stored.status == "stored"
+
+
+def test_store_skips_on_content_length_without_reading_the_body(aws: Aws) -> None:
+    def never_read() -> Iterator[bytes]:
+        raise AssertionError("the body must not be downloaded")
+        yield b""
+
+    cdn = streaming_cdn(VIDEO_HI_URL, never_read(), **{"Content-Length": "2000"})
+    item = video()
+    store = MediaStore(aws.s3, aws.bucket, cdn.client(), max_bytes=1000)
+
+    stored = store.store(make_message(media=(item,)), item)
+
+    assert stored.status == "too_large"
+    assert stored.size_bytes == 2000
+    assert keys_in_bucket(aws) == []
+    assert leftover_uploads(aws) == []
+
+
+def test_store_accepts_a_body_exactly_at_the_cap(aws: Aws) -> None:
+    cdn = CdnStub()
+    cdn.serve(PHOTO_URL, b"x" * 100, "image/jpeg")
+    store = MediaStore(aws.s3, aws.bucket, cdn.client(), max_bytes=100)
+
+    stored = store.store(make_message(media=(PHOTO,)), PHOTO)
+
+    assert (stored.status, stored.size_bytes) == ("stored", 100)
+
+
+def test_store_slow_download_hits_its_deadline_and_aborts_the_multipart_upload(
+    aws: Aws,
+) -> None:
+    clock = FakeClock()
+    calls: list[str] = []
+    for op in ("CreateMultipartUpload", "AbortMultipartUpload"):
+        aws.s3.meta.events.register(
+            f"before-call.s3.{op}", lambda *, op=op, **_kw: calls.append(op)
+        )
+
+    def slow() -> Iterator[bytes]:
+        for _ in range(200):
+            clock.now += 1
+            yield b"\x00" * 1024 * 1024
+
+    cdn = streaming_cdn(VIDEO_HI_URL, slow())
+    item = video()
+    store = MediaStore(aws.s3, aws.bucket, cdn.client(), clock=clock)
+
+    with pytest.raises(TransientMediaError, match="time budget"):
+        store.store(make_message(media=(item,)), item, budget_s=12)
+
+    assert calls.count("CreateMultipartUpload") == 1  # past the 8 MiB threshold
+    assert calls.count("AbortMultipartUpload") == 1
+    assert keys_in_bucket(aws) == []
+    assert leftover_uploads(aws) == []
+    assert clock.now == 12  # stopped as soon as the deadline was reached
+
+
+def test_store_gives_the_http_phases_a_share_of_the_time_left(aws: Aws) -> None:
+    clock = FakeClock()
+    seen: list[dict[str, Any]] = []
+
+    def stall(request: httpx.Request) -> httpx.Response:
+        seen.append(request.extensions["timeout"])
+        clock.now += 100  # a header phase that hangs until its timeout
+        raise httpx.ReadTimeout("stalled", request=request)
+
+    http = httpx.Client(transport=httpx.MockTransport(stall), timeout=10.0)
+    store = MediaStore(aws.s3, aws.bucket, http, clock=clock)
+
+    with pytest.raises(TransientMediaError, match="ReadTimeout"):
+        store.store(make_message(media=(PHOTO,)), PHOTO, budget_s=24)
+
+    assert seen == [{"connect": 8.0, "read": 8.0, "write": 8.0, "pool": 8.0}]
+
+
+def test_store_keeps_the_client_timeout_when_there_is_plenty_of_time(
+    aws: Aws,
+) -> None:
+    seen: list[dict[str, Any]] = []
+
+    def serve(request: httpx.Request) -> httpx.Response:
+        seen.append(request.extensions["timeout"])
+        return httpx.Response(200, content=b"x")
+
+    http = httpx.Client(transport=httpx.MockTransport(serve), timeout=10.0)
+    MediaStore(aws.s3, aws.bucket, http).store(
+        make_message(media=(PHOTO,)), PHOTO, budget_s=300
+    )
+    MediaStore(aws.s3, aws.bucket, http).store(
+        make_message("1700000000000000006", media=(PHOTO,)), PHOTO
+    )
+
+    assert seen[0]["read"] == 10.0
+    assert seen[1]["read"] == 10.0
+
+
+def test_store_without_a_read_timeout_uses_a_third_of_the_time_left(aws: Aws) -> None:
+    seen: list[dict[str, Any]] = []
+
+    def serve(request: httpx.Request) -> httpx.Response:
+        seen.append(request.extensions["timeout"])
+        return httpx.Response(200, content=b"x")
+
+    http = httpx.Client(transport=httpx.MockTransport(serve), timeout=None)
+    MediaStore(aws.s3, aws.bucket, http, clock=FakeClock()).store(
+        make_message(media=(PHOTO,)), PHOTO, budget_s=30
+    )
+
+    assert seen[0]["read"] == 10.0
+
+
+def test_store_with_no_time_left_makes_no_request(aws: Aws) -> None:
+    cdn = CdnStub()
+
+    with pytest.raises(TransientMediaError, match="no time left"):
+        media_store(aws, cdn).store(make_message(media=(PHOTO,)), PHOTO, budget_s=0)
+
+    assert cdn.requests == []
+
+
+# ---- precheck, media updates and the retry queue ------------------------------------
+
+
+def test_precheck_leaves_an_unstorable_media_retrying_with_url_and_planned_key(
+    aws: Aws,
+) -> None:
+    cdn = CdnStub()
+    store = MediaStore(aws.s3, aws.bucket, cdn.client())
+
+    result = store.precheck(make_message(media=(PHOTO,)), PHOTO)
+
+    assert result == StoredMedia(
+        media_key=PHOTO.media_key,
+        type="photo",
+        status="retrying",
+        s3_key=PHOTO_KEY,
+        source_url=f"{PHOTO_URL}?name=orig",
+    )
+    assert cdn.requests == []
+
+
+def test_precheck_finds_an_object_already_in_s3(aws: Aws) -> None:
+    aws.s3.put_object(
+        Bucket=aws.bucket, Key=PHOTO_KEY, Body=JPEG, ContentType="image/jpeg"
+    )
+    store = MediaStore(aws.s3, aws.bucket, CdnStub().client())
+
+    result = store.precheck(make_message(media=(PHOTO,)), PHOTO)
+
+    assert (result.status, result.s3_key, result.size_bytes) == (
+        "exists",
+        PHOTO_KEY,
+        len(JPEG),
+    )
+
+
+def test_precheck_without_head_makes_no_s3_call(aws: Aws) -> None:
+    aws.s3.put_object(Bucket=aws.bucket, Key=PHOTO_KEY, Body=JPEG)
+    store = MediaStore(aws.s3, aws.bucket, CdnStub().client())
+
+    result = store.precheck(make_message(media=(PHOTO,)), PHOTO, head=False)
+
+    assert result.status == "retrying"  # it exists, but this check was skipped
+
+
+def test_precheck_applies_the_size_estimate_and_the_host_allowlist(aws: Aws) -> None:
+    big = Media.from_dict(
+        {
+            "media_key": "7_big",
+            "type": "video",
+            "duration_ms": 10_000,
+            "variants": [
+                {
+                    "content_type": "video/mp4",
+                    "bit_rate": 8_000_000,
+                    "url": VIDEO_HI_URL,
+                }
+            ],
+        }
+    )
+    elsewhere = photo("3_x", "https://example.com/a.jpg")
+    store = MediaStore(aws.s3, aws.bucket, CdnStub().client(), max_bytes=1_000_000)
+    message = make_message(media=(big, elsewhere))
+
+    assert store.precheck(message, big).status == "too_large"
+    assert store.precheck(message, elsewhere).status == "skipped"
+
+
+def test_precheck_never_raises_when_head_object_fails(aws: Aws) -> None:
+    def deny(**_kw: Any) -> None:
+        raise ClientError({"Error": {"Code": "500", "Message": "boom"}}, "HeadObject")
+
+    aws.s3.meta.events.register("before-call.s3.HeadObject", deny)
+    store = MediaStore(aws.s3, aws.bucket, CdnStub().client())
+
+    result = store.precheck(make_message(media=(PHOTO,)), PHOTO)
+
+    assert (result.status, result.s3_key) == ("retrying", PHOTO_KEY)
+
+
+def test_get_media_reads_entries_and_reports_a_missing_item(aws: Aws) -> None:
+    store = TweetStore(aws.tweets_table, aws.s3, aws.bucket)
+    store.put_tweet(
+        make_message(media=(PHOTO,)),
+        [StoredMedia(media_key=PHOTO.media_key, type="photo", status="skipped")],
+    )
+    store.put_tweet(make_message("1700000000000000999"), [])
+
+    entries = store.get_media(TWEET_ID)
+
+    assert entries is not None
+    assert [e["status"] for e in entries] == ["skipped"]
+    assert store.get_media("1700000000000000999") == []
+    assert store.get_media("1") is None
+
+
+def test_resolve_media_replaces_only_a_matching_retrying_entry(aws: Aws) -> None:
+    store = TweetStore(aws.tweets_table, aws.s3, aws.bucket)
+    other = photo("3_other")
+    store.put_tweet(
+        make_message(media=(PHOTO, other)),
+        [
+            StoredMedia(media_key=PHOTO.media_key, type="photo", status="retrying"),
+            StoredMedia(media_key="3_other", type="photo", status="retrying"),
+        ],
+    )
+    done = {"media_key": PHOTO.media_key, "type": "photo", "status": "stored"}
+
+    assert store.resolve_media(TWEET_ID, 0, PHOTO.media_key, done)
+    assert not store.resolve_media(TWEET_ID, 0, PHOTO.media_key, done)  # not retrying
+    assert not store.resolve_media(TWEET_ID, 1, PHOTO.media_key, done)  # other key
+    assert not store.resolve_media(TWEET_ID, 5, "x", done)  # no such index
+    assert not store.resolve_media("1", 0, PHOTO.media_key, done)  # no item
+    entries = store.get_media(TWEET_ID)
+    assert entries is not None
+    assert [e["status"] for e in entries] == ["stored", "retrying"]
+    assert aws.tweets_table.scan()["Count"] == 1  # no item was created for "1"
+
+
+def test_resolve_media_propagates_other_errors(aws: Aws) -> None:
+    store = TweetStore(aws.tweets_table, aws.s3, aws.bucket)
+
+    def deny(**_kw: Any) -> None:
+        raise ClientError(
+            {"Error": {"Code": "ProvisionedThroughputExceededException"}}, "UpdateItem"
+        )
+
+    aws.tweets_table.meta.client.meta.events.register(
+        "before-call.dynamodb.UpdateItem", deny
+    )
+
+    with pytest.raises(ClientError):
+        store.resolve_media(TWEET_ID, 0, "k", {})
+
+
+def test_media_retry_queue_sends_the_delayed_json_message(aws: Aws) -> None:
+    queue = MediaRetryQueue(aws.sqs, aws.retry_queue_url, delay_seconds=45)
+    retry = MediaRetry(tweet_id=TWEET_ID, username="u", media=PHOTO)
+
+    queue.send(retry)
+
+    attributes = aws.sqs.get_queue_attributes(
+        QueueUrl=aws.retry_queue_url, AttributeNames=["All"]
+    )["Attributes"]
+    assert attributes["ApproximateNumberOfMessagesDelayed"] == "1"
+    aws.sqs.purge_queue(QueueUrl=aws.retry_queue_url)
+
+
+def test_a_declared_content_length_too_big_to_store_is_capped(aws: Aws) -> None:
+    cdn = CdnStub()
+    cdn.responses[PHOTO_URL] = lambda: httpx.Response(
+        200, headers={"content-length": "9" * 45}
+    )
+    store = MediaStore(aws.s3, aws.bucket, cdn.client())
+
+    result = store.store(make_message(media=(PHOTO,)), PHOTO)
+
+    assert (result.status, result.size_bytes) == ("too_large", MAX_STORED_INT)
+
+
+def test_the_runbook_scan_finds_items_with_any_retrying_media(aws: Aws) -> None:
+    """The filter expression the README gives, against four media per item."""
+    store = TweetStore(aws.tweets_table, aws.s3, aws.bucket)
+
+    def put(tweet_id: str, statuses: list[str]) -> None:
+        items = [photo(f"3_{i}") for i in range(len(statuses))]
+        store.put_tweet(
+            make_message(tweet_id, media=tuple(items)),
+            [
+                StoredMedia(media_key=m.media_key, type="photo", status=st)  # type: ignore[arg-type]
+                for m, st in zip(items, statuses, strict=True)
+            ],
+        )
+
+    put("1700000000000000001", ["stored", "stored"])
+    put("1700000000000000002", ["stored", "retrying"])
+    put("1700000000000000003", ["retrying"])
+    put("1700000000000000004", ["stored", "stored", "stored", "retrying"])
+    put("1700000000000000005", [])
+
+    found = aws.tweets_table.scan(
+        FilterExpression=(
+            "media[0].#s = :r OR media[1].#s = :r OR media[2].#s = :r "
+            "OR media[3].#s = :r"
+        ),
+        ExpressionAttributeNames={"#s": "status"},
+        ExpressionAttributeValues={":r": "retrying"},
+    )
+
+    assert sorted(i["tweet_id"] for i in as_items(found["Items"])) == [
+        "1700000000000000002",
+        "1700000000000000003",
+        "1700000000000000004",
+    ]

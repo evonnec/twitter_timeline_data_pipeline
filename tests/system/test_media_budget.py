@@ -1,18 +1,13 @@
 """Media that takes longer to download than the process function has."""
 
-import pytest
-
 from system.checks import assert_quiet, assert_stored, delivery_counts
 from system.conftest import MakeSim
+from system.fake_cdn import content_for
 
 SLOW_BYTES_PER_SECOND = 24 * 1024
 SLOW_SIZE = 3 * 1024 * 1024  # 128 s at that rate: over the 120 s function timeout
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="#12: downloads have no time budget, so a slow one times out the batch",
-)
 def test_slow_media_near_the_deadline_spares_its_batch_and_keeps_its_metadata(
     make_sim: MakeSim,
 ) -> None:
@@ -20,8 +15,9 @@ def test_slow_media_near_the_deadline_spares_its_batch_and_keeps_its_metadata(
     ten; the other nine Tweets have photos or no media. The CDN stays that slow.
 
     Expected: no invocation runs into the function timeout; the nine unrelated Tweets
-    are stored and never reach the DLQ; the slow Tweet's metadata is eventually written
-    (its video recorded as not stored); the queue and DLQ end empty.
+    are stored and never reach the DLQ; the slow Tweet's metadata is written on its
+    last receive with the video ``retrying``, and the media-retry function (300 s, so
+    128 s fits) then stores the video; every queue and DLQ ends empty.
     """
     sim = make_sim()
     x, user = sim.x, sim.username
@@ -36,10 +32,15 @@ def test_slow_media_near_the_deadline_spares_its_batch_and_keeps_its_metadata(
     sim.settle()
 
     assert all(i.outcome != "timeout" for i in sim.process.invocations)
+    assert all(i.outcome != "timeout" for i in sim.media_retry.invocations)
     assert_stored(sim, siblings)
     item = sim.tweets()[slow_tweet.id]
     assert [m["media_key"] for m in item["media"]] == [video.media_key]
-    assert item["media"][0]["status"] not in ("stored", "exists")
+    assert item["media"][0]["status"] == "stored"
+    assert sim.object_bytes(item["media"][0]["s3_key"]) == content_for(
+        video.download_url, SLOW_SIZE
+    )
+    assert [d.succeeded for d in sim.retry_deliveries] == [True]
     dead = sim.dlq_bodies()
     assert not any(t.id in body for t in siblings for body in dead)
     assert all(delivery_counts(sim)[t.id] == 1 for t in siblings)

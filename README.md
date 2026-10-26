@@ -1,6 +1,6 @@
 # Twitter Timeline Data Pipeline
 
-A serverless pipeline on AWS that copies a public X (Twitter) account's timeline into your own storage. A scheduled Lambda function reads new Tweets from the X API v2 and puts one SQS message on a queue for each Tweet. A second Lambda function consumes the queue, writes each Tweet's metadata to DynamoDB, and streams attached photos and videos into S3. The whole stack is one AWS SAM template, and the code is Python 3.14 managed with [uv](https://docs.astral.sh/uv/).
+A serverless pipeline on AWS that copies a public X (Twitter) account's timeline into your own storage. A scheduled Lambda function reads new Tweets from the X API v2 and puts one SQS message on a queue for each Tweet. A second Lambda function consumes the queue, writes each Tweet's metadata to DynamoDB, and streams attached photos and videos into S3. A third function stores media the second one could not store in time, through its own retry queue. The whole stack is one AWS SAM template, and the code is Python 3.14 managed with [uv](https://docs.astral.sh/uv/).
 
 ## Requirements
 
@@ -23,11 +23,18 @@ flowchart LR
     F <-->|checkpoint: newest Tweet ID| ST[(State table)]
     F -->|SendMessageBatch, one message per Tweet| Q[TweetsQueue]
     Q -->|batches of up to 10| P[ProcessFunction]
-    Q -.->|after 5 failed receives| DLQ[TweetsDeadLetterQueue]
+    Q -.->|after MaxReceiveCount failed receives| DLQ[TweetsDeadLetterQueue]
     P -->|PutItem| TT[(Tweets table)]
     P -->|stream upload| S3[(S3 media bucket)]
     P -->|download media| CDN[X media CDN]
+    P -->|last receive: media still unstored| RQ[MediaRetryQueue]
+    RQ -->|one message at a time| R[MediaRetryFunction]
+    RQ -.->|after MediaRetryMaxReceiveCount failed receives| RDLQ[MediaRetryDeadLetterQueue]
+    R -->|UpdateItem on that media entry| TT
+    R -->|stream upload| S3
+    R -->|download media| CDN
     CW[CloudWatch alarms] -.->|watch| DLQ
+    CW -.->|watch| RDLQ
     CW -.->|watch| F
     CW -.->|watch| P
 ```
@@ -41,7 +48,8 @@ A run, step by step:
 5. Only after every message of the run is enqueued does it advance the checkpoint.
 6. SQS invokes `ProcessFunction` with batches of up to 10 messages (up to 10 seconds of batching, at most 5 concurrent invocations).
 7. For each message it downloads the media and uploads it to S3, then writes the Tweet item to DynamoDB. Media goes first so a stored Tweet never points at missing media.
-8. Messages that fail are reported back individually. SQS redelivers them and, after 5 receives, moves them to the dead-letter queue, which has an alarm.
+8. Messages that fail are reported back individually. SQS redelivers them and, after `MaxReceiveCount` receives, moves them to the dead-letter queue, which has an alarm.
+9. On a message's last receive a media item that still can't be stored does not fail the record. The Tweet is written with that media marked `retrying` (with its `source_url`), and one message per such media item goes to the media-retry queue, delayed 5 minutes. `MediaRetryFunction` downloads the file and replaces just that entry of the Tweet item. If it keeps failing, the message ends up in the media-retry dead-letter queue, which also has an alarm. If the retry message cannot be sent, the record is reported failed and goes to the main DLQ instead.
 
 ## Data model
 
@@ -133,7 +141,30 @@ You can regenerate it with `TweetMessage(...).to_json()` from `twitter_timeline_
 
 **Reading the full text.** Use `text` unless `text_truncated` is `true`; then `GetObject` the key in `text_s3_key` from the media bucket (`text/<author_id>/<tweet_id>.json`, or the lower-cased username when the Tweet has no author ID) and `json.loads` it: the object is the text as one JSON string (UTF-8, `application/json`), so any characters, a lone surrogate included, read back exactly. The object is written before the item and create-only, so a redelivery leaves it alone. Only a post whose item would pass 350 KB is offloaded (a handful of emoji-only posts at most). A message without `note_text` never replaces a stored long post, whatever its `fetched_at`.
 
-Each `media` entry has `media_key`, `type`, `status` (`stored` and `exists` for files in S3, `unavailable` or `skipped`) and, when known, `s3_key`, `content_type`, `source_url` and `size_bytes`.
+Each `media` entry has `media_key`, `type`, `status` (`stored` and `exists` for files in S3; otherwise `unavailable`, `skipped`, `too_large` or `retrying`, see below) and, when known, `s3_key`, `content_type`, `source_url` and `size_bytes`. Statuses without a file in S3: `unavailable` (the source answered 4xx other than 429, or redirected), `skipped` (nothing to download: HLS-only video, or a URL that isn't https on an X media host), `too_large` (over `MAX_MEDIA_BYTES`; `size_bytes` is the estimate or the byte count where the download was stopped) and `retrying` (transient errors persisted through the message's last receive, so the Tweet was written without the file; `source_url` and the planned `s3_key` are recorded and a media-retry message is queued). `retrying` is not final: `MediaRetryFunction` replaces the entry with `stored`, `exists`, `unavailable`, `too_large` or `skipped` once it has dealt with the media. An entry still `retrying` means the retry is pending, or (after the media-retry dead-letter queue alarm) failed and awaits an operator; the `source_url` says what to fetch.
+
+### Media-retry message (`MediaRetryQueue`)
+
+One message per media item left `retrying`. The body is compact UTF-8 JSON with its own `kind`, so it cannot be mistaken for a Tweet message (which has no `kind`, and is rejected by the retry consumer) and `"schema_version": 1`:
+
+```json
+{
+  "kind": "media_retry",
+  "schema_version": 1,
+  "tweet_id": "1850000000000000001",
+  "username": "nasa",
+  "author_id": "11348282",
+  "fetched_at": "2024-10-25T15:00:00Z",
+  "media": {
+    "media_key": "7_1850000000000000002",
+    "type": "video",
+    "variants": [{"content_type": "video/mp4", "url": "https://video.twimg.com/a.mp4", "bit_rate": 832000}],
+    "duration_ms": 12000
+  }
+}
+```
+
+`media` has the shape of an entry of the Tweet message's `media`. The consumer reads the Tweet item (`GetItem`, strongly consistent) to find the index of the entry with that `media_key`, stores the file with the same deterministic S3 key as the process function (an object that already exists is not downloaded again), and then replaces `media[index]` with a conditional `UpdateItem` that applies only if the item exists, the entry at that index still has the same `media_key` and its status is still `retrying`. If that condition fails, another delivery already settled the entry (or a newer fetch rewrote the item) and the message is done. Permanent results (`unavailable`, `too_large`, `skipped`) update the entry the same way and finish. Anything else (a transient download error, a Tweet item that isn't written yet, a malformed message, running out of time) reports the record as failed, so SQS redelivers it and, after `MediaRetryMaxReceiveCount` receives, moves it to the media-retry dead-letter queue. The queue has a visibility timeout of 5,400 s (6 times the consumer's 900 s timeout), so retries are at least that far apart; a message lives up to 14 days.
 
 ### State table (`StateTable`)
 
@@ -157,11 +188,12 @@ Each object has the `Content-Type` of the source and user metadata `tweet-id`, `
 
 - **`GET /2/users/:id/tweets`.** It returns an account's own Tweets and works with an app-only bearer token (the home timeline endpoint needs user-context OAuth). One request returns up to 100 Tweets with their media expanded, instead of one lookup per Tweet, which keeps API usage low.
 - **At-least-once, with repeatable writes.** SQS can deliver a message twice, and a failed fetch run is re-run from the old checkpoint. Tweets are written with a conditional `PutItem` keyed by `tweet_id`: the write succeeds only if there is no item yet, or the stored `fetched_at` (if any) is not later than the message's and the stored `schema_version` is not higher (a legacy item without one counts as older). The latest fetch wins, not the latest delivery, so a stale redelivery (for example a DLQ redrive of an old message) cannot overwrite newer data such as `public_metrics`. `fetched_at` is an ISO 8601 UTC string with second precision, which compares chronologically as a string; an equal `fetched_at` rewrites the same data, so redelivery stays idempotent. A skipped stale write counts as processed: it is logged at INFO (`stale write skipped for tweet ...`), not retried and not sent to the DLQ. Media keys are deterministic and existing objects are not downloaded again.
-- **Checkpoint after enqueue.** If a run fails midway, the next run re-sends some Tweets (harmless duplicates) rather than losing any. Loss and delay cases are listed under limitations: the page-cap gap loses Tweets, and a batch that fails repeatedly (for example a media timeout) ends in the DLQ without its metadata being written.
+- **Checkpoint after enqueue.** If a run fails midway, the next run re-sends some Tweets (harmless duplicates) rather than losing any. Loss and delay cases are listed under limitations: the page-cap gap loses Tweets, and a record that was never started before its last receive ends in the DLQ without its metadata. A media download that keeps failing is not lost: on the last receive the Tweet is written with that media marked `retrying` and the file is fetched through the media-retry queue.
 - **Overlapping fetch runs are harmless.** The fetch function has no reserved concurrency. The checkpoint write is conditional, so it never moves backwards, and duplicate messages are handled by idempotent processing.
-- **Partial batch responses, DLQ and alarms.** `ProcessFunction` returns the IDs of failed records, so one bad message does not retry the other nine. Transient media errors (timeouts, 429, 5xx) fail the record for retry. Malformed messages and unexpected errors fail it too and end up in the DLQ after 5 receives (kept 14 days). Alarms cover a non-empty DLQ, fetch errors (1 hour window) and whole-invocation process errors (5 minute window). Because of partial batch responses, a failed record is not a Lambda `Errors` datapoint, so the DLQ alarm is the signal for record-level failures. DLQ messages expire after 14 days. Set `AlarmTopicArn` to get notified through SNS.
+- **Partial batch responses, DLQ and alarms.** `ProcessFunction` returns the IDs of failed records, so one bad message does not retry the other nine. Transient media errors (timeouts, 429, 5xx) fail the record for retry, until its last receive (see below). Malformed messages and unexpected errors fail it too and end up in the DLQ after `MaxReceiveCount` receives (kept 14 days). `MediaRetryFunction` works the same way on its own queue (`BatchSize` 1): a failed retry is redelivered and ends up in the media-retry DLQ after `MediaRetryMaxReceiveCount` receives. Alarms cover a non-empty DLQ, a non-empty media-retry DLQ, fetch errors (1 hour window) and whole-invocation process errors (5 minute window). Because of partial batch responses, a failed record is not a Lambda `Errors` datapoint, so the two DLQ alarms are the signal for record-level failures. DLQ messages expire after 14 days. Set `AlarmTopicArn` to get notified through SNS.
+- **A media failure on the last receive is queued, never dropped.** On a message's last receive (`MaxReceiveCount`) the process function does not fail the record for media it cannot store. For each such media item it runs the cheap checks first (not an allowed source: `skipped`; too big by estimate: `too_large`; already in S3: `exists`), and records what it still cannot store as `retrying` with its `source_url`. It writes the Tweet and then sends one message per `retrying` item to the media-retry queue. If a send fails, the record is reported failed instead and goes to the main DLQ (alarm), so a retry is never lost silently. It does not send retries when its write was skipped as stale, since the newer item has its own media state. Retries can duplicate (a redelivered Tweet message may queue them again); the consumer's conditional update makes that harmless.
 - **Streaming uploads.** Media is downloaded only over https from `pbs.twimg.com` and `video.twimg.com` (message bodies are treated as untrusted), redirects are not followed, and the file is streamed from the CDN straight into S3 `upload_fileobj` through a small file-like adapter, so a large video is never held in memory.
-- **Least-privilege IAM.** The fetch function can send to its queue, read one secret, and get/put items in the state table. The process function can write to the tweets table, put/get objects in the bucket and list it (so a missing key is a 404, not a 403). Neither can touch the other's resources.
+- **Least-privilege IAM.** The fetch function can send to its queue, read one secret, and get/put items in the state table. The process function can write to the tweets table, put/get objects in the bucket and list it (so a missing key is a 404, not a 403), and send to the media-retry queue only. The media-retry function can get and update items in the tweets table (no `PutItem`) and put/get/abort/list on the bucket; it has no SQS permissions beyond its event source. None can touch the others' resources.
 - **Secrets handling.** The stack creates an empty secret, so the token is never in the template, a parameter or an environment variable. `scripts/put_secret.sh` fills it in without putting the token in the process arguments. The fetch function only gets the secret's ARN. It caches the token for 15 minutes, so a rotated secret is picked up without a redeploy, and drops the cache on a 401/403. The token is sent only in the `Authorization` header and is excluded from log output and `repr`. The AWS SDK and HTTP library loggers (`botocore`, `boto3`, `s3transfer`, `urllib3`, `httpcore`, `httpx`) are held at WARNING even when `LogLevel` is `DEBUG`, since at DEBUG they can log secret values.
 - **Retained data stores.** The tweets table and the media bucket have `DeletionPolicy: Retain`, so deleting the stack does not delete collected data.
 - **No automatic fetch retries.** The function has `MaximumRetryAttempts: 0`, because the next scheduled run is the retry and a retry would only use up API rate limit.
@@ -190,12 +222,13 @@ Each object has the `Content-Type` of the source and user metadata `tweet-id`, `
 │   ├── config.py                      settings read from environment variables
 │   ├── credentials.py                 bearer token lookup and TTL cache
 │   ├── x_api.py                       X API v2 client (retries, rate limits, pagination)
-│   ├── models.py                      Tweet, Media, SQS message (schema_version 1)
+│   ├── models.py                      Tweet, Media, SQS messages (schema_version 1)
 │   ├── storage.py                     DynamoDB and S3 persistence, checkpoint store
 │   ├── cli.py                         `twitter-pipeline` command
 │   └── handlers/
 │       ├── fetch.py                   FetchFunction handler
-│       └── process.py                 ProcessFunction handler
+│       ├── process.py                 ProcessFunction handler
+│       └── media_retry.py             MediaRetryFunction handler
 └── tests/                             moto-mocked tests, no AWS account needed
 ```
 
@@ -272,14 +305,17 @@ Other options: `--max-pages`, `--max-results` (5 to 100), `--since-id` and `--lo
 | `TWITTER_BEARER_TOKEN` | local runs | none | The token itself; takes precedence over the secret. Not set on the deployed functions |
 | `QUEUE_URL` | fetch | none | URL of the tweets queue |
 | `STATE_TABLE` | fetch | none | Name of the checkpoint table |
-| `TWEETS_TABLE` | process | none | Name of the tweets table |
-| `MEDIA_BUCKET` | process | none | Name of the media bucket |
+| `TWEETS_TABLE` | process, media-retry | none | Name of the tweets table |
+| `MEDIA_BUCKET` | process, media-retry | none | Name of the media bucket |
 | `MAX_RESULTS` | fetch | `100` | Tweets per API page, 5 to 100 |
 | `MAX_PAGES` | fetch | `5` | Maximum pages per run, at least 1 |
 | `X_API_BASE_URL` | fetch | `https://api.x.com/2` | API base URL, for testing against a stub |
 | `HTTP_TIMEOUT_SECONDS` | both | `10` | Timeout for API and media HTTP requests, must be above 0 |
+| `MAX_MEDIA_BYTES` | process, media-retry | `536870912` (512 MiB) | Largest media file stored, must be above 0 |
+| `MAX_RECEIVE_COUNT` | process | none | The queue's `maxReceiveCount`; on a message's last receive its failing media are recorded as `retrying` and queued for the media-retry function instead of failing the record. Unset disables this. At least 1 |
+| `MEDIA_RETRY_QUEUE_URL` | process | none | URL of the media-retry queue |
 
-Blank values count as unset. The template sets everything except `TWITTER_BEARER_TOKEN`, `X_API_BASE_URL` and `HTTP_TIMEOUT_SECONDS`.
+Blank values count as unset. The template sets everything except `TWITTER_BEARER_TOKEN`, `X_API_BASE_URL` and `HTTP_TIMEOUT_SECONDS`. It sets `MAX_MEDIA_BYTES` and `MAX_RECEIVE_COUNT` from the `MaxMediaBytes` and `MaxReceiveCount` parameters.
 
 ## Deploying
 
@@ -327,12 +363,15 @@ Extra arguments are passed to `sam deploy`, for example `scripts/deploy.sh --reg
 | `ScheduleEnabled` | `true` | Set to `false` to disable the schedule rule |
 | `MaxPages` | `5` | Maximum timeline pages per run |
 | `MaxResults` | `100` | Tweets per page (5 to 100) |
+| `MaxMediaBytes` | `536870912` | Largest media file stored, in bytes; bigger ones are recorded as `too_large` |
+| `MaxReceiveCount` | `5` | Receives before a message moves to the DLQ; also tells the process function which receive is the last, when it queues unstored media for retry instead of failing the record |
+| `MediaRetryMaxReceiveCount` | `10` | Receives of a media-retry message before it moves to the media-retry DLQ (at least 5,400 s apart) |
 | `LogLevel` | `INFO` | Lambda application log level (`DEBUG`, `INFO`, `WARN`, `ERROR`); logs are JSON. SDK and HTTP library loggers stay at WARNING regardless |
 | `AlarmTopicArn` | empty | Optional SNS topic notified by the alarms |
 
 ### Stack outputs
 
-`QueueUrl`, `DeadLetterQueueUrl`, `TweetsTableName`, `StateTableName`, `MediaBucketName`, `BearerTokenSecretArn`, `FetchFunctionName`, `ProcessFunctionName`.
+`QueueUrl`, `DeadLetterQueueUrl`, `TweetsTableName`, `StateTableName`, `MediaBucketName`, `BearerTokenSecretArn`, `FetchFunctionName`, `ProcessFunctionName`, `MediaRetryFunctionName`, `MediaRetryQueueUrl`, `MediaRetryDeadLetterQueueUrl`.
 
 ## Testing a deployment
 
@@ -416,7 +455,7 @@ sam local invoke ProcessFunction --event events/sqs.json
 
 Use the stack outputs from [Testing a deployment](#testing-a-deployment) (`$QUEUE`, `$DLQ`, `$FETCH`) in these runbooks.
 
-**Redrive the DLQ.** An alarm on the DLQ means records failed 5 times. Read the process function's logs first (a malformed message will fail again; a stale message is skipped with a `stale write skipped ...` log line and can't overwrite newer data), fix the cause, then move the messages back before the 14-day retention expires them:
+**Redrive the DLQ.** An alarm on the DLQ means records failed `MaxReceiveCount` times. Read the process function's logs first (a malformed message will fail again; a stale message is skipped with a `stale write skipped ...` log line and can't overwrite newer data), fix the cause, then move the messages back before the 14-day retention expires them:
 
 ```bash
 DLQ_ARN=$(aws sqs get-queue-attributes --queue-url "$DLQ" --attribute-names QueueArn \
@@ -424,6 +463,29 @@ DLQ_ARN=$(aws sqs get-queue-attributes --queue-url "$DLQ" --attribute-names Queu
 aws sqs start-message-move-task --source-arn "$DLQ_ARN"   # defaults to the original source queue
 aws sqs list-message-move-tasks --source-arn "$DLQ_ARN"   # progress
 ```
+
+**Inspect and redrive the media-retry DLQ.** An alarm on `MediaRetryDeadLetterQueue` means a media file could not be stored even after `MediaRetryMaxReceiveCount` attempts. The Tweet item is already written, with that media `retrying` and its `source_url`. Look at the message and at the media-retry function's logs (a CDN outage, a file larger than the function can download in its 900 s, or a Tweet item that was never written all show there), fix the cause, then redrive. Messages expire after 14 days; before then you can also fetch `source_url` yourself and put it at the entry's `s3_key`:
+
+```bash
+RETRY_DLQ=$(out MediaRetryDeadLetterQueueUrl)
+aws sqs receive-message --queue-url "$RETRY_DLQ" --visibility-timeout 0 --max-number-of-messages 10   # peek; messages stay
+RETRY_DLQ_ARN=$(aws sqs get-queue-attributes --queue-url "$RETRY_DLQ" --attribute-names QueueArn \
+  --query Attributes.QueueArn --output text)
+aws sqs start-message-move-task --source-arn "$RETRY_DLQ_ARN"   # back to the media-retry queue
+aws sqs list-message-move-tasks --source-arn "$RETRY_DLQ_ARN"
+```
+
+A redriven message that finds its entry already settled is deleted without doing anything. To list the items that have any `retrying` media (X allows at most 4 media per Tweet, so four indices cover it):
+
+```bash
+aws dynamodb scan --table-name "$TABLE" \
+  --filter-expression 'media[0].#s = :r OR media[1].#s = :r OR media[2].#s = :r OR media[3].#s = :r' \
+  --expression-attribute-names '{"#s": "status"}' \
+  --expression-attribute-values '{":r": {"S": "retrying"}}' \
+  --projection-expression 'tweet_id, media'
+```
+
+Two cases to know. An alarm on the main DLQ can also leave items `retrying`: the process function wrote the Tweet but could not queue the retry, so the record failed; redriving the main DLQ makes the process function handle it again and settle the media. And if you fetch a `source_url` by hand and put the file at the entry's `s3_key`, still redrive: the entry then settles as `exists`; without a redrive it stays `retrying`.
 
 **Backfill or re-fetch.** The scheduled run only reads Tweets newer than the checkpoint, and a first run reads at most `MAX_PAGES x MAX_RESULTS`. To fetch a specific range, run the CLI against the real stack (it needs the stack's `QUEUE_URL` and `STATE_TABLE`, a token and AWS credentials), with `--since-id` set to the Tweet ID before the range and a higher `--max-pages`:
 
@@ -452,7 +514,7 @@ The script reads the table and bucket names from the stack outputs, runs `sam de
 - X API access now requires a paid plan. Billing is currently pay-per-use, charged per post read, and rate limits depend on the plan; check current pricing before deploying. Cost scales with Tweets read per run, which is bounded by `MaxPages x MaxResults` and multiplied by the schedule frequency, so lower `MaxPages` or run less often to spend less.
 - The first run backfills at most `MAX_PAGES x MAX_RESULTS` Tweets (500 by default). The API itself only exposes an account's 3,200 most recent Tweets (800 with `exclude=replies`).
 - Tweets can be lost in the page-cap case: if a run reaches the page cap while a checkpoint is set, Tweets older than those fetched but newer than the checkpoint are skipped, and a warning is logged. Raise `MaxPages` or run more often.
-- Large videos have no size or time budget yet. A batch that times out is retried and can end up in the DLQ, and the Tweets in it have no metadata stored until it is redriven. DLQ messages expire after 14 days, after which they are gone.
+- Media downloads are bounded. A file over `MaxMediaBytes` is recorded as `too_large`, judged before downloading from a video's `bit_rate x duration_ms` or the response `Content-Length`, or while streaming from the bytes counted; nothing is left in S3 and the Tweet is still stored. The function also watches the invocation's remaining time. It runs a batch's records cheapest first (estimated media bytes; text-only and photos before videos, videos of unknown size last; a record whose estimate can't be computed counts as free), so a slow video is tried after its siblings. It stops starting records once under 20 s remain (room for one stalled read, finishing or aborting an upload, and the DynamoDB write) and returns the rest in `batchItemFailures`, so only those are retried. Each download gets the time left minus that margin, split across connect, headers and body reads, and fails as a transient error when it runs out; the upload is aborted. On a message's last receive (`MaxReceiveCount`) a media failure of any kind no longer fails the record: the media gets the cheap checks (`skipped`, `too_large`, `exists`) and otherwise is recorded as `retrying` with its `source_url`, the Tweet is written, and a media-retry message is queued for it. A last-receive record that cannot be started for lack of time is handled the same way (every media queued for retry, no download and no S3 call when under 3 s remain) if at least 3 s remain. The media-retry function has a 900 s timeout and one message per invocation, so a video that needs more than about 880 s of download time never completes there: it lands in the media-retry DLQ (alarm) with its metadata and `source_url`, for manual handling. Other limits: a record left unstarted on its last receive with under 3 s left still goes to the DLQ without metadata (alarm; the message is intact, so a redrive works); a retry message that cannot be sent fails its record into the main DLQ the same way; and `BatchSize` stays at 10, so a slow download delays the records behind it until the next invocation. Lower `BatchSize` (keeping it within the visibility timeout rule) for media-heavy accounts.
 - A media key that is missing from the response's `includes` (deleted or withheld media) is dropped with a warning, so the Tweet is stored without that media entry.
 - Tweet writes are conditional on `fetched_at` and `schema_version`, so an older delivery never replaces a newer item. Fetch runs less than a second apart can't be ordered, and there is no stale-write metric yet, only an INFO log line. A stale message still runs the media step first: usually one `HeadObject` per media item, which can leave an S3 object the stored item doesn't reference, and a transient media error on a stale message still fails it for retry. The fetch time must be a valid UTC-convertible ISO 8601 string no more than 5 minutes ahead; other messages are rejected as malformed.
 - Edited Tweets get a new ID and are stored as new items; the old ones remain. `edit_history_tweet_ids` links them.

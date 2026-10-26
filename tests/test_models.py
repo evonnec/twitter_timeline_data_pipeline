@@ -18,8 +18,10 @@ from helpers import (
 )
 
 from twitter_timeline_data_pipeline.models import (
+    MAX_STORED_INT,
     SCHEMA_VERSION,
     Media,
+    MediaRetry,
     MediaVariant,
     MessageError,
     TimelinePage,
@@ -670,3 +672,137 @@ def test_note_post_is_accepted_as_the_renamed_field() -> None:
 
     assert tweet.note_text == "full"
     assert tweet.full_text == "full"
+
+
+# ---- MediaRetry --------------------------------------------------------------------
+
+
+def media_retry(**overrides: Any) -> MediaRetry:
+    values: dict[str, Any] = {
+        "tweet_id": "1700000000000000010",
+        "username": "example_user",
+        "author_id": "2244994945",
+        "fetched_at": "2026-10-25T00:00:00Z",
+        "media": Media.from_dict(
+            {
+                "media_key": "7_1",
+                "type": "video",
+                "duration_ms": 1000,
+                "alt_text": "emoji \U0001f44d \ud800",
+                "variants": [
+                    {
+                        "content_type": "video/mp4",
+                        "url": "https://video.twimg.com/a.mp4",
+                        "bit_rate": 832000,
+                    }
+                ],
+            }
+        ),
+    }
+    return MediaRetry(**{**values, **overrides})
+
+
+def test_media_retry_round_trips_through_json() -> None:
+    retry = media_retry()
+
+    assert MediaRetry.from_json(retry.to_json()) == retry
+    assert json.loads(retry.to_json())["kind"] == "media_retry"
+
+
+def test_media_retry_without_an_author_round_trips() -> None:
+    retry = media_retry(author_id=None)
+
+    assert MediaRetry.from_json(retry.to_json()) == retry
+
+
+def test_media_retry_escapes_what_sqs_rejects() -> None:
+    body = media_retry().to_json()
+
+    assert "\\ud800" in body
+    assert "\U0001f44d" in body  # other non-ASCII stays as is
+
+
+def test_media_retry_and_tweet_messages_are_not_interchangeable() -> None:
+    with pytest.raises(MessageError, match="not a media_retry message"):
+        MediaRetry.from_json(full_message().to_json())
+    with pytest.raises(MessageError):
+        TweetMessage.from_json(media_retry().to_json())
+
+
+def test_media_retry_builds_a_message_naming_the_s3_object() -> None:
+    message = media_retry().to_tweet_message()
+
+    assert message.tweet.id == "1700000000000000010"
+    assert message.tweet.author_id == "2244994945"
+    assert message.media == (media_retry().media,)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "{nope",
+        "[]",
+        '{"kind": "media_retry", "schema_version": Infinity}',
+    ],
+)
+def test_media_retry_rejects_bad_json(body: str) -> None:
+    with pytest.raises(MessageError):
+        MediaRetry.from_json(body)
+
+
+@pytest.mark.parametrize("version", [None, 0, 2, "1"])
+def test_media_retry_rejects_wrong_schema_version(version: object) -> None:
+    data = media_retry().to_dict()
+    data["schema_version"] = version
+
+    with pytest.raises(MessageError, match="unsupported schema_version"):
+        MediaRetry.from_json(json.dumps(data))
+
+
+@pytest.mark.parametrize("missing", ["tweet_id", "username", "fetched_at", "media"])
+def test_media_retry_rejects_missing_keys(missing: str) -> None:
+    data = media_retry().to_dict()
+    del data[missing]
+
+    with pytest.raises(MessageError, match="malformed message"):
+        MediaRetry.from_json(json.dumps(data))
+
+
+@pytest.mark.parametrize("tweet_id", ["", None, 12])
+def test_media_retry_rejects_a_bad_tweet_id(tweet_id: object) -> None:
+    data = media_retry().to_dict()
+    data["tweet_id"] = tweet_id
+
+    with pytest.raises(MessageError, match="tweet_id"):
+        MediaRetry.from_json(json.dumps(data))
+
+
+def test_media_retry_rejects_a_media_without_a_key() -> None:
+    data = media_retry().to_dict()
+    data["media"] = {"type": "photo"}
+
+    with pytest.raises(MessageError, match="malformed message"):
+        MediaRetry.from_json(json.dumps(data))
+
+
+def test_integers_are_clamped_to_what_dynamodb_can_store() -> None:
+    huge = 10**45
+    media = Media.from_dict(
+        {
+            "media_key": "m",
+            "type": "photo",
+            "width": huge,
+            "height": -huge,
+            "duration_ms": huge,
+            "variants": [{"content_type": "video/mp4", "url": "u", "bit_rate": huge}],
+        }
+    )
+    tweet = Tweet.from_dict({"id": "1", "text": "t", "public_metrics": {"likes": huge}})
+
+    assert (media.width, media.height, media.duration_ms) == (
+        MAX_STORED_INT,
+        -MAX_STORED_INT,
+        MAX_STORED_INT,
+    )
+    assert media.variants[0].bit_rate == MAX_STORED_INT
+    assert tweet.public_metrics["likes"] == MAX_STORED_INT
