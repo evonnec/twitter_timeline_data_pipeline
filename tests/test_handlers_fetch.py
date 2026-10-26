@@ -1,12 +1,13 @@
 import json
 import logging
 from collections.abc import Callable
-from typing import Any
+from typing import Any, cast
 
 import httpx
 import pytest
 from conftest import Aws
 from helpers import (
+    KISS,
     TOKEN,
     USER_ID,
     FakeSqs,
@@ -20,6 +21,7 @@ from helpers import (
 )
 from hypothesis import given
 from hypothesis import strategies as st
+from mypy_boto3_s3 import S3Client
 
 from twitter_timeline_data_pipeline import credentials
 from twitter_timeline_data_pipeline.config import ConfigError
@@ -38,7 +40,11 @@ from twitter_timeline_data_pipeline.handlers.fetch import (
     run_fetch,
 )
 from twitter_timeline_data_pipeline.models import Media, Tweet, TweetMessage
-from twitter_timeline_data_pipeline.storage import CheckpointStore, TweetStore
+from twitter_timeline_data_pipeline.storage import (
+    ITEM_TEXT_LIMIT_BYTES,
+    CheckpointStore,
+    TweetStore,
+)
 from twitter_timeline_data_pipeline.x_api import AuthError, NotFoundError, XApiError
 
 USERNAME = "example_user"
@@ -702,6 +708,7 @@ WORST_CASES = {
     "zwj-family": "\U0001f468\u200d\U0001f469\u200d\U0001f467\u200d\U0001f466",
     "tag-flag": ENGLAND_FLAG,
     "cjk": "\u6f22",
+    "zwj-kiss": KISS,
 }
 
 
@@ -722,6 +729,21 @@ def worst_case_message(unit: str) -> TweetMessage:
         media=media,
         fetched_at="2026-10-25T00:00:00Z",
     )
+
+
+class FakeS3:
+    """Records ``put_object`` calls."""
+
+    def __init__(self) -> None:
+        self.puts: list[dict[str, Any]] = []
+
+    def put_object(self, **kwargs: Any) -> dict[str, Any]:
+        self.puts.append(kwargs)
+        return {}
+
+
+def _utf8(text: str) -> bytes:
+    return text.encode("utf-8")
 
 
 def approx_item_size(item: Any) -> int:
@@ -747,13 +769,25 @@ def test_worst_case_posts_fit_one_message_and_one_dynamodb_item(unit: str) -> No
     body = message.to_json()
 
     assert len(body.encode()) < SQS_MAX_MESSAGE_BYTES
-    assert len(body.encode()) < 400_000
     assert TweetMessage.from_json(body) == message
-    item = TweetStore.to_item(message, [])
+    s3 = FakeS3()
+    store = TweetStore(cast(Any, None), cast("S3Client", s3), "bucket")
+    item = store.build_item(message, [])
     item["media"] = [
         {"media_key": m.media_key, "alt_text": m.alt_text} for m in message.media
     ]
     assert approx_item_size(item) < 400_000
+    # What the item leaves out is in S3, in full.
+    assert [c["Body"] for c in s3.puts] in ([], [_utf8(unit * 12_500)])
+    assert bool(s3.puts) == (len(_utf8(unit * 12_500)) > ITEM_TEXT_LIMIT_BYTES)
+
+
+def test_the_35_byte_emoji_post_is_the_largest_body_and_item_text() -> None:
+    unit = WORST_CASES["zwj-kiss"]
+
+    assert len(unit.encode()) == 35
+    assert len(worst_case_message(unit).to_json().encode()) > 440_000
+    assert len(unit.encode()) * 12_500 > 400_000
 
 
 def test_a_long_post_is_enqueued_in_full(aws: Aws) -> None:

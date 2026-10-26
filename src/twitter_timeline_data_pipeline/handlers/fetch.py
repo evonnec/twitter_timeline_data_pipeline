@@ -38,9 +38,11 @@ SQS_BATCH_SIZE = 10  # SendMessageBatch limit
 SEND_RETRIES = 2  # extra attempts for entries SQS reports as Failed
 RETRY_BACKOFF_SECONDS = 0.5
 # SQS's maximum for one message and for the total of one SendMessageBatch call (1 MiB).
-# The queues' MaximumMessageSize in template.yaml must equal it. The DynamoDB item
-# holds the same text as UTF-8, so a body under this limit stays under its 400 KB item
-# limit (checked in the tests); re-check that if the limit or the item layout changes.
+# The queues' MaximumMessageSize in template.yaml must equal it. The worst legal body
+# (a 25,000-weighted-character post of 35-byte emoji sequences) is about 450 KB, under
+# the limit. That text alone can exceed DynamoDB's 400 KB item limit, so the processor
+# moves text over ``ITEM_TEXT_LIMIT_BYTES`` to S3 and keeps the item under the limit
+# (checked in the tests); re-check that if the limit or the item layout changes.
 SQS_MAX_MESSAGE_BYTES = 1_048_576
 
 

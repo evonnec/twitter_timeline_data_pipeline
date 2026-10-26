@@ -50,9 +50,9 @@ NEW = "2026-10-25T12:00:00Z"
 class ExplodingTweetStore(TweetStore):
     """Fails like a DynamoDB outage for one tweet; behaves normally otherwise."""
 
-    def __init__(self, table: Any, bad_tweet_id: str) -> None:
-        super().__init__(table)
-        self._bad = bad_tweet_id
+    def __init__(self, table: Any, s3_client: Any, bucket: str, bad: str) -> None:
+        super().__init__(table, s3_client, bucket)
+        self._bad = bad
 
     def put_tweet(self, message: TweetMessage, media: Any) -> PutResult:
         if message.tweet.id == self._bad:
@@ -96,7 +96,9 @@ def test_reports_exactly_the_failing_records(
         failed = process_records(
             records,
             media_store=MediaStore(aws.s3, aws.bucket, cdn.client()),
-            tweet_store=ExplodingTweetStore(aws.tweets_table, UNEXPECTED),
+            tweet_store=ExplodingTweetStore(
+                aws.tweets_table, aws.s3, aws.bucket, UNEXPECTED
+            ),
         )
 
     assert failed == ["m-malformed", "m-transient", "m-unexpected", "m-schema"]
@@ -113,7 +115,7 @@ def test_empty_batch_has_no_failures(aws: Aws, cdn: CdnStub) -> None:
     failed = process_records(
         [],
         media_store=MediaStore(aws.s3, aws.bucket, cdn.client()),
-        tweet_store=TweetStore(aws.tweets_table),
+        tweet_store=TweetStore(aws.tweets_table, aws.s3, aws.bucket),
     )
 
     assert failed == []
@@ -129,7 +131,7 @@ def test_stale_record_is_skipped_without_failing_and_logged(
     older = make_message(
         GOOD, media=(pic,), tweet={"media_keys": [pic.media_key]}, fetched_at=OLD
     )
-    store = TweetStore(aws.tweets_table)
+    store = TweetStore(aws.tweets_table, aws.s3, aws.bucket)
     media_store = MediaStore(aws.s3, aws.bucket, cdn.client())
     process_records(
         [sqs_record("new", body(newer))], media_store=media_store, tweet_store=store
@@ -163,7 +165,7 @@ def test_all_good_batch_has_no_failures(aws: Aws, cdn: CdnStub) -> None:
     failed = process_records(
         records,
         media_store=MediaStore(aws.s3, aws.bucket, cdn.client()),
-        tweet_store=TweetStore(aws.tweets_table),
+        tweet_store=TweetStore(aws.tweets_table, aws.s3, aws.bucket),
     )
 
     assert failed == []
@@ -176,7 +178,7 @@ def test_metadata_is_not_written_when_media_fails_transiently(
     failed = process_records(
         [sqs_record("m1", body(photo_message(TRANSIENT, TRANSIENT_URL)))],
         media_store=MediaStore(aws.s3, aws.bucket, cdn.client()),
-        tweet_store=TweetStore(aws.tweets_table),
+        tweet_store=TweetStore(aws.tweets_table, aws.s3, aws.bucket),
     )
 
     assert failed == ["m1"]
@@ -192,7 +194,7 @@ def test_second_media_failing_transiently_blocks_metadata_then_redelivery_comple
     )
     record = sqs_record("m1", body(message))
     media_store = MediaStore(aws.s3, aws.bucket, cdn.client())
-    tweet_store = TweetStore(aws.tweets_table)
+    tweet_store = TweetStore(aws.tweets_table, aws.s3, aws.bucket)
 
     assert process_records(
         [record], media_store=media_store, tweet_store=tweet_store
@@ -221,7 +223,7 @@ def test_permanently_unavailable_media_still_records_the_tweet(
     failed = process_records(
         [sqs_record("m1", body(photo_message(TRANSIENT, TRANSIENT_URL)))],
         media_store=MediaStore(aws.s3, aws.bucket, cdn.client()),
-        tweet_store=TweetStore(aws.tweets_table),
+        tweet_store=TweetStore(aws.tweets_table, aws.s3, aws.bucket),
     )
 
     assert failed == []
@@ -245,7 +247,9 @@ def test_unexpected_exception_in_media_store_is_isolated_to_its_record(
     ]
 
     failed = process_records(
-        records, media_store=store, tweet_store=TweetStore(aws.tweets_table)
+        records,
+        media_store=store,
+        tweet_store=TweetStore(aws.tweets_table, aws.s3, aws.bucket),
     )
 
     assert failed == ["m-media"]
@@ -272,7 +276,7 @@ def test_malformed_bodies_fail_their_record(
         failed = process_records(
             [sqs_record("bad", bad_body)],
             media_store=MediaStore(aws.s3, aws.bucket, cdn.client()),
-            tweet_store=TweetStore(aws.tweets_table),
+            tweet_store=TweetStore(aws.tweets_table, aws.s3, aws.bucket),
         )
 
     assert failed == ["bad"]
@@ -390,5 +394,5 @@ def test_http_client_factory_configuration() -> None:
 
 def test_aws_client_factories_are_cached(aws: Aws) -> None:
     assert process._s3_client() is process._s3_client()
-    assert process._tweet_store("t") is process._tweet_store("t")
-    assert process._tweet_store("t") is not process._tweet_store("u")
+    assert process._tweet_store("t", "b") is process._tweet_store("t", "b")
+    assert process._tweet_store("t", "b") is not process._tweet_store("u", "b")

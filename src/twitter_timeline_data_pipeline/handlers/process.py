@@ -91,8 +91,10 @@ def _http_client(timeout: float) -> httpx.Client:
 
 
 @functools.cache
-def _tweet_store(table_name: str) -> TweetStore:
-    return TweetStore(boto3.resource("dynamodb").Table(table_name))
+def _tweet_store(table_name: str, bucket: str) -> TweetStore:
+    return TweetStore(
+        boto3.resource("dynamodb").Table(table_name), _s3_client(), bucket
+    )
 
 
 def handler(event: Any, context: Any) -> dict[str, list[dict[str, str]]]:
@@ -105,6 +107,6 @@ def handler(event: Any, context: Any) -> dict[str, list[dict[str, str]]]:
         media_store=MediaStore(
             _s3_client(), settings.media_bucket, _http_client(settings.http_timeout)
         ),
-        tweet_store=_tweet_store(settings.tweets_table),
+        tweet_store=_tweet_store(settings.tweets_table, settings.media_bucket),
     )
     return {"batchItemFailures": [{"itemIdentifier": i} for i in failed]}
