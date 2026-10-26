@@ -1,6 +1,6 @@
 #!/bin/bash
 
-API_URL=$(aws cloudformation describe-stacks --stack-name nuclei-serverless-app-dynamo \
+API_URL=$(aws cloudformation describe-stacks --stack-name serverless-app-dynamo \
    --query "Stacks[0].Outputs[?OutputKey=='EndpointURL'].OutputValue | [0]")
 #get the API URL created by the deploy of the stack
 

@@ -1,5 +1,5 @@
-Take Home: Serverless App
-================
+Serverless App
+==============
 
 Status
 ------

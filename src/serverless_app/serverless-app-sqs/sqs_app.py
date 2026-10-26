@@ -9,7 +9,7 @@ Returns:
     _type_: _description_
 """
 # Invoke this lambda function whenever a message
-# is sent to the ``tweets-queue_nuclei-serverless-app`` SQS queue.
+# is sent to the ``tweets-queue_serverless-app`` SQS queue.
 
 @app.on_sqs_message(queue='tweets-queue_serverless-app')
 def handler_sqs(event):
