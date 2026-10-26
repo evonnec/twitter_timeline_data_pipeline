@@ -1,0 +1,316 @@
+{
+  "data": [
+    {
+      "id": "1700000000000000015",
+      "text": "RT @orig_author: Full original body that is long. Full original body that is long. Full origi…",
+      "author_id": "2244994945",
+      "created_at": "2026-10-20T12:00:05.000Z",
+      "edit_history_tweet_ids": [
+        "1700000000000000015"
+      ],
+      "conversation_id": "1700000000000000015",
+      "lang": "en",
+      "public_metrics": {
+        "retweet_count": 0,
+        "reply_count": 0,
+        "like_count": 1,
+        "quote_count": 0,
+        "bookmark_count": 0,
+        "impression_count": 9
+      },
+      "possibly_sensitive": false,
+      "edit_controls": {
+        "edits_remaining": 5,
+        "is_edit_eligible": true,
+        "editable_until": "2026-10-20T13:00:00.000Z"
+      },
+      "referenced_tweets": [
+        {
+          "type": "retweeted",
+          "id": "1600000000000000001"
+        }
+      ],
+      "entities": {
+        "mentions": [
+          {
+            "start": 3,
+            "end": 15,
+            "username": "orig_author",
+            "id": "111"
+          }
+        ]
+      }
+    },
+    {
+      "id": "1700000000000000014",
+      "text": "Interesting take, see https://t.co/aaaa and #pipelines $NASA @friend",
+      "author_id": "2244994945",
+      "created_at": "2026-10-20T12:00:04.000Z",
+      "edit_history_tweet_ids": [
+        "1700000000000000014"
+      ],
+      "conversation_id": "1700000000000000014",
+      "lang": "en",
+      "public_metrics": {
+        "retweet_count": 0,
+        "reply_count": 0,
+        "like_count": 1,
+        "quote_count": 0,
+        "bookmark_count": 0,
+        "impression_count": 9
+      },
+      "possibly_sensitive": false,
+      "edit_controls": {
+        "edits_remaining": 5,
+        "is_edit_eligible": true,
+        "editable_until": "2026-10-20T13:00:00.000Z"
+      },
+      "referenced_tweets": [
+        {
+          "type": "quoted",
+          "id": "1600000000000000002"
+        }
+      ],
+      "entities": {
+        "urls": [
+          {
+            "start": 19,
+            "end": 42,
+            "url": "https://t.co/aaaa",
+            "expanded_url": "https://example.com/article",
+            "display_url": "example.com/article",
+            "status": 200,
+            "title": "An article"
+          }
+        ],
+        "hashtags": [
+          {
+            "start": 47,
+            "end": 57,
+            "tag": "pipelines"
+          }
+        ],
+        "cashtags": [
+          {
+            "start": 58,
+            "end": 63,
+            "tag": "NASA"
+          }
+        ],
+        "mentions": [
+          {
+            "start": 64,
+            "end": 71,
+            "username": "friend",
+            "id": "222"
+          }
+        ],
+        "annotations": [
+          {
+            "start": 0,
+            "end": 3,
+            "probability": 0.5,
+            "type": "Other",
+            "normalized_text": "x"
+          }
+        ]
+      }
+    },
+    {
+      "id": "1700000000000000013",
+      "text": "@friend thanks!",
+      "author_id": "2244994945",
+      "created_at": "2026-10-20T12:00:03.000Z",
+      "edit_history_tweet_ids": [
+        "1700000000000000013"
+      ],
+      "conversation_id": "1700000000000000013",
+      "lang": "en",
+      "public_metrics": {
+        "retweet_count": 0,
+        "reply_count": 0,
+        "like_count": 1,
+        "quote_count": 0,
+        "bookmark_count": 0,
+        "impression_count": 9
+      },
+      "possibly_sensitive": false,
+      "edit_controls": {
+        "edits_remaining": 5,
+        "is_edit_eligible": true,
+        "editable_until": "2026-10-20T13:00:00.000Z"
+      },
+      "in_reply_to_user_id": "222",
+      "referenced_tweets": [
+        {
+          "type": "replied_to",
+          "id": "1600000000000000003"
+        }
+      ],
+      "entities": {
+        "mentions": [
+          {
+            "start": 0,
+            "end": 7,
+            "username": "friend",
+            "id": "222"
+          }
+        ]
+      }
+    },
+    {
+      "id": "1700000000000000012",
+      "text": "RT @gone: this original was deleted",
+      "author_id": "2244994945",
+      "created_at": "2026-10-20T12:00:02.000Z",
+      "edit_history_tweet_ids": [
+        "1700000000000000012"
+      ],
+      "conversation_id": "1700000000000000012",
+      "lang": "en",
+      "public_metrics": {
+        "retweet_count": 0,
+        "reply_count": 0,
+        "like_count": 1,
+        "quote_count": 0,
+        "bookmark_count": 0,
+        "impression_count": 9
+      },
+      "possibly_sensitive": false,
+      "edit_controls": {
+        "edits_remaining": 5,
+        "is_edit_eligible": true,
+        "editable_until": "2026-10-20T13:00:00.000Z"
+      },
+      "referenced_tweets": [
+        {
+          "type": "retweeted",
+          "id": "1600000000000000004"
+        }
+      ]
+    },
+    {
+      "id": "1700000000000000011",
+      "text": "A long post with a link https://t.co/bbbb …",
+      "author_id": "2244994945",
+      "created_at": "2026-10-20T12:00:01.000Z",
+      "edit_history_tweet_ids": [
+        "1700000000000000011"
+      ],
+      "conversation_id": "1700000000000000011",
+      "lang": "en",
+      "public_metrics": {
+        "retweet_count": 0,
+        "reply_count": 0,
+        "like_count": 1,
+        "quote_count": 0,
+        "bookmark_count": 0,
+        "impression_count": 9
+      },
+      "possibly_sensitive": false,
+      "edit_controls": {
+        "edits_remaining": 5,
+        "is_edit_eligible": true,
+        "editable_until": "2026-10-20T13:00:00.000Z"
+      },
+      "note_tweet": {
+        "text": "A long post with a link https://t.co/bbbb xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "entities": {
+          "urls": [
+            {
+              "start": 22,
+              "end": 45,
+              "url": "https://t.co/bbbb",
+              "expanded_url": "https://example.org/long",
+              "display_url": "example.org/long"
+            }
+          ]
+        }
+      },
+      "entities": {
+        "urls": [
+          {
+            "start": 22,
+            "end": 45,
+            "url": "https://t.co/bbbb",
+            "expanded_url": "https://example.org/long",
+            "display_url": "example.org/long"
+          }
+        ]
+      },
+      "withheld": {
+        "copyright": false,
+        "country_codes": [
+          "DE"
+        ]
+      }
+    }
+  ],
+  "includes": {
+    "tweets": [
+      {
+        "id": "1600000000000000001",
+        "text": "Full original body that is long. Full original body that is long. Full origi…",
+        "author_id": "111",
+        "created_at": "2026-10-01T08:00:00.000Z",
+        "edit_history_tweet_ids": [
+          "1600000000000000001"
+        ],
+        "note_tweet": {
+          "text": "Full original body that is long. Full original body that is long. Full original body that is long. Full original body that is long. Full original body that is long. Full original body that is long. Full original body that is long. Full original body that is long. Full original body that is long. Full original body that is long. Full original body that is long. Full original body that is long. "
+        }
+      },
+      {
+        "id": "1600000000000000002",
+        "text": "The quoted post",
+        "author_id": "333",
+        "created_at": "2026-10-02T08:00:00.000Z",
+        "edit_history_tweet_ids": [
+          "1600000000000000002"
+        ]
+      },
+      {
+        "id": "1600000000000000003",
+        "text": "Did you see the pipeline?",
+        "author_id": "222",
+        "created_at": "2026-10-03T08:00:00.000Z",
+        "edit_history_tweet_ids": [
+          "1600000000000000003"
+        ]
+      }
+    ],
+    "users": [
+      {
+        "id": "111",
+        "name": "Original Author",
+        "username": "orig_author"
+      },
+      {
+        "id": "222",
+        "name": "Friend",
+        "username": "friend"
+      },
+      {
+        "id": "333",
+        "name": "Quoted",
+        "username": "quoted_user"
+      }
+    ]
+  },
+  "errors": [
+    {
+      "value": "1600000000000000004",
+      "detail": "Could not find tweet with referenced_tweets.id: [1600000000000000004].",
+      "title": "Not Found Error",
+      "resource_type": "tweet",
+      "parameter": "referenced_tweets.id",
+      "resource_id": "1600000000000000004",
+      "type": "https://api.twitter.com/2/problems/resource-not-found"
+    }
+  ],
+  "meta": {
+    "newest_id": "1700000000000000015",
+    "oldest_id": "1700000000000000011",
+    "result_count": 5
+  }
+}

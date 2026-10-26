@@ -9,7 +9,7 @@ import json
 import logging
 import re
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any, NoReturn, Self
 
@@ -199,6 +199,108 @@ class ReferencedTweet:
     id: TweetId
 
 
+def _clean_json(value: Any) -> Any:
+    """``value`` as plain JSON for DynamoDB: integers clamped, ``None`` entries dropped
+    and floats (which DynamoDB's resource API rejects) written as strings."""
+    match value:
+        case dict():
+            return {str(k): _clean_json(v) for k, v in value.items() if v is not None}
+        case list() | tuple():
+            return [_clean_json(v) for v in value if v is not None]
+        case bool() | str():
+            return value
+        case int():
+            return clamp_int(value)
+        case _:  # a float (DynamoDB's resource API rejects them) or anything else
+            return str(value)
+
+
+# Entity kind -> the keys kept for each entry. Offsets (``start``/``end``) index the
+# text the entities came from.
+_ENTITY_KEYS: Mapping[str, tuple[str, ...]] = {
+    "urls": ("url", "expanded_url", "display_url", "start", "end"),
+    "mentions": ("username", "id", "start", "end"),
+    "hashtags": ("tag", "start", "end"),
+    "cashtags": ("tag", "start", "end"),
+}
+
+
+def compact_entities(data: Any) -> dict[str, Any] | None:
+    """The part of an API ``entities`` object that is stored (URLs with their expanded
+    form, mentions, hashtags, cashtags), or None when there is none. Idempotent."""
+    if not isinstance(data, Mapping):
+        return None
+    out: dict[str, Any] = {}
+    for kind, keys in _ENTITY_KEYS.items():
+        entries = data.get(kind)
+        if isinstance(entries, list) and entries:
+            out[kind] = [
+                {k: _clean_json(e[k]) for k in keys if e.get(k) is not None}
+                for e in entries
+                if isinstance(e, Mapping)
+            ]
+    return out or None
+
+
+def _opt_object(value: Any) -> dict[str, Any] | None:
+    return _clean_json(value) if isinstance(value, Mapping) and value else None
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ReferencedPost:
+    """A compact copy of a post another post refers to (the original of a retweet, the
+    quoted post, the one replied to), from the ``referenced_tweets.id`` expansion.
+
+    ``text`` is the API's text (for a retweet of a long post it is cut at about 140
+    characters and ``note_text`` holds the whole body). ``status`` is ``unavailable``
+    when the expansion was requested but the API returned nothing for the post
+    (deleted, withheld or protected); only ``id`` and ``type`` are known then.
+    """
+
+    id: TweetId
+    type: str = ""
+    text: str | None = None
+    note_text: str | None = None
+    author_id: str | None = None
+    author_username: str | None = None
+    created_at: str | None = None
+    status: str | None = None
+
+    @property
+    def full_text(self) -> str | None:
+        return self.note_text or self.text
+
+    @classmethod
+    def from_api(
+        cls, data: Mapping[str, Any], usernames: Mapping[str, str] | None = None
+    ) -> Self:
+        """Build from an ``includes.tweets`` object; ``usernames`` maps author IDs to
+        handles (``includes.users``)."""
+        note = data.get("note_tweet") or data.get("note_post") or {}
+        author_id = _opt_str(data.get("author_id"))
+        return cls(
+            id=str(data["id"]),
+            text=_opt_str(data.get("text")),
+            note_text=_opt_str(note.get("text")),
+            author_id=author_id,
+            author_username=(usernames or {}).get(author_id or ""),
+            created_at=_opt_str(data.get("created_at")),
+        )
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> Self:
+        return cls(
+            id=str(data["id"]),
+            type=str(data.get("type") or ""),
+            text=_opt_str(data.get("text")),
+            note_text=_opt_str(data.get("note_text")),
+            author_id=_opt_str(data.get("author_id")),
+            author_username=_opt_str(data.get("author_username")),
+            created_at=_opt_str(data.get("created_at")),
+            status=_opt_str(data.get("status")),
+        )
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class Tweet:
     id: TweetId
@@ -216,6 +318,15 @@ class Tweet:
     # Full text of a long post (over 280 characters), from ``note_tweet.text``. For
     # those posts ``text`` is only a truncated preview.
     note_text: str | None = None
+    # Entities of the text stored as ``text`` (a long post's come from
+    # ``note_tweet.entities``); ``display_entities`` are the Tweet-level ones for the
+    # truncated preview, kept only when they differ.
+    entities: Mapping[str, Any] | None = None
+    display_entities: Mapping[str, Any] | None = None
+    in_reply_to_user_id: str | None = None
+    possibly_sensitive: bool | None = None
+    edit_controls: Mapping[str, Any] | None = None
+    withheld: Mapping[str, Any] | None = None
 
     @property
     def full_text(self) -> str:
@@ -228,10 +339,18 @@ class Tweet:
         attachments = data.get("attachments") or {}
         # X is renaming the field (the docs and OpenAPI spec show ``note_post``).
         note = data.get("note_tweet") or data.get("note_post") or {}
+        entities = compact_entities(data.get("entities"))
+        note_entities = compact_entities(note.get("entities"))
+        if note_entities is not None and note.get("text"):
+            entities, display_entities = note_entities, entities
+        else:
+            display_entities = None
         return cls._build(
             data,
             media_keys=attachments.get("media_keys") or (),
             note_text=note.get("text"),
+            entities=entities,
+            display_entities=display_entities,
         )
 
     @classmethod
@@ -241,11 +360,19 @@ class Tweet:
             data,
             media_keys=data.get("media_keys") or (),
             note_text=data.get("note_text"),
+            entities=compact_entities(data.get("entities")),
+            display_entities=compact_entities(data.get("display_entities")),
         )
 
     @classmethod
     def _build(
-        cls, data: Mapping[str, Any], *, media_keys: Any, note_text: Any
+        cls,
+        data: Mapping[str, Any],
+        *,
+        media_keys: Any,
+        note_text: Any,
+        entities: dict[str, Any] | None,
+        display_entities: dict[str, Any] | None,
     ) -> Self:
         return cls(
             id=str(data["id"]),
@@ -267,6 +394,16 @@ class Tweet:
             ),
             media_keys=tuple(str(k) for k in media_keys),
             note_text=_opt_str(note_text),
+            entities=entities,
+            display_entities=display_entities,
+            in_reply_to_user_id=_opt_str(data.get("in_reply_to_user_id")),
+            possibly_sensitive=(
+                None
+                if data.get("possibly_sensitive") is None
+                else bool(data["possibly_sensitive"])
+            ),
+            edit_controls=_opt_object(data.get("edit_controls")),
+            withheld=_opt_object(data.get("withheld")),
         )
 
 
@@ -281,6 +418,9 @@ class TweetMessage:
     # (deleted or withheld media). Additive and optional, like ``note_text``: an old
     # reader ignores it, and a message without it means none were reported missing.
     missing_media_keys: tuple[MediaKey, ...] = ()
+    # A compact copy of each post the Tweet refers to (additive and optional too): a
+    # reader without it still has the ``{type, id}`` pairs in the Tweet.
+    referenced: tuple[ReferencedPost, ...] = ()
     fetched_at: str = field(default_factory=utc_now_iso)
     schema_version: int = SCHEMA_VERSION
 
@@ -306,6 +446,9 @@ class TweetMessage:
             media=tuple(Media.from_dict(m) for m in data.get("media") or ()),
             missing_media_keys=tuple(
                 str(k) for k in data.get("missing_media_keys") or ()
+            ),
+            referenced=tuple(
+                ReferencedPost.from_dict(r) for r in data.get("referenced") or ()
             ),
             fetched_at=normalize_fetched_at(data["fetched_at"]),
             schema_version=version,
@@ -428,6 +571,33 @@ class TimelinePage:
     newest_id: TweetId | None = None
     oldest_id: TweetId | None = None
     next_token: str | None = None
+    # Posts from ``includes.tweets`` by ID (``type`` is empty here), and whether the
+    # request asked for the expansion: only then is a reference with no entry here
+    # known to be unavailable rather than simply not requested.
+    included: Mapping[TweetId, ReferencedPost] = field(default_factory=dict)
+    expanded: bool = False
+
+    def _referenced(self, tweet: Tweet) -> tuple[ReferencedPost, ...]:
+        out = []
+        for ref in tweet.referenced_tweets:
+            if (post := self.included.get(ref.id)) is not None:
+                out.append(replace(post, type=ref.type))
+                continue
+            if self.expanded:
+                logger.warning(
+                    "%s tweet %s of tweet %s missing from includes",
+                    ref.type,
+                    ref.id,
+                    tweet.id,
+                )
+            out.append(
+                ReferencedPost(
+                    id=ref.id,
+                    type=ref.type,
+                    status="unavailable" if self.expanded else None,
+                )
+            )
+        return tuple(out)
 
     def messages(
         self, username: str, *, fetched_at: str | None = None
@@ -456,6 +626,7 @@ class TimelinePage:
                     tweet=tweet,
                     media=tuple(media),
                     missing_media_keys=tuple(missing),
+                    referenced=self._referenced(tweet),
                     fetched_at=stamp,
                 )
             )

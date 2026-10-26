@@ -17,8 +17,10 @@ from helpers import (
 
 from twitter_timeline_data_pipeline import x_api
 from twitter_timeline_data_pipeline.x_api import (
+    ENTITY_FIELDS,
     EXPANSIONS,
     MEDIA_FIELDS,
+    REFERENCE_EXPANSIONS,
     TWEET_FIELDS,
     AuthError,
     NotFoundError,
@@ -502,9 +504,13 @@ def test_iter_timeline_sends_field_params_and_follows_pagination() -> None:
     assert len(pages) == 2
     assert first.url.path == f"/2/users/{USER_ID}/tweets"
     assert first.url.params["max_results"] == "50"
-    assert first.url.params["tweet.fields"] == ",".join(TWEET_FIELDS)
+    assert first.url.params["tweet.fields"] == ",".join(
+        sorted({*TWEET_FIELDS, *ENTITY_FIELDS})
+    )
     assert "note_tweet" in first.url.params["tweet.fields"].split(",")
-    assert first.url.params["expansions"] == ",".join(EXPANSIONS)
+    assert first.url.params["expansions"] == ",".join(
+        (*EXPANSIONS, *REFERENCE_EXPANSIONS)
+    )
     assert first.url.params["media.fields"] == ",".join(MEDIA_FIELDS)
     assert "pagination_token" not in first.url.params
     assert "since_id" not in first.url.params

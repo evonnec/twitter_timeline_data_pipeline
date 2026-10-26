@@ -31,6 +31,21 @@ Parameters:
     MinValue: 5
     MaxValue: 100
     Description: Tweets per API page.
+  ExpandReferencedTweets:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: >-
+      Also request the posts each Tweet retweets, quotes or replies to, with their
+      authors, so the stored item holds the original's full text. Under pay-per-use
+      these expanded posts may be billed as reads.
+  RequestEntities:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: >-
+      Also request entities (expanded URLs, mentions, hashtags) and the in_reply_to_user_id,
+      possibly_sensitive, edit_controls and withheld fields.
   MaxMediaBytes:
     Type: Number
     Default: 536870912  # 512 MiB
@@ -277,6 +292,8 @@ Resources:
           STATE_TABLE: !Ref StateTable
           MAX_PAGES: !Ref MaxPages
           MAX_RESULTS: !Ref MaxResults
+          EXPAND_REFERENCED_TWEETS: !Ref ExpandReferencedTweets
+          REQUEST_ENTITIES: !Ref RequestEntities
       Policies:
         - SQSSendMessagePolicy:
             QueueName: !GetAtt TweetsQueue.QueueName

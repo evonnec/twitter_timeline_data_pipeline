@@ -105,7 +105,11 @@ def _fetch(args: argparse.Namespace) -> int:
 
     token = get_bearer_token(settings)
     with XClient(
-        token, base_url=settings.x_api_base_url, timeout=settings.http_timeout
+        token,
+        base_url=settings.x_api_base_url,
+        timeout=settings.http_timeout,
+        expand_referenced=settings.expand_referenced_tweets,
+        request_entities=settings.request_entities,
     ) as x_client:
         if args.dry_run:
             username = normalize_username(args.username)

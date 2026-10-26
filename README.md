@@ -78,7 +78,23 @@ One message per Tweet. The body is compact UTF-8 JSON, with only the characters 
     },
     "edit_history_tweet_ids": ["1850000000000000001"],
     "media_keys": ["3_1850000000000000002"],
-    "note_text": null
+    "note_text": null,
+    "entities": {
+      "urls": [
+        {
+          "url": "https://t.co/abc",
+          "expanded_url": "https://example.com/launch",
+          "display_url": "example.com/launch",
+          "start": 12,
+          "end": 28
+        }
+      ]
+    },
+    "display_entities": null,
+    "in_reply_to_user_id": null,
+    "possibly_sensitive": null,
+    "edit_controls": null,
+    "withheld": null
   },
   "media": [
     {
@@ -94,6 +110,7 @@ One message per Tweet. The body is compact UTF-8 JSON, with only the characters 
     }
   ],
   "missing_media_keys": [],
+  "referenced": [],
   "fetched_at": "2024-10-25T14:35:00Z",
   "schema_version": 1
 }
@@ -101,11 +118,13 @@ One message per Tweet. The body is compact UTF-8 JSON, with only the characters 
 
 You can regenerate it with `TweetMessage(...).to_json()` from `twitter_timeline_data_pipeline.models`.
 
-**Long posts.** For a post over 280 characters the API's `text` is only a truncated preview; the full body is in `note_tweet.text`, which the fetch Lambda requests. It travels as `tweet.note_text` (`null` for a short post, and absent from messages queued by the old fetch Lambda). Entities of the long text are not collected.
+**Long posts.** For a post over 280 characters the API's `text` is only a truncated preview; the full body is in `note_tweet.text`, which the fetch Lambda requests. It travels as `tweet.note_text` (`null` for a short post, and absent from messages queued by the old fetch Lambda). For a long post the stored `entities` are the ones of `note_tweet.entities` (their offsets index the full text); the Tweet-level ones, which index the preview, are kept as `display_entities` when the post is long.
 
 **Missing media.** A key in the Tweet's `attachments.media_keys` that the response's `includes.media` does not return (deleted or withheld media) is logged (`media key ... missing from includes`) and listed in `missing_media_keys`; the Tweet's `media_keys` still holds every attached key. The field is optional (absent means none were reported).
 
-**Compatibility.** `note_text` and `missing_media_keys` are additive, optional fields, so `schema_version` stays 1. A reader builds a Tweet from explicit keys and ignores unknown ones, so a processor from before this field still parses a new message (and stores the preview), and a new processor reading an old message gets `note_text = null` and no `missing_media_keys`. The version only changes for a change a reader cannot ignore.
+**Referenced posts and entities.** The fetch Lambda requests the `referenced_tweets.id` and `referenced_tweets.id.author_id` expansions, so the API returns the original of a retweet (whose own `text` is cut at about 140 characters, `RT @user: ...`), the quoted post and the post replied to under `includes.tweets`, and their authors under `includes.users`. Each message carries a compact copy of each in `referenced`: `{id, type, text, note_text, author_id, author_username, created_at, status}` (`note_text` for a long original, `status` below). A referenced post the API did not return (deleted, withheld or protected) is kept as `{id, type, status: "unavailable"}` and logged; the reference is never dropped. `tweet.entities` holds `urls` (`url`, `expanded_url`, `display_url`, `start`, `end`), `mentions` (`username`, `id`, offsets), `hashtags` and `cashtags` (`tag`, offsets); `tweet` also carries `in_reply_to_user_id`, `possibly_sensitive`, `edit_controls` and `withheld` when the API returns them. The media of referenced posts is not requested: `referenced_tweets.id.attachments.media_keys` is not in the endpoint's current expansion list in X's documentation (a possible flag later). Both requests can be turned off (`EXPAND_REFERENCED_TWEETS`, `REQUEST_ENTITIES`); with the expansion off the references are only `{type, id}` and carry no `status`.
+
+**Compatibility.** `note_text`, `missing_media_keys`, `referenced` and the entity fields are additive, optional fields, so `schema_version` stays 1. A reader builds a Tweet from explicit keys and ignores unknown ones, so a processor from before this field still parses a new message (and stores the preview), and a new processor reading an old message gets `note_text = null` and no `missing_media_keys`. The version only changes for a change a reader cannot ignore.
 
 **Size.** Each Tweet is one message, encoded as UTF-8. Only the characters SQS rejects or UTF-8 cannot encode (lone surrogates, U+FFFE, U+FFFF) are escaped, because escaping every non-ASCII character made emoji three to six times larger. The queues' `MaximumMessageSize` is 1 MiB (SQS's maximum; the dead-letter queue matches so redriven messages fit), and the fetch Lambda also groups messages so one `SendMessageBatch` call stays under 1 MiB in total. The worst case measured is about 450 KB, under the 1 MiB limit: a 25,000-weighted-character post of 35-byte emoji sequences (12,500 of them, such as woman, skin tone, heart, kiss mark, man, skin tone) with four photos whose alt text is 1,000 characters each. That text alone is over DynamoDB's 400 KB item limit, so when the estimated item size is over 350 KB the processor moves the text (and, if still needed, `display_text`) to S3 (see the Tweets table) and keeps the item under the limit. A body over the limit stops the run with `MessageTooLargeError` instead of dropping data: the checkpoint is not advanced and the Lambda's Errors alarm fires.
 
@@ -135,7 +154,13 @@ You can regenerate it with `TweetMessage(...).to_json()` from `twitter_timeline_
 | `created_at` | S | ISO 8601 |
 | `conversation_id` | S | |
 | `lang` | S | |
-| `referenced_tweets` | L of M | `{type, id}`; type is `retweeted`, `quoted` or `replied_to` |
+| `referenced_tweets` | L of M | `{type, id}`; type is `retweeted`, `quoted` or `replied_to`. With the expansion on, also the original's `text` (full: for a long post `note_tweet.text`, with `display_text` the preview and `is_long_post: true`), `author_id`, `author_username` and `created_at`; `status` is `unavailable` for a post the API did not return (then only `type` and `id` are known). A referenced text is moved to S3 like `text` (`text_truncated`, `text_s3_key` in the entry; key `text/<author_id>/<tweet_id>.ref.<referenced_id>.json`) when the item is still near the size limit after `text` and `display_text` have been moved |
+| `entities` | M | Of the text stored in `text`: `urls[]` (`url`, `expanded_url`, `display_url`, `start`, `end`), `mentions[]` (`username`, `id`, `start`, `end`), `hashtags[]` and `cashtags[]` (`tag`, `start`, `end`). Absent when the Tweet has none or `REQUEST_ENTITIES` is off |
+| `display_entities` | M | Only for a long post: the Tweet-level entities, which index the preview in `display_text` |
+| `in_reply_to_user_id` | S | |
+| `possibly_sensitive` | BOOL | |
+| `edit_controls` | M | `edits_remaining`, `is_edit_eligible`, `editable_until` as returned |
+| `withheld` | M | `copyright`, `country_codes`, `scope` as returned |
 | `public_metrics` | M | retweet, reply, like and quote counts at fetch time |
 | `edit_history_tweet_ids` | L of S | |
 | `media_keys` | L of S | every media key the Tweet attaches, in the API's order, including keys the API did not return (see `missing` below) |
@@ -332,13 +357,15 @@ Other options: `--max-pages`, `--max-results` (5 to 100), `--since-id` and `--lo
 | `MEDIA_BUCKET` | process, media-retry | none | Name of the media bucket |
 | `MAX_RESULTS` | fetch | `100` | Tweets per API page, 5 to 100 |
 | `MAX_PAGES` | fetch | `5` | Maximum pages per run, at least 1 |
+| `EXPAND_REFERENCED_TWEETS` | fetch | `true` | Request the posts each Tweet retweets, quotes or replies to, with their authors. Under pay-per-use these may be billed as reads. `true` or `false` |
+| `REQUEST_ENTITIES` | fetch | `true` | Request `entities`, `in_reply_to_user_id`, `possibly_sensitive`, `edit_controls` and `withheld`. `true` or `false` |
 | `X_API_BASE_URL` | fetch | `https://api.x.com/2` | API base URL, for testing against a stub |
 | `HTTP_TIMEOUT_SECONDS` | both | `10` | Timeout for API and media HTTP requests, must be above 0 |
 | `MAX_MEDIA_BYTES` | process, media-retry | `536870912` (512 MiB) | Largest media file stored, must be above 0 |
 | `MAX_RECEIVE_COUNT` | process | none | The queue's `maxReceiveCount`; on a message's last receive its failing media are recorded as `retrying` and queued for the media-retry function instead of failing the record. Unset disables this. At least 1 |
 | `MEDIA_RETRY_QUEUE_URL` | process | none | URL of the media-retry queue |
 
-Blank values count as unset. The template sets everything except `TWITTER_BEARER_TOKEN`, `X_API_BASE_URL` and `HTTP_TIMEOUT_SECONDS`. It sets `MAX_MEDIA_BYTES` and `MAX_RECEIVE_COUNT` from the `MaxMediaBytes` and `MaxReceiveCount` parameters.
+Blank values count as unset. The template sets everything except `TWITTER_BEARER_TOKEN`, `X_API_BASE_URL` and `HTTP_TIMEOUT_SECONDS`. It sets `MAX_MEDIA_BYTES` and `MAX_RECEIVE_COUNT` from the `MaxMediaBytes` and `MaxReceiveCount` parameters, and `EXPAND_REFERENCED_TWEETS` and `REQUEST_ENTITIES` from `ExpandReferencedTweets` and `RequestEntities`.
 
 ## Deploying
 
@@ -386,6 +413,8 @@ Extra arguments are passed to `sam deploy`, for example `scripts/deploy.sh --reg
 | `ScheduleEnabled` | `true` | Set to `false` to disable the schedule rule |
 | `MaxPages` | `5` | Maximum timeline pages per run |
 | `MaxResults` | `100` | Tweets per page (5 to 100) |
+| `ExpandReferencedTweets` | `true` | Sets `EXPAND_REFERENCED_TWEETS`: also request referenced posts and their authors (possibly billed as extra reads under pay-per-use) |
+| `RequestEntities` | `true` | Sets `REQUEST_ENTITIES`: also request entities and the extra per-Tweet fields |
 | `MaxMediaBytes` | `536870912` | Largest media file stored, in bytes; bigger ones are recorded as `too_large` |
 | `MaxReceiveCount` | `5` | Receives before a message moves to the DLQ; also tells the process function which receive is the last, when it queues unstored media for retry instead of failing the record |
 | `MediaRetryMaxReceiveCount` | `10` | Receives of a media-retry message before it moves to the media-retry DLQ (at least 5,400 s apart) |
@@ -556,6 +585,7 @@ The script reads the table and bucket names from the stack outputs, runs `sam de
 - Tweet writes are conditional on `fetched_at` and `schema_version`, so an older delivery never replaces a newer item. Fetch runs less than a second apart can't be ordered, and there is no stale-write metric yet, only an INFO log line. A stale message still runs the media step first: usually one `HeadObject` per media item, which can leave an S3 object the stored item doesn't reference, and a transient media error on a stale message still fails it for retry. The fetch time must be a valid UTC-convertible ISO 8601 string no more than 5 minutes ahead; other messages are rejected as malformed.
 - Edited Tweets get a new ID and are stored as new items; the old ones remain. `edit_history_tweet_ids` links them.
 - Deletions are not propagated: a Tweet deleted at the source stays in the table.
+- Turning `EXPAND_REFERENCED_TWEETS` or `REQUEST_ENTITIES` off does not erase stored data, but a Tweet fetched again afterwards replaces its item with one without the original's text or entities (the latest fetch wins), so decide before backfilling.
 - Metrics (`public_metrics`) are a snapshot at fetch time and are not refreshed.
 - Videos that only have HLS variants (no `video/mp4`) are recorded with status `skipped_hls`: only the poster frame is stored, and the playlist URL stays in `variants`.
 - Media whose download returns a 4xx other than 429, or a redirect, is recorded as `unavailable`; the Tweet is still stored. Media at a non-https URL or a host other than the two X CDN hosts is recorded as `skipped`. 429 and 5xx responses and timeouts are retried.

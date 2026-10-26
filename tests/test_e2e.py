@@ -129,7 +129,7 @@ def test_full_pipeline_stores_tweets_and_media(pipeline: Aws, cdn: CdnStub) -> N
     assert video_item["public_metrics"]["like_count"] == 7
     quote = item(pipeline, QUOTE_TWEET)
     assert quote["referenced_tweets"] == [
-        {"type": "quoted", "id": "1600000000000000009"}
+        {"type": "quoted", "id": "1600000000000000009", "status": "unavailable"}
     ]
     # Its media key was missing from includes: recorded, not dropped.
     assert quote["media_count"] == 1

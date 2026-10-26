@@ -23,6 +23,7 @@ from twitter_timeline_data_pipeline.config import DEFAULT_X_API_BASE_URL
 from twitter_timeline_data_pipeline.models import (
     JSONObject,
     Media,
+    ReferencedPost,
     TimelinePage,
     Tweet,
 )
@@ -44,7 +45,22 @@ TWEET_FIELDS = (
     "public_metrics",
     "referenced_tweets",
 )
+# Requested with ``request_entities`` (the default): expanded URLs, mentions, hashtags
+# and the other per-Tweet metadata.
+ENTITY_FIELDS = (
+    "edit_controls",
+    "entities",
+    "in_reply_to_user_id",
+    "possibly_sensitive",
+    "withheld",
+)
 EXPANSIONS = ("attachments.media_keys",)
+# Requested with ``expand_referenced`` (the default): the posts a Tweet retweets,
+# quotes or replies to, and their authors. The media of those posts is not requested:
+# ``referenced_tweets.id.attachments.media_keys`` is not in the endpoint's current
+# list of expansions.
+REFERENCE_EXPANSIONS = ("referenced_tweets.id", "referenced_tweets.id.author_id")
+USER_FIELDS = ("name", "username")
 MEDIA_FIELDS = (
     "alt_text",
     "duration_ms",
@@ -102,6 +118,8 @@ class XClient:
         timeout: float = 10.0,
         max_retries: int = 3,
         max_rate_limit_wait: float = 60.0,
+        expand_referenced: bool = True,
+        request_entities: bool = True,
         http_client: httpx.Client | None = None,
         sleep: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.time,
@@ -111,6 +129,8 @@ class XClient:
         self._auth_header = {"Authorization": f"Bearer {bearer_token}"}
         self._max_retries = max_retries
         self._max_rate_limit_wait = max_rate_limit_wait
+        self._expand_referenced = expand_referenced
+        self._request_entities = request_entities
         self._sleep = sleep
         self._clock = clock
         self._owns_client = http_client is None
@@ -188,12 +208,20 @@ class XClient:
         max_results: int,
         max_pages: int,
     ) -> Iterator[TimelinePage]:
+        tweet_fields: tuple[str, ...] = TWEET_FIELDS
+        if self._request_entities:
+            tweet_fields = tuple(sorted({*tweet_fields, *ENTITY_FIELDS}))
+        expansions: tuple[str, ...] = EXPANSIONS
+        if self._expand_referenced:
+            expansions += REFERENCE_EXPANSIONS
         params: dict[str, str | int] = {
             "max_results": max_results,
-            "tweet.fields": ",".join(TWEET_FIELDS),
-            "expansions": ",".join(EXPANSIONS),
+            "tweet.fields": ",".join(tweet_fields),
+            "expansions": ",".join(expansions),
             "media.fields": ",".join(MEDIA_FIELDS),
         }
+        if self._expand_referenced:
+            params["user.fields"] = ",".join(USER_FIELDS)
         if since_id:
             params["since_id"] = since_id
         if until_id:
@@ -226,13 +254,22 @@ class XClient:
                 yield TimelinePage(tweets=(), media={}, next_token=next_token)
                 params["pagination_token"] = next_token
                 continue
-            media = (
-                Media.from_dict(m)
-                for m in (body.get("includes") or {}).get("media", ())
+            includes: Mapping[str, Any] = body.get("includes") or {}
+            media = (Media.from_dict(m) for m in includes.get("media", ()))
+            usernames = {
+                str(u["id"]): str(u["username"])
+                for u in includes.get("users", ())
+                if u.get("id") and u.get("username")
+            }
+            included = (
+                ReferencedPost.from_api(t, usernames)
+                for t in includes.get("tweets", ())
             )
             yield TimelinePage(
                 tweets=tuple(Tweet.from_api(t) for t in data),
                 media={m.media_key: m for m in media},
+                included={p.id: p for p in included},
+                expanded=self._expand_referenced,
                 newest_id=meta.get("newest_id"),
                 oldest_id=meta.get("oldest_id"),
                 next_token=next_token,

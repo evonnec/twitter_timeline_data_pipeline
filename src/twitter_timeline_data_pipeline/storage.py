@@ -593,8 +593,16 @@ class TweetStore:
         suffix = "" if field == "text" else f".{field}"
         return f"text/{owner}/{message.tweet.id}{suffix}.json"
 
-    def _offload(self, message: TweetMessage, item: dict[str, Any], field: str) -> None:
+    def _offload(
+        self,
+        message: TweetMessage,
+        item: dict[str, Any],
+        field: str,
+        key: str | None = None,
+    ) -> None:
         """Upload ``item[field]`` to S3 and leave a prefix and pointer in the item.
+        ``item`` is the dict holding the field (the item, or a referenced post's
+        entry) and ``key`` the S3 key (default: the Tweet's text key for ``field``).
 
         The object is the text as a JSON string (strict UTF-8; characters SQS and UTF-8
         reject are escaped the same way as in the message), so any text, a lone
@@ -602,7 +610,7 @@ class TweetStore:
         create-only: a redelivery, or a stale message for the same Tweet (same ID, same
         text), finds it already there and writes nothing.
         """
-        key = self.text_key(message, field)
+        key = key or self.text_key(message, field)
         text: str = item[field]
         body = escape_disallowed_chars(json.dumps(text, ensure_ascii=False))
         try:
@@ -641,7 +649,49 @@ class TweetStore:
             )
             if over or _LONE_SURROGATE.search(item[field]):
                 self._offload(message, item, field)
+        # Referenced posts' texts: kept inline unless the item is still too big (a
+        # long original quoted by a long post) or the text can't be stored inline.
+        owner = message.tweet.author_id or message.username.lower()
+        refs = [
+            (ref, f)
+            for ref in item.get("referenced_tweets", ())
+            for f in ("text", "display_text")
+            if f in ref
+        ]
+        for ref, name in sorted(refs, key=lambda r: len(r[0][r[1]]), reverse=True):
+            over = (
+                estimate_item_size(item) > ITEM_LIMIT_BYTES
+                and len(ref[name]) > TEXT_PREVIEW_CHARS
+            )
+            if over or _LONE_SURROGATE.search(ref[name]):
+                suffix = "" if name == "text" else f".{name}"
+                key = f"text/{owner}/{message.tweet.id}.ref.{ref['id']}{suffix}.json"
+                self._offload(message, ref, name, key)
         return item
+
+    @staticmethod
+    def referenced_entries(message: TweetMessage) -> list[dict[str, Any]]:
+        """``referenced_tweets`` for the item: the Tweet's ``{type, id}`` pairs with the
+        copies the message carries merged in (original text and author). A copy the
+        Tweet doesn't list is appended, so nothing in the message is dropped."""
+        copies = {(r.type, r.id): r for r in message.referenced}
+        pairs = [(r.type, r.id) for r in message.tweet.referenced_tweets]
+        pairs += [k for k in copies if k not in pairs]
+        entries = []
+        for type_, id_ in pairs:
+            entry: dict[str, Any] = {"type": type_, "id": id_}
+            if (copy := copies.get((type_, id_))) is not None:
+                entry |= {
+                    "text": copy.full_text,
+                    "display_text": copy.text if copy.note_text else None,
+                    "is_long_post": True if copy.note_text else None,
+                    "author_id": copy.author_id,
+                    "author_username": copy.author_username,
+                    "created_at": copy.created_at,
+                    "status": copy.status,
+                }
+            entries.append({k: v for k, v in entry.items() if v is not None})
+        return entries
 
     @staticmethod
     def to_item(message: TweetMessage, media: Sequence[StoredMedia]) -> dict[str, Any]:
@@ -677,9 +727,15 @@ class TweetStore:
             "created_at": tweet.created_at,
             "conversation_id": tweet.conversation_id,
             "lang": tweet.lang,
-            "referenced_tweets": [
-                {"type": r.type, "id": r.id} for r in tweet.referenced_tweets
-            ],
+            "entities": dict(tweet.entities) if tweet.entities else None,
+            "display_entities": (
+                dict(tweet.display_entities) if tweet.display_entities else None
+            ),
+            "in_reply_to_user_id": tweet.in_reply_to_user_id,
+            "possibly_sensitive": tweet.possibly_sensitive,
+            "edit_controls": dict(tweet.edit_controls) if tweet.edit_controls else None,
+            "withheld": dict(tweet.withheld) if tweet.withheld else None,
+            "referenced_tweets": TweetStore.referenced_entries(message),
             "public_metrics": dict(tweet.public_metrics),
             "edit_history_tweet_ids": list(tweet.edit_history_tweet_ids),
             "media_keys": keys,

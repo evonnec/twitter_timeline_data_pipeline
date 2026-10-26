@@ -523,7 +523,9 @@ def test_timeline_page_messages_warn_on_missing_media_key(
     assert quoted.tweet.media_keys == ("3_1700000000000000199",)
     assert quoted.media == ()
     assert quoted.missing_media_keys == ("3_1700000000000000199",)
-    assert [r.getMessage() for r in caplog.records] == [
+    assert [
+        r.getMessage() for r in caplog.records if "media key" in r.getMessage()
+    ] == [
         "media key 3_1700000000000000199 of tweet 1700000000000000001 "
         "missing from includes"
     ]
@@ -653,6 +655,8 @@ def test_golden_v1_message_without_note_text_parses() -> None:
     assert parsed.schema_version == 1
     assert parsed.tweet.note_text is None
     assert parsed.tweet.full_text == "old format"
+    assert parsed.referenced == ()
+    assert parsed.tweet.entities is None and parsed.tweet.withheld is None
 
 
 def test_unknown_keys_are_ignored_at_message_and_tweet_level() -> None:

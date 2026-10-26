@@ -202,6 +202,17 @@ def test_max_media_bytes_parameter_feeds_the_process_function(
     assert "MAX_MEDIA_BYTES" not in env_of(template, "FetchFunction")
 
 
+def test_expansion_parameters_feed_the_fetch_function_only(template: Template) -> None:
+    for parameter, variable in (
+        ("ExpandReferencedTweets", "EXPAND_REFERENCED_TWEETS"),
+        ("RequestEntities", "REQUEST_ENTITIES"),
+    ):
+        assert template["Parameters"][parameter]["Default"] == "true"
+        assert template["Parameters"][parameter]["AllowedValues"] == ["true", "false"]
+        assert env_of(template, "FetchFunction")[variable] == {"Ref": parameter}
+        assert variable not in env_of(template, "ProcessFunction")
+
+
 def test_dead_letter_queue_keeps_messages_longer_than_the_source(
     template: Template,
 ) -> None:

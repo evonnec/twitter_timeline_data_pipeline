@@ -581,6 +581,8 @@ def handler(event: Any, context: Any) -> dict[str, Any]:
             base_url=settings.x_api_base_url,
             timeout=settings.http_timeout,
             max_rate_limit_wait=max_rate_limit_wait,
+            expand_referenced=settings.expand_referenced_tweets,
+            request_entities=settings.request_entities,
         ) as x_client:
             result = run_fetch(
                 username=username,
