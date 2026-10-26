@@ -1,0 +1,13 @@
+{
+  "errors": [
+    {
+      "value": "no_such_user",
+      "detail": "Could not find user with username: [no_such_user].",
+      "title": "Not Found Error",
+      "resource_type": "user",
+      "parameter": "username",
+      "resource_id": "no_such_user",
+      "type": "https://api.twitter.com/2/problems/resource-not-found"
+    }
+  ]
+}

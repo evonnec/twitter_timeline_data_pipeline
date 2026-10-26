@@ -1,0 +1,20 @@
+{
+  "Records": [
+    {
+      "messageId": "00000000-0000-0000-0000-000000000001",
+      "receiptHandle": "EXAMPLE-RECEIPT-HANDLE",
+      "body": "{\"username\":\"NASA\",\"tweet\":{\"id\":\"1000000000000000001\",\"text\":\"Example Tweet with a photo https://example.com/t/abc\",\"created_at\":\"2024-01-01T12:00:00.000Z\",\"author_id\":\"1000000000000000000\",\"conversation_id\":\"1000000000000000001\",\"lang\":\"en\",\"referenced_tweets\":[],\"public_metrics\":{\"retweet_count\":1,\"reply_count\":0,\"like_count\":3,\"quote_count\":0},\"edit_history_tweet_ids\":[\"1000000000000000001\"],\"media_keys\":[\"3_1000000000000000002\"]},\"media\":[{\"media_key\":\"3_1000000000000000002\",\"type\":\"photo\",\"url\":\"https://pbs.twimg.com/media/ExamplePhoto1.jpg\",\"preview_image_url\":null,\"variants\":[],\"width\":1200,\"height\":800,\"duration_ms\":null,\"alt_text\":null}],\"fetched_at\":\"2024-01-01T12:05:00Z\",\"schema_version\":1}",
+      "attributes": {
+        "ApproximateReceiveCount": "1",
+        "SentTimestamp": "1704110700000",
+        "SenderId": "AIDAEXAMPLEEXAMPLE",
+        "ApproximateFirstReceiveTimestamp": "1704110700010"
+      },
+      "messageAttributes": {},
+      "md5OfBody": "00000000000000000000000000000000",
+      "eventSource": "aws:sqs",
+      "eventSourceARN": "arn:aws:sqs:us-east-1:123456789012:tweets-queue",
+      "awsRegion": "us-east-1"
+    }
+  ]
+}

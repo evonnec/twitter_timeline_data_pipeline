@@ -1,25 +1,77 @@
-# configuration for linters and project
 [project]
-name = "serverless-app-twitter"
-dependencies = [
-    "boto3",
-    "chalice",
-    # "chalice[cdkv2]",
-    "pytest",
-    "requests",
-    "python-twitter-v2",
-    "awscli",
-    "httpie",
-    "pyproject-toml",
-    "mypy",
-    "black",
-    "ruff",
-    "types-boto3",
-    "types-requests"
+name = "twitter_timeline_data_pipeline"
+version = "0.1.0"
+description = "Serverless pipeline that pulls an X (Twitter) user's timeline into SQS, then stores Tweet metadata in DynamoDB and attached media in S3."
+readme = "README.md"
+license = "GPL-3.0-only"
+license-files = ["LICENSE"]
+authors = [{ name = "EvonneC" }]
+requires-python = ">=3.14"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
+    "Topic :: Internet",
+    "Typing :: Typed",
 ]
-version = "0.1"
+dependencies = [
+    "boto3>=1.43.118",
+    "httpx>=0.28.1",
+]
+
+[project.scripts]
+twitter-pipeline = "twitter_timeline_data_pipeline.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.13.5,<0.14.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "boto3-stubs[dynamodb,s3,secretsmanager,sqs]>=1.43.118",
+    "cfn-lint>=1.58.0",
+    "moto[dynamodb,s3,secretsmanager,sqs]>=5.2.4",
+    "mypy>=2.4.0",
+    "pytest>=9.1.1",
+    "pytest-cov>=7.1.0",
+    "ruff>=0.17.2",
+]
+
+[tool.ruff]
+target-version = "py314"
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "B",   # flake8-bugbear
+    "C4",  # flake8-comprehensions
+    "UP",  # pyupgrade
+    "SIM", # flake8-simplify
+    "PTH", # flake8-use-pathlib
+    "RUF", # ruff-specific rules
+]
+
+[tool.ruff.format]
+docstring-code-format = true
 
 [tool.mypy]
-[[tool.mypy.overrides]]
-module = ["python-twitter-v2", "pytwitter.Api"]
-ignore_missing_imports = true
+python_version = "3.14"
+strict = true
+# Only src/ is type-checked (it is also the import root for the package).
+mypy_path = "src"
+files = ["src", "tests"]
+
+[tool.pytest.ini_options]
+minversion = "9.0"
+testpaths = ["tests"]
+pythonpath = ["src", "tests"]
+addopts = ["--import-mode=importlib", "-ra"]
+strict = true

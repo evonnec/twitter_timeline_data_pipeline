@@ -1,0 +1,22 @@
+{
+  "data": [
+    {
+      "id": "1700000000000000010",
+      "text": "Post that survived",
+      "created_at": "2026-10-21T08:00:00.000Z",
+      "author_id": "2244994945",
+      "edit_history_tweet_ids": ["1700000000000000010"]
+    }
+  ],
+  "errors": [
+    {
+      "detail": "Sorry, you are not authorized to see the Tweet with id: [1700000000000000011].",
+      "title": "Authorization Error",
+      "resource_type": "tweet",
+      "parameter": "id",
+      "resource_id": "1700000000000000011",
+      "type": "https://api.twitter.com/2/problems/not-authorized-for-resource"
+    }
+  ],
+  "meta": {"newest_id": "1700000000000000010", "oldest_id": "1700000000000000010", "result_count": 1}
+}
