@@ -9,7 +9,6 @@ price is duplicates (at most the page in flight), which processing absorbs.
 
 import dataclasses
 import functools
-import itertools
 import logging
 import time
 from collections.abc import Callable, Iterable, Iterator, Sequence
@@ -23,6 +22,7 @@ from twitter_timeline_data_pipeline.credentials import clear_cache, get_bearer_t
 from twitter_timeline_data_pipeline.models import (
     TimelinePage,
     TweetId,
+    TweetMessage,
     normalize_username,
 )
 from twitter_timeline_data_pipeline.storage import (
@@ -42,10 +42,21 @@ logger = logging.getLogger(__name__)
 SQS_BATCH_SIZE = 10  # SendMessageBatch limit
 SEND_RETRIES = 2  # extra attempts for entries SQS reports as Failed
 RETRY_BACKOFF_SECONDS = 0.5
+# SQS's maximum for one message and for the total of one SendMessageBatch call (1 MiB).
+# The queues' MaximumMessageSize in template.yaml must equal it. The DynamoDB item
+# holds the same text as UTF-8, so a body under this limit stays under its 400 KB item
+# limit (checked in the tests); re-check that if the limit or the item layout changes.
+SQS_MAX_MESSAGE_BYTES = 1_048_576
 
 
 class EnqueueError(RuntimeError):
     """Some messages could not be sent to SQS even after retries."""
+
+
+class MessageTooLargeError(EnqueueError):
+    """A Tweet's message body is over the SQS limit. Nothing is dropped: the page is
+    left unfetched in the cursor and the run fails (alarm fires), so the data can be
+    handled deliberately."""
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -91,6 +102,40 @@ def _send_batch(
             )
             sleep(RETRY_BACKOFF_SECONDS * (attempt + 1))
     raise EnqueueError(f"{len(pending)} messages still failing after retries")
+
+
+def _encode(messages: Sequence[TweetMessage]) -> list[str]:
+    """The JSON bodies, or ``MessageTooLargeError`` if any exceeds the SQS limit."""
+    bodies = []
+    for message in messages:
+        body = message.to_json()
+        size = len(body.encode())
+        if size > SQS_MAX_MESSAGE_BYTES:
+            raise MessageTooLargeError(
+                f"tweet {message.tweet.id}: message body is {size} bytes, over the "
+                f"{SQS_MAX_MESSAGE_BYTES} byte SQS limit"
+            )
+        bodies.append(body)
+    return bodies
+
+
+def _chunk_bodies(bodies: Sequence[str]) -> Iterator[list[str]]:
+    """Group bodies into SendMessageBatch calls: at most ``SQS_BATCH_SIZE`` entries and
+    ``SQS_MAX_MESSAGE_BYTES`` in total (SQS limits the whole call, not just each
+    message). A body under the per-message limit always fits alone."""
+    chunk: list[str] = []
+    total = 0
+    for body in bodies:
+        size = len(body.encode())
+        if chunk and (
+            len(chunk) == SQS_BATCH_SIZE or total + size > SQS_MAX_MESSAGE_BYTES
+        ):
+            yield chunk
+            chunk, total = [], 0
+        chunk.append(body)
+        total += size
+    if chunk:
+        yield chunk
 
 
 class _StateConflict(Exception):
@@ -161,10 +206,10 @@ class _Run:
         """Send the page's messages; returns its Tweet IDs."""
         messages = page.messages(self.username)
         self.tweets += len(messages)
-        for chunk in itertools.batched(messages, SQS_BATCH_SIZE, strict=False):
-            _send_batch(
-                self.sqs, self.queue_url, [m.to_json() for m in chunk], self.sleep
-            )
+        # Every body is encoded (and size-checked) before anything is sent, so an
+        # over-limit Tweet fails the page with nothing enqueued and the cursor unmoved.
+        for chunk in _chunk_bodies(_encode(messages)):
+            _send_batch(self.sqs, self.queue_url, chunk, self.sleep)
             self.enqueued += len(chunk)
         return [int(t.id) for t in page.tweets]
 

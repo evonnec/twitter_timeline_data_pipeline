@@ -161,7 +161,32 @@ def test_queue_redrives_to_the_dead_letter_queue(template: Template) -> None:
     assert policy["deadLetterTargetArn"] == {
         "Fn::GetAtt": ["TweetsDeadLetterQueue", "Arn"]
     }
-    assert policy["maxReceiveCount"] >= 1
+    assert policy["maxReceiveCount"] == {"Ref": "MaxReceiveCount"}
+
+
+def test_max_receive_count_parameter_feeds_the_queue_and_the_process_function(
+    template: Template,
+) -> None:
+    parameter = template["Parameters"]["MaxReceiveCount"]
+
+    assert parameter["Default"] == 5
+    assert parameter["MinValue"] >= 1
+    assert env_of(template, "ProcessFunction")["MAX_RECEIVE_COUNT"] == {
+        "Ref": "MaxReceiveCount"
+    }
+
+
+def test_max_media_bytes_parameter_feeds_the_process_function(
+    template: Template,
+) -> None:
+    parameter = template["Parameters"]["MaxMediaBytes"]
+
+    assert parameter["Default"] == 512 * 1024 * 1024
+    assert parameter["MinValue"] >= 1
+    assert env_of(template, "ProcessFunction")["MAX_MEDIA_BYTES"] == {
+        "Ref": "MaxMediaBytes"
+    }
+    assert "MAX_MEDIA_BYTES" not in env_of(template, "FetchFunction")
 
 
 def test_dead_letter_queue_keeps_messages_longer_than_the_source(
@@ -349,3 +374,12 @@ def test_process_function_can_abort_multipart_uploads(template: Template) -> Non
     actions = {a for s in statements for a in _as_list(s["Action"])}
 
     assert "s3:AbortMultipartUpload" in actions
+
+
+@pytest.mark.parametrize("name", ["TweetsQueue", "TweetsDeadLetterQueue"])
+def test_queues_accept_messages_up_to_the_size_the_fetch_guard_allows(
+    template: Template, name: str
+) -> None:
+    from twitter_timeline_data_pipeline.handlers.fetch import SQS_MAX_MESSAGE_BYTES
+
+    assert properties(template, name)["MaximumMessageSize"] == SQS_MAX_MESSAGE_BYTES

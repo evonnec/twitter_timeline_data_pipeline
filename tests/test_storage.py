@@ -1,25 +1,32 @@
 import io
+from collections.abc import Iterator
 from typing import Any, cast
 from urllib.parse import urlsplit
 
+import boto3
 import httpx
 import pytest
 from botocore.exceptions import ClientError
 from conftest import STATE_TABLE, Aws
 from helpers import (
     GIF_URL,
+    LONG_POST_ID,
     PHOTO_URL,
     USER_ID,
     VIDEO_HI_URL,
     CdnStub,
     as_items,
     ddb_get,
+    long_post_api_object,
     make_message,
     photo,
 )
+from hypothesis import given, settings
+from hypothesis import strategies as st
+from moto import mock_aws
 from mypy_boto3_s3 import S3Client
 
-from twitter_timeline_data_pipeline.models import Media, TweetMessage
+from twitter_timeline_data_pipeline.models import Media, Tweet, TweetMessage
 from twitter_timeline_data_pipeline.storage import (
     ALLOWED_MEDIA_HOSTS,
     MAX_GAPS,
@@ -27,11 +34,13 @@ from twitter_timeline_data_pipeline.storage import (
     CheckpointStore,
     Gap,
     MediaStore,
+    PutResult,
     StoredMedia,
     TransientMediaError,
     TweetStore,
     _extension,
     _IterReader,
+    _MediaTooLarge,
     _original_size_url,
     merge_gaps,
 )
@@ -462,6 +471,7 @@ def test_to_item_contains_every_field() -> None:
         "username": "example_user",
         "author_id": USER_ID,
         "text": f"tweet {TWEET_ID}",
+        "is_long_post": False,
         "created_at": "2026-10-20T12:00:00.000Z",
         "conversation_id": "1700000000000000001",
         "lang": "en",
@@ -483,6 +493,27 @@ def test_to_item_contains_every_field() -> None:
         "fetched_at": "2026-10-25T00:00:00Z",
         "schema_version": 1,
     }
+
+
+def test_to_item_stores_the_full_text_of_a_long_post() -> None:
+    post = long_post_api_object()
+    message = TweetMessage(
+        username="example_user", tweet=Tweet.from_api(post), fetched_at="x"
+    )
+
+    item = TweetStore.to_item(message, [])
+
+    assert item["tweet_id"] == LONG_POST_ID
+    assert item["text"] == post["note_tweet"]["text"]
+    assert item["display_text"] == post["text"]
+    assert item["is_long_post"] is True
+
+
+def test_to_item_flags_a_short_post_as_not_long_and_has_no_display_text() -> None:
+    item = TweetStore.to_item(make_message(), [])
+
+    assert item["is_long_post"] is False
+    assert "display_text" not in item
 
 
 def test_to_item_drops_none_values_at_every_level() -> None:
@@ -537,14 +568,152 @@ def test_put_tweet_is_queryable_via_username_index(aws: Aws) -> None:
     ]
 
 
-def test_put_tweet_twice_replaces_the_item(aws: Aws) -> None:
-    store = TweetStore(aws.tweets_table)
-    store.put_tweet(make_message(tweet={"public_metrics": {"like_count": 1}}), [])
-    store.put_tweet(make_message(tweet={"public_metrics": {"like_count": 9}}), [])
+OLDER = "2026-10-20T12:00:00Z"
+NEWER = "2026-10-25T12:00:00Z"
 
+
+def likes(count: int, fetched_at: str, **kwargs: Any) -> TweetMessage:
+    return make_message(
+        tweet={"public_metrics": {"like_count": count}},
+        fetched_at=fetched_at,
+        **kwargs,
+    )
+
+
+def stored_item(aws: Aws) -> dict[str, Any]:
     assert aws.tweets_table.scan()["Count"] == 1
-    item = ddb_get(aws.tweets_table, tweet_id=TWEET_ID)
-    assert item["public_metrics"] == {"like_count": 9}
+    return ddb_get(aws.tweets_table, tweet_id=TWEET_ID)
+
+
+def test_put_tweet_newer_then_older_skips_the_older(aws: Aws) -> None:
+    store = TweetStore(aws.tweets_table)
+
+    assert store.put_tweet(likes(5000, NEWER), []).written is True
+    assert store.put_tweet(likes(10, OLDER), []).written is False
+
+    item = stored_item(aws)
+    assert item["public_metrics"] == {"like_count": 5000}
+    assert item["fetched_at"] == NEWER
+
+
+def test_put_tweet_older_then_newer_replaces_the_item(aws: Aws) -> None:
+    store = TweetStore(aws.tweets_table)
+
+    assert store.put_tweet(likes(10, OLDER), []).written is True
+    assert store.put_tweet(likes(5000, NEWER), []).written is True
+
+    item = stored_item(aws)
+    assert item["public_metrics"] == {"like_count": 5000}
+    assert item["fetched_at"] == NEWER
+
+
+def test_put_tweet_with_equal_fetched_at_rewrites_idempotently(aws: Aws) -> None:
+    store = TweetStore(aws.tweets_table)
+
+    assert store.put_tweet(likes(7, NEWER), []).written is True
+    assert store.put_tweet(likes(7, NEWER), []).written is True
+    assert (
+        store.put_tweet(likes(8, NEWER), []).written is True
+    )  # the tie rule: last one wins
+
+    assert stored_item(aws)["public_metrics"] == {"like_count": 8}
+
+
+def test_put_tweet_older_schema_version_cannot_overwrite_a_newer_one(
+    aws: Aws,
+) -> None:
+    store = TweetStore(aws.tweets_table)
+
+    assert store.put_tweet(likes(1, OLDER, schema_version=2), []).written is True
+    # fetched later, but in the old format
+    assert store.put_tweet(likes(2, NEWER, schema_version=1), []).written is False
+
+    item = stored_item(aws)
+    assert item["schema_version"] == 2
+    assert item["public_metrics"] == {"like_count": 1}
+
+
+def test_put_tweet_newer_schema_version_can_overwrite_an_older_one(aws: Aws) -> None:
+    store = TweetStore(aws.tweets_table)
+
+    assert store.put_tweet(likes(1, OLDER, schema_version=1), []).written is True
+    assert store.put_tweet(likes(2, NEWER, schema_version=2), []).written is True
+
+    assert stored_item(aws)["schema_version"] == 2
+
+
+def test_put_tweet_overwrites_a_legacy_item_without_schema_version(aws: Aws) -> None:
+    aws.tweets_table.put_item(
+        Item={"tweet_id": TWEET_ID, "username": "u", "fetched_at": OLDER}
+    )
+
+    assert TweetStore(aws.tweets_table).put_tweet(likes(3, NEWER), []).written
+
+    item = stored_item(aws)
+    assert item["schema_version"] == 1
+    assert item["public_metrics"] == {"like_count": 3}
+
+
+def test_put_tweet_overwrites_an_item_without_fetched_at(aws: Aws) -> None:
+    aws.tweets_table.put_item(Item={"tweet_id": TWEET_ID, "username": "u"})
+
+    assert TweetStore(aws.tweets_table).put_tweet(likes(3, NEWER), []).written
+
+    assert stored_item(aws)["fetched_at"] == NEWER
+
+
+def test_put_tweet_stale_result_reports_the_stored_values(aws: Aws) -> None:
+    store = TweetStore(aws.tweets_table)
+    store.put_tweet(likes(1, NEWER, schema_version=2), [])
+
+    result = store.put_tweet(likes(2, OLDER), [])
+
+    assert result == PutResult(
+        written=False, stored_fetched_at=NEWER, stored_schema_version=2
+    )
+
+
+def test_put_tweet_reraises_other_dynamodb_errors(aws: Aws) -> None:
+    class Failing:
+        def put_item(self, **_: Any) -> None:
+            raise ClientError(
+                {"Error": {"Code": "ProvisionedThroughputExceededException"}},
+                "PutItem",
+            )
+
+    store = TweetStore(cast(Any, Failing()))
+
+    with pytest.raises(ClientError, match="ProvisionedThroughputExceeded"):
+        store.put_tweet(likes(1, NEWER), [])
+
+
+@settings(max_examples=25, deadline=None)
+@given(
+    fetched=st.lists(
+        st.sampled_from([f"2026-10-{day:02d}T00:00:00Z" for day in range(1, 6)]),
+        min_size=1,
+        max_size=8,
+    )
+)
+def test_any_delivery_order_ends_with_the_greatest_fetched_at(
+    fetched: list[str],
+) -> None:
+    with mock_aws():
+        table = boto3.resource("dynamodb", region_name="us-east-1").create_table(
+            TableName="tweets-prop",
+            BillingMode="PAY_PER_REQUEST",
+            KeySchema=[{"AttributeName": "tweet_id", "KeyType": "HASH"}],
+            AttributeDefinitions=[{"AttributeName": "tweet_id", "AttributeType": "S"}],
+        )
+        store = TweetStore(table)
+        # like_count is the delivery's own fetched_at day, so the winner is visible
+        for stamp in fetched:
+            day = int(stamp[8:10])
+            store.put_tweet(likes(day, stamp), [])
+
+        item = ddb_get(table, tweet_id=TWEET_ID)
+        assert item["fetched_at"] == max(fetched)
+        assert item["public_metrics"] == {"like_count": int(max(fetched)[8:10])}
 
 
 # ---- CheckpointStore ---------------------------------------------------------
@@ -727,3 +896,273 @@ def test_a_hundred_and_fifty_gaps_are_capped_without_losing_coverage() -> None:
     assert all(
         any(m.first <= g.first and g.last <= m.last for m in merged) for g in gaps
     )
+
+
+# ---- size cap and time budget ------------------------------------------------
+
+
+class FakeClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def leftover_uploads(aws: Aws) -> list[Any]:
+    uploads = aws.s3.list_multipart_uploads(Bucket=aws.bucket).get("Uploads", [])
+    return list(uploads)
+
+
+def keys_in_bucket(aws: Aws) -> list[str]:
+    contents = aws.s3.list_objects_v2(Bucket=aws.bucket).get("Contents", [])
+    return [o["Key"] for o in contents if "Key" in o]
+
+
+def streaming_cdn(url: str, chunks: Iterator[bytes], **headers: str) -> CdnStub:
+    cdn = CdnStub()
+    cdn.responses[url] = lambda: httpx.Response(
+        200, content=chunks, headers={"Content-Type": "video/mp4", **headers}
+    )
+    return cdn
+
+
+def sized_video(bit_rate: int | None, duration_ms: int | None) -> Media:
+    return Media.from_dict(
+        {
+            "media_key": "7_1",
+            "type": "video",
+            "duration_ms": duration_ms,
+            "variants": [
+                {
+                    "content_type": "video/mp4",
+                    "bit_rate": bit_rate,
+                    "url": VIDEO_HI_URL,
+                },
+                {"content_type": "video/mp4", "bit_rate": 0, "url": GIF_URL},
+            ],
+        }
+    )
+
+
+def test_iter_reader_raises_once_the_next_chunk_passes_the_cap() -> None:
+    reader = _IterReader(iter([b"abcd", b"efgh", b"ijkl"]), max_bytes=10)
+    buffered = io.BufferedReader(reader, buffer_size=4)
+
+    with pytest.raises(_MediaTooLarge) as info:
+        buffered.read()
+
+    assert info.value.size == 12
+
+
+def test_iter_reader_allows_exactly_the_cap() -> None:
+    reader = _IterReader(iter([b"abcd", b"efgh", b"ij"]), max_bytes=10)
+
+    assert io.BufferedReader(reader, buffer_size=4).read() == b"abcdefghij"
+
+
+def test_iter_reader_raises_transient_error_at_the_deadline() -> None:
+    clock = FakeClock()
+
+    def chunks() -> Iterator[bytes]:
+        for _ in range(5):
+            clock.now += 3
+            yield b"x" * 10
+
+    reader = _IterReader(chunks(), deadline=7, clock=clock)
+
+    with pytest.raises(TransientMediaError, match="time budget"):
+        io.BufferedReader(reader, buffer_size=10).read()
+
+    assert reader.size == 30  # the chunk that crossed the deadline was handed out
+
+
+def test_store_aborts_a_small_stream_past_the_cap(aws: Aws) -> None:
+    chunks = iter([b"x" * 512] * 100)
+    cdn = streaming_cdn(VIDEO_HI_URL, chunks)
+    item = video()
+    store = MediaStore(aws.s3, aws.bucket, cdn.client(), max_bytes=1000)
+
+    stored = store.store(make_message(media=(item,)), item)
+
+    assert stored.status == "too_large"
+    assert stored.size_bytes == 1024  # the second chunk passed the cap
+    assert stored.s3_key is None
+    assert keys_in_bucket(aws) == []
+    assert leftover_uploads(aws) == []
+    assert len(list(chunks)) == 98  # the rest of the body was never read
+
+
+def test_store_aborts_a_multipart_upload_past_the_cap(aws: Aws) -> None:
+    chunk = b"\x00" * 65536
+    cdn = streaming_cdn(VIDEO_HI_URL, iter([chunk] * 192))  # 12 MiB, past 9 MiB
+    item = video()
+    store = MediaStore(aws.s3, aws.bucket, cdn.client(), max_bytes=9 * 1024 * 1024)
+
+    stored = store.store(make_message(media=(item,)), item)
+
+    assert stored.status == "too_large"
+    assert stored.size_bytes == 9 * 1024 * 1024 + 65536
+    assert keys_in_bucket(aws) == []
+    assert leftover_uploads(aws) == []
+
+
+def test_store_skips_on_the_bit_rate_estimate_without_a_request(aws: Aws) -> None:
+    cdn = CdnStub()
+    item = sized_video(bit_rate=8_000_000, duration_ms=10_000)  # 10 MB
+    store = MediaStore(aws.s3, aws.bucket, cdn.client(), max_bytes=1_000_000)
+
+    stored = store.store(make_message(media=(item,)), item)
+
+    assert stored.status == "too_large"
+    assert stored.size_bytes == 10_000_000
+    assert stored.source_url == VIDEO_HI_URL
+    assert cdn.requests == []
+    assert keys_in_bucket(aws) == []
+
+
+@pytest.mark.parametrize(
+    ("bit_rate", "duration_ms"),
+    [(None, 10_000), (8_000_000, None), (0, 10_000), (800_000, 10_000)],
+)
+def test_store_downloads_when_there_is_no_usable_estimate_or_it_fits(
+    aws: Aws, bit_rate: int | None, duration_ms: int | None
+) -> None:
+    cdn = CdnStub()
+    cdn.serve(VIDEO_HI_URL, b"mp4", "video/mp4")
+    item = sized_video(bit_rate, duration_ms)
+    store = MediaStore(aws.s3, aws.bucket, cdn.client(), max_bytes=1_000_000)
+
+    assert store.store(make_message(media=(item,)), item).status == "stored"
+
+
+def test_store_estimate_ignores_other_variants_and_photos(aws: Aws) -> None:
+    cdn = CdnStub()
+    cdn.serve(PHOTO_URL, b"jpg", "image/jpeg")
+    store = MediaStore(aws.s3, aws.bucket, cdn.client(), max_bytes=10)
+    photo_item = Media.from_dict(
+        {"media_key": "3_1", "type": "photo", "url": PHOTO_URL, "duration_ms": 10**9}
+    )
+
+    stored = store.store(make_message(media=(photo_item,)), photo_item)
+
+    assert stored.status == "stored"
+
+
+def test_store_skips_on_content_length_without_reading_the_body(aws: Aws) -> None:
+    def never_read() -> Iterator[bytes]:
+        raise AssertionError("the body must not be downloaded")
+        yield b""
+
+    cdn = streaming_cdn(VIDEO_HI_URL, never_read(), **{"Content-Length": "2000"})
+    item = video()
+    store = MediaStore(aws.s3, aws.bucket, cdn.client(), max_bytes=1000)
+
+    stored = store.store(make_message(media=(item,)), item)
+
+    assert stored.status == "too_large"
+    assert stored.size_bytes == 2000
+    assert keys_in_bucket(aws) == []
+    assert leftover_uploads(aws) == []
+
+
+def test_store_accepts_a_body_exactly_at_the_cap(aws: Aws) -> None:
+    cdn = CdnStub()
+    cdn.serve(PHOTO_URL, b"x" * 100, "image/jpeg")
+    store = MediaStore(aws.s3, aws.bucket, cdn.client(), max_bytes=100)
+
+    stored = store.store(make_message(media=(PHOTO,)), PHOTO)
+
+    assert (stored.status, stored.size_bytes) == ("stored", 100)
+
+
+def test_store_slow_download_hits_its_deadline_and_aborts_the_multipart_upload(
+    aws: Aws,
+) -> None:
+    clock = FakeClock()
+    calls: list[str] = []
+    for op in ("CreateMultipartUpload", "AbortMultipartUpload"):
+        aws.s3.meta.events.register(
+            f"before-call.s3.{op}", lambda *, op=op, **_kw: calls.append(op)
+        )
+
+    def slow() -> Iterator[bytes]:
+        for _ in range(200):
+            clock.now += 1
+            yield b"\x00" * 1024 * 1024
+
+    cdn = streaming_cdn(VIDEO_HI_URL, slow())
+    item = video()
+    store = MediaStore(aws.s3, aws.bucket, cdn.client(), clock=clock)
+
+    with pytest.raises(TransientMediaError, match="time budget"):
+        store.store(make_message(media=(item,)), item, budget_s=12)
+
+    assert calls.count("CreateMultipartUpload") == 1  # past the 8 MiB threshold
+    assert calls.count("AbortMultipartUpload") == 1
+    assert keys_in_bucket(aws) == []
+    assert leftover_uploads(aws) == []
+    assert clock.now == 12  # stopped as soon as the deadline was reached
+
+
+def test_store_gives_the_http_phases_a_share_of_the_time_left(aws: Aws) -> None:
+    clock = FakeClock()
+    seen: list[dict[str, Any]] = []
+
+    def stall(request: httpx.Request) -> httpx.Response:
+        seen.append(request.extensions["timeout"])
+        clock.now += 100  # a header phase that hangs until its timeout
+        raise httpx.ReadTimeout("stalled", request=request)
+
+    http = httpx.Client(transport=httpx.MockTransport(stall), timeout=10.0)
+    store = MediaStore(aws.s3, aws.bucket, http, clock=clock)
+
+    with pytest.raises(TransientMediaError, match="ReadTimeout"):
+        store.store(make_message(media=(PHOTO,)), PHOTO, budget_s=24)
+
+    assert seen == [{"connect": 8.0, "read": 8.0, "write": 8.0, "pool": 8.0}]
+
+
+def test_store_keeps_the_client_timeout_when_there_is_plenty_of_time(
+    aws: Aws,
+) -> None:
+    seen: list[dict[str, Any]] = []
+
+    def serve(request: httpx.Request) -> httpx.Response:
+        seen.append(request.extensions["timeout"])
+        return httpx.Response(200, content=b"x")
+
+    http = httpx.Client(transport=httpx.MockTransport(serve), timeout=10.0)
+    MediaStore(aws.s3, aws.bucket, http).store(
+        make_message(media=(PHOTO,)), PHOTO, budget_s=300
+    )
+    MediaStore(aws.s3, aws.bucket, http).store(
+        make_message("1700000000000000006", media=(PHOTO,)), PHOTO
+    )
+
+    assert seen[0]["read"] == 10.0
+    assert seen[1]["read"] == 10.0
+
+
+def test_store_without_a_read_timeout_uses_a_third_of_the_time_left(aws: Aws) -> None:
+    seen: list[dict[str, Any]] = []
+
+    def serve(request: httpx.Request) -> httpx.Response:
+        seen.append(request.extensions["timeout"])
+        return httpx.Response(200, content=b"x")
+
+    http = httpx.Client(transport=httpx.MockTransport(serve), timeout=None)
+    MediaStore(aws.s3, aws.bucket, http, clock=FakeClock()).store(
+        make_message(media=(PHOTO,)), PHOTO, budget_s=30
+    )
+
+    assert seen[0]["read"] == 10.0
+
+
+def test_store_with_no_time_left_makes_no_request(aws: Aws) -> None:
+    cdn = CdnStub()
+
+    with pytest.raises(TransientMediaError, match="no time left"):
+        media_store(aws, cdn).store(make_message(media=(PHOTO,)), PHOTO, budget_s=0)
+
+    assert cdn.requests == []

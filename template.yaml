@@ -30,6 +30,19 @@ Parameters:
     MinValue: 5
     MaxValue: 100
     Description: Tweets per API page.
+  MaxMediaBytes:
+    Type: Number
+    Default: 536870912  # 512 MiB
+    MinValue: 1
+    Description: Largest media file stored; bigger ones are recorded as too_large.
+  MaxReceiveCount:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 1000
+    Description: >-
+      Receives before a message moves to the dead-letter queue. On the last one the
+      Tweet is written even if its media keeps failing.
   LogLevel:
     Type: String
     Default: INFO
@@ -162,6 +175,8 @@ Resources:
     Type: AWS::SQS::Queue
     Properties:
       MessageRetentionPeriod: 1209600  # 14 days
+      # Matches SQS_MAX_MESSAGE_BYTES; the DLQ must take whatever the main queue does.
+      MaximumMessageSize: 1048576
       SqsManagedSseEnabled: true
       RedriveAllowPolicy:
         redrivePermission: byQueue
@@ -177,9 +192,10 @@ Resources:
       # 6 x ProcessFunction timeout (120 s) + its 10 s batching window, per AWS guidance
       # for SQS event sources.
       VisibilityTimeout: 730
+      MaximumMessageSize: 1048576  # matches SQS_MAX_MESSAGE_BYTES
       RedrivePolicy:
         deadLetterTargetArn: !GetAtt TweetsDeadLetterQueue.Arn
-        maxReceiveCount: 5
+        maxReceiveCount: !Ref MaxReceiveCount
 
   # --- Log groups ------------------------------------------------------------
   FetchFunctionLogGroup:
@@ -245,6 +261,8 @@ Resources:
         Variables:
           TWEETS_TABLE: !Ref TweetsTable
           MEDIA_BUCKET: !Ref MediaBucket
+          MAX_MEDIA_BYTES: !Ref MaxMediaBytes
+          MAX_RECEIVE_COUNT: !Ref MaxReceiveCount
       Policies:
         - DynamoDBWritePolicy:
             TableName: !Ref TweetsTable

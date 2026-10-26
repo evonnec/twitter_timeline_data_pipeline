@@ -11,6 +11,7 @@ import httpx
 import pytest
 
 from twitter_timeline_data_pipeline.models import (
+    SCHEMA_VERSION,
     Media,
     Tweet,
     TweetMessage,
@@ -144,12 +145,15 @@ def make_message(
     media: tuple[Media, ...] = (),
     username: str = USERNAME,
     tweet: Mapping[str, Any] | None = None,
+    fetched_at: str = FETCHED_AT,
+    schema_version: int = SCHEMA_VERSION,
 ) -> TweetMessage:
     return TweetMessage(
         username=username,
         tweet=make_tweet(tweet_id, **(tweet or {})),
         media=media,
-        fetched_at=FETCHED_AT,
+        fetched_at=fetched_at,
+        schema_version=schema_version,
     )
 
 
@@ -207,6 +211,28 @@ def synthetic_timeline(
         return httpx.Response(200, json=body)
 
     return handler
+
+
+LONG_POST_ID = "1700000000000000009"
+
+
+def long_post_timeline() -> Handler:
+    """An X API serving ``timeline_long_post.json`` (one long post) for the timeline."""
+    stub = XApiStub()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path != f"/2/users/{USER_ID}/tweets":
+            return stub(request)
+        stub.requests.append(request)
+        return httpx.Response(200, json=load_fixture("timeline_long_post.json"))
+
+    return handler
+
+
+def long_post_api_object() -> dict[str, Any]:
+    """The long post's API object, as the fixture holds it."""
+    post: dict[str, Any] = load_fixture("timeline_long_post.json")["data"][0]
+    return post
 
 
 class FakeSqs:
