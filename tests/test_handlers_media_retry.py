@@ -116,6 +116,7 @@ def test_success_updates_only_its_entry(aws: Aws, cdn: CdnStub) -> None:
         "status": "retrying",
         "s3_key": f"media/{USER_ID}/{TWEET}/3_c.jpg",
         "source_url": f"{BROKEN_URL}?name=orig",
+        "url": BROKEN_URL,
     }
     obj = aws.s3.get_object(Bucket=aws.bucket, Key=eb["s3_key"])
     assert obj["Body"].read() == b"jpeg-good"

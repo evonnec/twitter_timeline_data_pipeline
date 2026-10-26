@@ -105,16 +105,20 @@ class StoredMedia:
     size_bytes: int | None = None
     # The poster frame of a video or animated GIF, when it is stored (or planned).
     preview_s3_key: str | None = None
+    # How the poster frame ended: stored, exists, unavailable, too_large or retrying.
+    preview_status: MediaStatus | None = None
+    preview_size_bytes: int | None = None  # the estimate or count when too_large
 
 
 def media_entry(stored: StoredMedia, media: Media | None = None) -> dict[str, Any]:
     """The item's ``media`` map for one key: the storage outcome, plus the media's own
-    fields from the message (``alt_text``, ``width``, ``height``, ``duration_ms``,
-    ``preview_image_url``, ``variants``) so nothing the API said is lost. None values
-    and an empty variant list are left out."""
+    fields from the message (``url``, ``alt_text``, ``width``, ``height``,
+    ``duration_ms``, ``preview_image_url``, ``variants``) so nothing the API said is
+    lost. None values and an empty variant list are left out."""
     entry: dict[str, Any] = {}
     if media is not None:
         entry = {
+            "url": media.url,
             "alt_text": media.alt_text,
             "width": media.width,
             "height": media.height,
@@ -270,6 +274,7 @@ class MediaStore:
             raw_url,
             known_type,
             lambda url: self.object_key(message, media, _extension(known_type, url)),
+            "skipped",
         )
         return skipped if target is None else target
 
@@ -283,6 +288,7 @@ class MediaStore:
             media.preview_image_url,
             None,
             lambda _: self.object_key(message, media, "_preview.jpg"),
+            "preview not stored",
         )
 
     @staticmethod
@@ -291,6 +297,7 @@ class MediaStore:
         raw_url: str,
         known_type: str | None,
         key_for: Callable[[str], str],
+        outcome: str,
     ) -> _Target | None:
         """A download target for ``raw_url``, or None (logged) when it isn't https on an
         allowed media host."""
@@ -302,8 +309,9 @@ class MediaStore:
             parts, host = None, None
         if parts is None or parts.scheme != "https" or host not in ALLOWED_MEDIA_HOSTS:
             logger.warning(
-                "media %s skipped: host %r is not an allowed media host",
+                "media %s %s: host %r is not an allowed media host",
                 media.media_key,
+                outcome,
                 host,
             )
             return None
@@ -389,6 +397,7 @@ class MediaStore:
             main,
             status=main.status if found else "retrying",
             preview_s3_key=preview.key,
+            preview_status="exists" if found else "retrying",
         )
 
     def _exists(self, key: str) -> bool:
@@ -434,8 +443,14 @@ class MediaStore:
             logger.warning(
                 "media %s preview not stored: %s", media.media_key, stored.status
             )
-            return main
-        return replace(main, preview_s3_key=stored.s3_key)
+        return replace(
+            main,
+            preview_s3_key=stored.s3_key,
+            preview_status=stored.status,
+            preview_size_bytes=stored.size_bytes
+            if stored.status == "too_large"
+            else None,
+        )
 
     def _download(
         self,
@@ -457,14 +472,16 @@ class MediaStore:
                 **extra,
             )
 
+        # Before the HeadObject, so a file (or poster frame) with no time left makes
+        # no S3 call either.
+        if deadline is not None and deadline - self._clock() <= 0:
+            raise TransientMediaError("no time left to download")
         if (cheap := self._cheap_result(media, target)) is not None:
             return cheap
 
         timeout: Any = httpx.USE_CLIENT_DEFAULT
         if deadline is not None:
-            left = deadline - self._clock()
-            if left <= 0:
-                raise TransientMediaError("no time left to download")
+            left = max(deadline - self._clock(), 0.001)
             # Connect, TLS and headers each get their own timeout, and only body
             # reads are checked against the deadline. A third of the time left per
             # phase keeps the whole exchange inside it, and the body then overruns
@@ -577,6 +594,48 @@ def estimate_item_size(value: Any) -> int:
             return 21
 
 
+# How often ``put_tweet`` re-reads and retries when another write lands between its read
+# of the stored item and its put; after that the message counts as stale.
+MERGE_ATTEMPTS = 3
+# What is read from the stored item to merge from, and to guard the put with.
+_MERGE_PROJECTION = "media, fetched_at, stored_at"
+
+
+def needs_previous(item: Mapping[str, Any]) -> bool:
+    """Whether ``item`` lacks something the stored item may still hold, so the stored
+    item must be read and merged before the write. Add a rule here (and in
+    ``carry_forward``) for each field a later message can lose."""
+    return any(e.get("status") == "missing" for e in item.get("media", ()))
+
+
+def carry_forward(
+    item: dict[str, Any], previous: Mapping[str, Any], fetched_at: str
+) -> None:
+    """Merge what the stored item ``previous`` knows into the new ``item``, in place.
+
+    Enrichment is merged, not replaced: a newer fetch that no longer sees a thing must
+    not erase it (and orphan its S3 objects). Media: a key the API now omits keeps its
+    stored entry (type, fields, S3 keys), unless that entry is itself ``missing``,
+    with ``missing_since`` (this fetch's time, first noted) and ``last_seen_fetched_at``
+    (the fetch that last saw it) added. A key that is present again simply replaces it.
+    """
+    old = {e.get("media_key"): e for e in previous.get("media") or ()}
+    for i, entry in enumerate(item.get("media", ())):
+        kept = old.get(entry["media_key"])
+        if (
+            entry.get("status") == "missing"
+            and kept
+            and kept.get("status") != "missing"
+        ):
+            item["media"][i] = {
+                **kept,
+                "missing_since": kept.get("missing_since", fetched_at),
+                "last_seen_fetched_at": kept.get(
+                    "last_seen_fetched_at", previous.get("fetched_at", fetched_at)
+                ),
+            }
+
+
 class TweetStore:
     """Writes Tweet metadata to the tweets table (partition key ``tweet_id``)."""
 
@@ -622,7 +681,10 @@ class TweetStore:
         item[f"{field}_s3_key"] = key
 
     def build_item(
-        self, message: TweetMessage, media: Sequence[StoredMedia]
+        self,
+        message: TweetMessage,
+        media: Sequence[StoredMedia],
+        previous: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """``to_item``, with texts moved to S3 until the estimated size fits.
 
@@ -631,8 +693,12 @@ class TweetStore:
         prefix (cut on a code point), ``<field>_truncated: true`` and
         ``<field>_s3_key``. A text with a lone surrogate is offloaded regardless of
         size. Items that fit make no S3 call. This runs before the conditional write.
+        ``previous`` (the stored item) is merged in first, see ``carry_forward``, so the
+        size estimate counts what will be written.
         """
         item = self.to_item(message, media)
+        if previous is not None:
+            carry_forward(item, previous, message.fetched_at)
         fields = [f for f in ("text", "display_text") if f in item]
         for field in sorted(fields, key=lambda f: len(item[f]), reverse=True):
             over = (
@@ -712,44 +778,95 @@ class TweetStore:
             if is_long
             else " AND (attribute_not_exists(is_long_post) OR is_long_post = :no)"
         )
-        values: dict[str, Any] = {
-            ":fetched_at": message.fetched_at,
-            ":schema_version": message.schema_version,
-        }
-        if not is_long:
-            values[":no"] = False
-        try:
-            self._table.put_item(
-                Item=self.build_item(message, media),
-                ConditionExpression=(
-                    "attribute_not_exists(tweet_id) OR ("
-                    "(attribute_not_exists(fetched_at) "
-                    "OR fetched_at <= :fetched_at) AND "
-                    "(attribute_not_exists(schema_version) "
-                    f"OR schema_version <= :schema_version){keep_long_post})"
-                ),
-                ExpressionAttributeValues=values,
-                ReturnValuesOnConditionCheckFailure="ALL_OLD",
-            )
-        except ClientError as exc:
-            if exc.response.get("Error", {}).get("Code") == (
-                "ConditionalCheckFailedException"
-            ):
+        base = (
+            "attribute_not_exists(tweet_id) OR ("
+            "(attribute_not_exists(fetched_at) "
+            "OR fetched_at <= :fetched_at) AND "
+            "(attribute_not_exists(schema_version) "
+            f"OR schema_version <= :schema_version){keep_long_post})"
+        )
+        for _ in range(MERGE_ATTEMPTS):
+            values: dict[str, Any] = {
+                ":fetched_at": message.fetched_at,
+                ":schema_version": message.schema_version,
+            }
+            if not is_long:
+                values[":no"] = False
+            previous: dict[str, Any] | None = None
+            condition = base
+            guarded = needs_previous(self.to_item(message, media))
+            if guarded:
+                # Read what is stored and guard the put with what was read, so a write
+                # that lands in between is merged on the next attempt, not overwritten.
+                previous = cast(
+                    "dict[str, Any] | None",
+                    self._table.get_item(
+                        Key={"tweet_id": message.tweet.id},
+                        ConsistentRead=True,
+                        ProjectionExpression=_MERGE_PROJECTION,
+                    ).get("Item"),
+                )
+                guard = ["attribute_not_exists(tweet_id)"]
+                if previous is not None:
+                    guard = []
+                    for name in ("fetched_at", "stored_at"):
+                        if name in previous:
+                            values[f":read_{name}"] = previous[name]
+                            guard.append(f"{name} = :read_{name}")
+                        else:
+                            guard.append(f"attribute_not_exists({name})")
+                condition = f"({base}) AND ({' AND '.join(guard)})"
+            try:
+                self._table.put_item(
+                    Item=self.build_item(message, media, previous),
+                    ConditionExpression=condition,
+                    ExpressionAttributeValues=values,
+                    ReturnValuesOnConditionCheckFailure="ALL_OLD",
+                )
+            except ClientError as exc:
+                if exc.response.get("Error", {}).get("Code") != (
+                    "ConditionalCheckFailedException"
+                ):
+                    raise
                 old = cast("dict[str, Any]", exc.response.get("Item") or {})
-                version = old.get("schema_version", {}).get("N")
-                if not is_long and old.get("is_long_post", {}).get("BOOL"):
+                # With the guard on, a failure is either a write since the read (the
+                # stored item differs from what was read) or the base condition on
+                # the state that was read, which is a stale message.
+                if guarded and (
+                    previous is None
+                    or any(
+                        old.get(n, {}).get("S") != previous.get(n)
+                        for n in ("fetched_at", "stored_at")
+                    )
+                ):
                     logger.info(
-                        "preview-only message for tweet %s not stored: the stored "
-                        "item is a long post",
+                        "tweet %s changed while it was merged; reading it again",
                         message.tweet.id,
                     )
-                return PutResult(
-                    written=False,
-                    stored_fetched_at=old.get("fetched_at", {}).get("S"),
-                    stored_schema_version=None if version is None else int(version),
-                )
-            raise
-        return PutResult(written=True)
+                    continue
+                return self._stale(message, old, is_long=is_long)
+            return PutResult(written=True)
+        logger.warning(
+            "tweet %s kept changing under its merge: treated as stale", message.tweet.id
+        )
+        return PutResult(written=False)
+
+    @staticmethod
+    def _stale(
+        message: TweetMessage, old: Mapping[str, Any], *, is_long: bool
+    ) -> PutResult:
+        version = old.get("schema_version", {}).get("N")
+        if not is_long and old.get("is_long_post", {}).get("BOOL"):
+            logger.info(
+                "preview-only message for tweet %s not stored: the stored "
+                "item is a long post",
+                message.tweet.id,
+            )
+        return PutResult(
+            written=False,
+            stored_fetched_at=old.get("fetched_at", {}).get("S"),
+            stored_schema_version=None if version is None else int(version),
+        )
 
     def get_media(self, tweet_id: TweetId) -> list[dict[str, Any]] | None:
         """The item's ``media`` entries (strongly consistent), None if no such item."""
