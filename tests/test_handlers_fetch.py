@@ -354,6 +354,19 @@ def test_next_token_followed_by_an_empty_page_is_not_truncated(
     assert not any("page cap reached" in m for m in caplog.messages)
 
 
+def test_empty_string_next_token_is_not_truncated(aws: Aws) -> None:
+    def api(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/tweets"):
+            body = {
+                "data": [{"id": i, "text": "t"} for i in ids(2)],
+                "meta": {"result_count": 2, "next_token": ""},
+            }
+            return httpx.Response(200, json=body)
+        return XApiStub()(request)
+
+    assert run(aws, api, max_pages=1).truncated is False
+
+
 def test_hitting_the_cap_exactly_on_the_last_page_is_not_truncated(aws: Aws) -> None:
     result = run(aws, XApiStub(), max_pages=2)
 
@@ -402,7 +415,7 @@ def test_unmoved_checkpoint_is_logged_at_info(
         run(aws, synthetic_timeline(ids(2)), since_id="1")
 
     assert (
-        f"checkpoint for {USERNAME} not moved: another run already stored a newer mark"
+        f"checkpoint for {USERNAME} not moved: the stored mark is the same or newer"
         in caplog.messages
     )
 

@@ -354,3 +354,15 @@ def test_second_fetch_is_incremental_and_since_id_flag_overrides(
     third = json.loads(capsys.readouterr().out)
     assert third["since_id"] == "1"
     assert third["enqueued"] == 7
+
+
+def test_dry_run_normalizes_the_username(
+    api: XApiStub, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code = main(["fetch", "--username", "@Example_User", "--dry-run"])
+
+    assert code == EXIT_OK
+    assert api.requests[0].url.path == "/2/users/by/username/example_user"
+    assert {m.username for m in dry_run_lines(capsys.readouterr().out)} == {
+        "example_user"
+    }
