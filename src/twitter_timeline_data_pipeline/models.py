@@ -166,6 +166,16 @@ class Media:
             alt_text=_opt_str(data.get("alt_text")),
         )
 
+    @property
+    def is_hls_only(self) -> bool:
+        """A video or animated GIF that lists variants but none is ``video/mp4``
+        (the HLS playlist isn't a file), so there is no file to download."""
+        return (
+            self.type in ("video", "animated_gif")
+            and bool(self.variants)
+            and self.download_source() is None
+        )
+
     def download_source(self) -> tuple[str, str | None] | None:
         """The ``(url, content_type)`` of the file worth storing, or None.
 
@@ -281,6 +291,10 @@ class TweetMessage:
     username: str
     tweet: Tweet
     media: tuple[Media, ...] = ()
+    # Keys the Tweet attaches that the API's ``includes.media`` did not return
+    # (deleted or withheld media). Additive and optional, like ``note_text``: an old
+    # reader ignores it, and a message without it means none were reported missing.
+    missing_media_keys: tuple[MediaKey, ...] = ()
     fetched_at: str = field(default_factory=utc_now_iso)
     schema_version: int = SCHEMA_VERSION
     raw_key: str | None = None
@@ -311,6 +325,9 @@ class TweetMessage:
             username=str(data["username"]),
             tweet=Tweet.from_dict(data["tweet"]),
             media=tuple(Media.from_dict(m) for m in data.get("media") or ()),
+            missing_media_keys=tuple(
+                str(k) for k in data.get("missing_media_keys") or ()
+            ),
             fetched_at=normalize_fetched_at(data["fetched_at"]),
             schema_version=version,
             raw_key=_opt_str(data.get("raw_key")),
@@ -492,17 +509,19 @@ class TimelinePage:
         """One message per Tweet, each carrying the media its ``media_keys`` name.
 
         A key missing from ``includes.media`` (deleted or withheld media) is logged and
-        skipped rather than failing the page.
+        carried in ``missing_media_keys`` rather than failing the page or vanishing.
         """
         stamp = fetched_at or utc_now_iso()
         messages = []
         for tweet in self.tweets:
             media = []
+            missing = []
             for key in tweet.media_keys:
                 if (item := self.media.get(key)) is None:
                     logger.warning(
                         "media key %s of tweet %s missing from includes", key, tweet.id
                     )
+                    missing.append(key)
                     continue
                 media.append(item)
             messages.append(
@@ -510,6 +529,7 @@ class TimelinePage:
                     username=username,
                     tweet=tweet,
                     media=tuple(media),
+                    missing_media_keys=tuple(missing),
                     fetched_at=stamp,
                     raw_key=raw_key,
                 )

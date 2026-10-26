@@ -1,6 +1,7 @@
 import io
 import json
-from collections.abc import Iterator
+import logging
+from collections.abc import Callable, Iterator
 from typing import Any, cast
 from urllib.parse import urlsplit
 
@@ -49,11 +50,13 @@ from twitter_timeline_data_pipeline.storage import (
     StoredMedia,
     TransientMediaError,
     TweetStore,
+    WriteContentionError,
     _extension,
     _IterReader,
     _MediaTooLarge,
     _original_size_url,
     estimate_item_size,
+    media_entry,
     merge_gaps,
 )
 
@@ -266,7 +269,7 @@ def test_store_skips_media_with_nothing_downloadable(aws: Aws) -> None:
 
     stored = media_store(aws, cdn).store(make_message(media=(hls_only,)), hls_only)
 
-    assert stored == StoredMedia(media_key="7_2", type="video", status="skipped")
+    assert stored == StoredMedia(media_key="7_2", type="video", status="skipped_hls")
     assert cdn.requests == []
     assert "Contents" not in aws.s3.list_objects_v2(Bucket=aws.bucket)
 
@@ -490,6 +493,7 @@ def test_to_item_contains_every_field() -> None:
         "referenced_tweets": [{"type": "quoted", "id": "9"}],
         "public_metrics": {"like_count": 3},
         "edit_history_tweet_ids": [TWEET_ID],
+        "media_keys": ["3_1700000000000000101"],
         "media": [
             {
                 "media_key": "3_1700000000000000101",
@@ -499,6 +503,7 @@ def test_to_item_contains_every_field() -> None:
                 "content_type": "image/jpeg",
                 "source_url": PHOTO_URL,
                 "size_bytes": 7,
+                "url": PHOTO_URL,
             }
         ],
         "media_count": 1,
@@ -951,6 +956,9 @@ def test_put_tweet_stale_result_reports_the_stored_values(aws: Aws) -> None:
 
 def test_put_tweet_reraises_other_dynamodb_errors(aws: Aws) -> None:
     class Failing:
+        def get_item(self, **_: Any) -> dict[str, Any]:
+            return {}
+
         def put_item(self, **_: Any) -> None:
             raise ClientError(
                 {"Error": {"Code": "ProvisionedThroughputExceededException"}},
@@ -1715,3 +1723,787 @@ def test_the_runbook_scan_finds_items_with_any_retrying_media(aws: Aws) -> None:
         "1700000000000000003",
         "1700000000000000004",
     ]
+
+
+# ---- missing keys, media fields, previews (#17, #36) -----------------------------
+
+PREVIEW_URL = "https://pbs.twimg.com/ext_tw_video_thumb/1/pu/img/p.jpg"
+HLS = {"content_type": "application/x-mpegURL", "url": "https://video.twimg.com/p.m3u8"}
+MP4 = {"content_type": "video/mp4", "bit_rate": 1, "url": VIDEO_HI_URL}
+VIDEO_KEY_BASE = f"media/{USER_ID}/{TWEET_ID}/7_1"
+
+
+def video_with_preview(
+    *variants: dict[str, Any], preview: str | None = PREVIEW_URL
+) -> Media:
+    return Media.from_dict(
+        {
+            "media_key": "7_1",
+            "type": "video",
+            "preview_image_url": preview,
+            "variants": list(variants or [MP4]),
+        }
+    )
+
+
+def preview_cdn() -> CdnStub:
+    cdn = CdnStub()
+    cdn.serve(VIDEO_HI_URL, b"video", "video/mp4")
+    cdn.serve(PREVIEW_URL, b"poster", "image/jpeg")
+    return cdn
+
+
+def test_to_item_records_every_attached_key_with_a_missing_entry() -> None:
+    message = make_message(
+        media=(PHOTO,),
+        tweet={"media_keys": ["3_gone", PHOTO.media_key, "3_gone2"]},
+    )
+    stored = StoredMedia(media_key=PHOTO.media_key, type="photo", status="stored")
+
+    item = TweetStore.to_item(message, [stored])
+
+    assert item["media_keys"] == ["3_gone", PHOTO.media_key, "3_gone2"]
+    assert [(e["media_key"], e["status"]) for e in item["media"]] == [
+        ("3_gone", "missing"),
+        (PHOTO.media_key, "stored"),
+        ("3_gone2", "missing"),
+    ]
+    assert item["media"][0] == {
+        "media_key": "3_gone",
+        "type": "unknown",
+        "status": "missing",
+    }
+    assert item["media_count"] == 3
+
+
+def test_to_item_without_media_has_empty_keys_and_zero_count() -> None:
+    item = TweetStore.to_item(make_message(), [])
+
+    assert (item["media_keys"], item["media"], item["media_count"]) == ([], [], 0)
+
+
+def test_to_item_keeps_stored_media_the_tweet_does_not_list() -> None:
+    stored = StoredMedia(media_key=PHOTO.media_key, type="photo", status="stored")
+
+    item = TweetStore.to_item(make_message(media=(PHOTO,)), [stored])
+
+    assert item["media_keys"] == [PHOTO.media_key]
+    assert item["media_count"] == 1
+
+
+def test_to_item_stores_every_media_field() -> None:
+    media = Media.from_dict(
+        {
+            "media_key": "7_1",
+            "type": "video",
+            "alt_text": "a clip",
+            "width": 1280,
+            "height": 720,
+            "duration_ms": 30_000,
+            "preview_image_url": PREVIEW_URL,
+            "variants": [HLS, MP4],
+        }
+    )
+    stored = StoredMedia(
+        media_key="7_1", type="video", status="stored", preview_s3_key="p"
+    )
+
+    (entry,) = TweetStore.to_item(
+        make_message(media=(media,), tweet={"media_keys": ["7_1"]}), [stored]
+    )["media"]
+
+    assert entry == {
+        "media_key": "7_1",
+        "type": "video",
+        "status": "stored",
+        "preview_s3_key": "p",
+        "alt_text": "a clip",
+        "width": 1280,
+        "height": 720,
+        "duration_ms": 30_000,
+        "preview_image_url": PREVIEW_URL,
+        "variants": [
+            {"content_type": HLS["content_type"], "url": HLS["url"]},
+            {"content_type": "video/mp4", "bit_rate": 1, "url": VIDEO_HI_URL},
+        ],
+    }
+
+
+def test_media_fields_are_clamped_and_empty_values_dropped() -> None:
+    media = Media.from_dict(
+        {
+            "media_key": "3_1",
+            "type": "photo",
+            "width": 10**45,
+            "height": -(10**45),
+            "alt_text": "",
+            "variants": [],
+        }
+    )
+
+    entry = media_entry(
+        StoredMedia(media_key="3_1", type="photo", status="stored"), media
+    )
+
+    assert (entry["width"], entry["height"]) == (MAX_STORED_INT, -MAX_STORED_INT)
+    assert entry["alt_text"] == ""
+    assert "variants" not in entry
+    assert media_entry(StoredMedia(media_key="k", type="t", status="missing")) == {
+        "media_key": "k",
+        "type": "t",
+        "status": "missing",
+    }
+
+
+def heavy_media(n: int) -> list[Media]:
+    return [
+        Media.from_dict(
+            {
+                "media_key": f"7_{i}",
+                "type": "video",
+                "alt_text": "é" * 1000,
+                "preview_image_url": PREVIEW_URL,
+                "variants": [
+                    {
+                        "content_type": "video/mp4",
+                        "bit_rate": 10**18 + v,
+                        "url": f"https://video.twimg.com/{'x' * 150}/{v}.mp4",
+                    }
+                    for v in range(12)
+                ],
+            }
+        )
+        for i in range(n)
+    ]
+
+
+def test_item_with_four_heavy_media_fits_and_counts_them(aws: Aws) -> None:
+    media = heavy_media(4)
+    keys = [m.media_key for m in media]
+    message = make_message(media=tuple(media), tweet={"media_keys": keys})
+    stored = [StoredMedia(media_key=k, type="video", status="skipped") for k in keys]
+
+    store = TweetStore(aws.tweets_table, aws.s3, aws.bucket)
+    item = store.build_item(message, stored)
+
+    media_size = estimate_item_size(item["media"])
+    assert 20_000 < media_size < ITEM_LIMIT_BYTES // 4
+    assert store.put_tweet(message, stored).written
+    saved = ddb_get(aws.tweets_table, tweet_id=TWEET_ID)
+    assert [e["alt_text"] for e in saved["media"]] == ["é" * 1000] * 4
+    assert len(saved["media"][3]["variants"]) == 12
+
+
+def test_text_offload_boundary_accounts_for_the_media_fields(aws: Aws) -> None:
+    media = heavy_media(4)
+    keys = [m.media_key for m in media]
+    stored = [StoredMedia(media_key=k, type="video", status="skipped") for k in keys]
+    store = TweetStore(aws.tweets_table, aws.s3, aws.bucket)
+
+    def build(text_len: int) -> dict[str, Any]:
+        message = make_message(
+            media=tuple(media), tweet={"media_keys": keys, "text": "a" * text_len}
+        )
+        return store.build_item(message, stored)
+
+    base = estimate_item_size(
+        TweetStore.to_item(
+            make_message(media=tuple(media), tweet={"media_keys": keys, "text": ""}),
+            stored,
+        )
+    )
+    fits = ITEM_LIMIT_BYTES - base
+
+    assert base > 20_000  # the media fields are part of what the estimate counts
+    assert "text_s3_key" not in build(fits)
+    assert build(fits + 1)["text_truncated"] is True
+
+
+def test_store_stores_the_poster_frame_of_a_video(aws: Aws) -> None:
+    cdn = preview_cdn()
+    media = video_with_preview()
+
+    stored = media_store(aws, cdn).store(make_message(media=(media,)), media)
+
+    assert stored.status == "stored"
+    assert stored.s3_key == f"{VIDEO_KEY_BASE}.mp4"
+    assert stored.preview_s3_key == f"{VIDEO_KEY_BASE}_preview.jpg"
+    poster = aws.s3.get_object(Bucket=aws.bucket, Key=stored.preview_s3_key)
+    assert poster["Body"].read() == b"poster"
+    assert poster["ContentType"] == "image/jpeg"
+    assert poster["Metadata"]["media-key"] == "7_1"
+
+
+def test_store_does_not_download_an_existing_poster_frame_again(aws: Aws) -> None:
+    cdn = preview_cdn()
+    media = video_with_preview()
+    message = make_message(media=(media,))
+    media_store(aws, cdn).store(message, media)
+    downloads = len(cdn.requests)
+
+    again = media_store(aws, cdn).store(message, media)
+
+    assert len(cdn.requests) == downloads
+    assert (again.status, again.preview_s3_key) == (
+        "exists",
+        f"{VIDEO_KEY_BASE}_preview.jpg",
+    )
+
+
+def test_hls_only_video_stores_the_poster_frame_and_is_skipped_hls(aws: Aws) -> None:
+    cdn = preview_cdn()
+    media = video_with_preview(HLS)
+
+    stored = media_store(aws, cdn).store(make_message(media=(media,)), media)
+
+    assert stored == StoredMedia(
+        media_key="7_1",
+        type="video",
+        status="skipped_hls",
+        preview_s3_key=f"{VIDEO_KEY_BASE}_preview.jpg",
+        preview_status="stored",
+    )
+    assert [str(r.url) for r in cdn.requests] == [PREVIEW_URL]
+
+
+def test_gif_poster_frame_is_stored_but_a_photo_has_none(aws: Aws) -> None:
+    cdn = preview_cdn()
+    gif = Media.from_dict(
+        {
+            "media_key": "16_1",
+            "type": "animated_gif",
+            "preview_image_url": PREVIEW_URL,
+            "variants": [MP4],
+        }
+    )
+    pic = Media.from_dict(
+        {
+            "media_key": "3_1",
+            "type": "photo",
+            "url": PHOTO_URL,
+            "preview_image_url": PREVIEW_URL,
+        }
+    )
+    cdn.serve(PHOTO_URL, b"p", "image/jpeg")
+    store = media_store(aws, cdn)
+    message = make_message(media=(gif, pic))
+
+    assert store.store(message, gif).preview_s3_key is not None
+    assert store.store(message, pic).preview_s3_key is None
+
+
+@pytest.mark.parametrize("preview", [None, "https://example.com/p.jpg", "http://x"])
+def test_no_poster_frame_without_an_allowed_preview_url(
+    aws: Aws, preview: str | None
+) -> None:
+    cdn = preview_cdn()
+    media = video_with_preview(preview=preview)
+
+    stored = media_store(aws, cdn).store(make_message(media=(media,)), media)
+
+    assert (stored.status, stored.preview_s3_key) == ("stored", None)
+    assert [str(r.url) for r in cdn.requests] == [VIDEO_HI_URL]
+
+
+@pytest.mark.parametrize("status", [404, 403])
+def test_a_permanently_unavailable_poster_frame_is_left_out(
+    aws: Aws, status: int
+) -> None:
+    cdn = preview_cdn()
+    cdn.fail(PREVIEW_URL, status)
+    media = video_with_preview()
+
+    stored = media_store(aws, cdn).store(make_message(media=(media,)), media)
+
+    assert (stored.status, stored.preview_s3_key) == ("stored", None)
+    assert stored.preview_status == "unavailable"
+
+
+def test_a_poster_frame_over_the_cap_is_left_out(aws: Aws) -> None:
+    cdn = preview_cdn()
+    cdn.serve(PREVIEW_URL, b"x" * 100, "image/jpeg")
+    media = video_with_preview()
+    store = MediaStore(aws.s3, aws.bucket, cdn.client(), max_bytes=50)
+    cdn.serve(VIDEO_HI_URL, b"v" * 10, "video/mp4")
+
+    stored = store.store(make_message(media=(media,)), media)
+
+    assert (stored.status, stored.preview_s3_key) == ("stored", None)
+    assert (stored.preview_status, stored.preview_size_bytes) == ("too_large", 100)
+    assert "Contents" in aws.s3.list_objects_v2(Bucket=aws.bucket)
+    with pytest.raises(ClientError):
+        aws.s3.head_object(Bucket=aws.bucket, Key=f"{VIDEO_KEY_BASE}_preview.jpg")
+
+
+def test_a_transient_poster_frame_failure_is_raised(aws: Aws) -> None:
+    cdn = preview_cdn()
+    cdn.fail(PREVIEW_URL, 503)
+    media = video_with_preview()
+
+    with pytest.raises(TransientMediaError):
+        media_store(aws, cdn).store(make_message(media=(media,)), media)
+
+
+def test_the_poster_frame_shares_the_download_deadline(aws: Aws) -> None:
+    clock = [0.0]
+    cdn = preview_cdn()
+
+    def main_eats_the_budget() -> httpx.Response:
+        clock[0] += 100
+        return httpx.Response(200, content=b"v", headers={"Content-Type": "video/mp4"})
+
+    cdn.responses[VIDEO_HI_URL] = main_eats_the_budget
+    media = video_with_preview()
+    store = MediaStore(aws.s3, aws.bucket, cdn.client(), clock=lambda: clock[0])
+
+    with pytest.raises(TransientMediaError):
+        store.store(make_message(media=(media,)), media, budget_s=50)
+
+    assert [str(r.url) for r in cdn.requests] == [VIDEO_HI_URL]
+
+
+def test_precheck_plans_the_poster_frame_of_a_retrying_video(aws: Aws) -> None:
+    media = video_with_preview()
+
+    result = media_store(aws, CdnStub()).precheck(make_message(media=(media,)), media)
+
+    assert result.status == "retrying"
+    assert result.s3_key == f"{VIDEO_KEY_BASE}.mp4"
+    assert result.preview_s3_key == f"{VIDEO_KEY_BASE}_preview.jpg"
+
+
+def test_precheck_keeps_a_settled_file_open_while_its_poster_frame_is_missing(
+    aws: Aws,
+) -> None:
+    media = video_with_preview(HLS)  # skipped_hls: nothing else to store
+    store = media_store(aws, CdnStub())
+    message = make_message(media=(media,))
+
+    open_ = store.precheck(message, media)
+    assert (open_.status, open_.preview_s3_key) == (
+        "retrying",
+        f"{VIDEO_KEY_BASE}_preview.jpg",
+    )
+
+    aws.s3.put_object(Bucket=aws.bucket, Key=f"{VIDEO_KEY_BASE}_preview.jpg", Body=b"p")
+    settled = store.precheck(message, media)
+    assert (settled.status, settled.preview_s3_key) == (
+        "skipped_hls",
+        f"{VIDEO_KEY_BASE}_preview.jpg",
+    )
+    # Without a HeadObject the poster frame can't be confirmed.
+    assert store.precheck(message, media, head=False).status == "retrying"
+
+
+def test_precheck_leaves_a_video_without_a_preview_url_alone(aws: Aws) -> None:
+    media = video_with_preview(HLS, preview=None)
+
+    result = media_store(aws, CdnStub()).precheck(make_message(media=(media,)), media)
+
+    assert result == StoredMedia(media_key="7_1", type="video", status="skipped_hls")
+
+
+def test_precheck_treats_a_failing_poster_head_as_not_stored(aws: Aws) -> None:
+    media = video_with_preview(HLS)
+
+    def deny(**_kw: Any) -> None:
+        raise ClientError({"Error": {"Code": "500", "Message": "boom"}}, "HeadObject")
+
+    aws.s3.meta.events.register("before-call.s3.HeadObject", deny)
+
+    result = media_store(aws, CdnStub()).precheck(make_message(media=(media,)), media)
+
+    assert result.status == "retrying"
+
+
+def test_a_disallowed_poster_host_is_logged_as_a_poster_not_a_skipped_media(
+    aws: Aws, caplog: pytest.LogCaptureFixture
+) -> None:
+    media = video_with_preview(preview="https://example.com/p.jpg")
+
+    with caplog.at_level(logging.WARNING):
+        media_store(aws, preview_cdn()).store(make_message(media=(media,)), media)
+
+    assert any(
+        "7_1 preview not stored: host 'example.com'" in m for m in caplog.messages
+    )
+    assert not any("7_1 skipped" in m for m in caplog.messages)
+
+
+def test_no_time_left_is_raised_before_any_head_object(aws: Aws) -> None:
+    calls: list[str] = []
+    aws.s3.meta.events.register(
+        "before-call.s3.HeadObject", lambda **_: calls.append("head")
+    )
+    media = video_with_preview(HLS)  # only the poster frame is left to store
+
+    with pytest.raises(TransientMediaError, match="no time left"):
+        media_store(aws, preview_cdn()).store(
+            make_message(media=(media,)), media, budget_s=0
+        )
+
+    assert calls == []
+
+
+def test_media_entry_keeps_the_media_url() -> None:
+    pic = photo()
+
+    entry = media_entry(
+        StoredMedia(media_key=pic.media_key, type="photo", status="skipped"), pic
+    )
+
+    assert entry["url"] == PHOTO_URL
+
+
+# ---- merging the stored item (no enrichment is lost) ----------------------------
+
+OLD_FETCH = "2026-10-20T00:00:00Z"
+NEW_FETCH = "2026-10-25T00:00:00Z"
+
+
+def photo_entry_message(
+    fetched_at: str, *, present: bool
+) -> tuple[TweetMessage, list[StoredMedia]]:
+    pic = Media.from_dict(
+        {
+            "media_key": "3_a",
+            "type": "photo",
+            "url": PHOTO_URL,
+            "alt_text": "a cat",
+            "width": 10,
+            "height": 20,
+        }
+    )
+    message = make_message(
+        media=(pic,) if present else (),
+        tweet={"media_keys": ["3_a"]},
+        fetched_at=fetched_at,
+    )
+    stored = (
+        [
+            StoredMedia(
+                media_key="3_a",
+                type="photo",
+                status="stored",
+                s3_key="media/k.jpg",
+                source_url=PHOTO_URL,
+            )
+        ]
+        if present
+        else []
+    )
+    return message, stored
+
+
+def test_a_newer_fetch_with_the_key_missing_keeps_the_stored_entry(aws: Aws) -> None:
+    store = TweetStore(aws.tweets_table, aws.s3, aws.bucket)
+    store.put_tweet(*photo_entry_message(OLD_FETCH, present=True))
+
+    result = store.put_tweet(*photo_entry_message(NEW_FETCH, present=False))
+
+    assert result.written
+    item = ddb_get(aws.tweets_table, tweet_id=TWEET_ID)
+    (entry,) = item["media"]
+    assert entry["status"] == "stored"
+    assert entry["s3_key"] == "media/k.jpg"
+    assert (entry["alt_text"], entry["width"], entry["type"]) == ("a cat", 10, "photo")
+    assert entry["missing_since"] == NEW_FETCH
+    assert entry["last_seen_fetched_at"] == OLD_FETCH
+    assert item["fetched_at"] == NEW_FETCH
+    assert item["media_keys"] == ["3_a"] and item["media_count"] == 1
+
+
+def test_missing_since_and_last_seen_are_kept_on_a_later_missing_fetch(
+    aws: Aws,
+) -> None:
+    store = TweetStore(aws.tweets_table, aws.s3, aws.bucket)
+    store.put_tweet(*photo_entry_message(OLD_FETCH, present=True))
+    store.put_tweet(*photo_entry_message(NEW_FETCH, present=False))
+
+    store.put_tweet(*photo_entry_message("2026-10-26T00:00:00Z", present=False))
+
+    (entry,) = ddb_get(aws.tweets_table, tweet_id=TWEET_ID)["media"]
+    assert entry["status"] == "stored"
+    assert (entry["missing_since"], entry["last_seen_fetched_at"]) == (
+        NEW_FETCH,
+        OLD_FETCH,
+    )
+
+
+def test_a_missing_entry_is_updated_when_a_newer_fetch_has_the_media(aws: Aws) -> None:
+    store = TweetStore(aws.tweets_table, aws.s3, aws.bucket)
+    store.put_tweet(*photo_entry_message(OLD_FETCH, present=False))
+    (first,) = ddb_get(aws.tweets_table, tweet_id=TWEET_ID)["media"]
+    assert first["status"] == "missing"
+
+    store.put_tweet(*photo_entry_message(NEW_FETCH, present=True))
+
+    (entry,) = ddb_get(aws.tweets_table, tweet_id=TWEET_ID)["media"]
+    assert entry["status"] == "stored"
+    assert "missing_since" not in entry
+
+
+def test_a_missing_key_over_a_missing_entry_stays_missing(aws: Aws) -> None:
+    store = TweetStore(aws.tweets_table, aws.s3, aws.bucket)
+    store.put_tweet(*photo_entry_message(OLD_FETCH, present=False))
+
+    store.put_tweet(*photo_entry_message(NEW_FETCH, present=False))
+
+    (entry,) = ddb_get(aws.tweets_table, tweet_id=TWEET_ID)["media"]
+    assert entry == {"media_key": "3_a", "type": "unknown", "status": "missing"}
+
+
+def test_an_older_message_with_the_key_missing_is_stale_and_changes_nothing(
+    aws: Aws,
+) -> None:
+    store = TweetStore(aws.tweets_table, aws.s3, aws.bucket)
+    store.put_tweet(*photo_entry_message(NEW_FETCH, present=True))
+
+    result = store.put_tweet(*photo_entry_message(OLD_FETCH, present=False))
+
+    assert not result.written
+    assert result.stored_fetched_at == NEW_FETCH
+    (entry,) = ddb_get(aws.tweets_table, tweet_id=TWEET_ID)["media"]
+    assert entry["status"] == "stored"
+    assert "missing_since" not in entry
+
+
+def racing_table(table: Any, before_put: Callable[[], object], times: int) -> Any:
+    """A table whose put_item first runs ``before_put`` (another writer) ``times``."""
+
+    class Racing:
+        remaining = times
+
+        def get_item(self, **kw: Any) -> Any:
+            return table.get_item(**kw)
+
+        def put_item(self, **kw: Any) -> Any:
+            if self.remaining:
+                self.remaining -= 1
+                before_put()
+            return table.put_item(**kw)
+
+    return Racing()
+
+
+def test_a_write_between_the_read_and_the_put_is_merged_not_overwritten(
+    aws: Aws,
+) -> None:
+    plain = TweetStore(aws.tweets_table, aws.s3, aws.bucket)
+    plain.put_tweet(*photo_entry_message(OLD_FETCH, present=True))
+
+    def other_writer() -> None:
+        # Between the read and the put: a fetch that carries a second media item.
+        extra = photo("3_b", PHOTO_URL)
+        message = make_message(
+            media=(extra,),
+            tweet={"media_keys": ["3_a", "3_b"]},
+            fetched_at="2026-10-22T00:00:00Z",
+        )
+        plain.put_tweet(
+            message,
+            [
+                StoredMedia(
+                    media_key="3_a", type="photo", status="stored", s3_key="k-a"
+                ),
+                StoredMedia(
+                    media_key="3_b", type="photo", status="stored", s3_key="k-b"
+                ),
+            ],
+        )
+
+    racing = TweetStore(
+        racing_table(aws.tweets_table, other_writer, 1), aws.s3, aws.bucket
+    )
+
+    result = racing.put_tweet(*photo_entry_message(NEW_FETCH, present=False))
+
+    assert result.written
+    item = ddb_get(aws.tweets_table, tweet_id=TWEET_ID)
+    assert item["fetched_at"] == NEW_FETCH
+    by_key = {e["media_key"]: e for e in item["media"]}
+    # Merged from the re-read item (the other writer's), not the first read.
+    assert {k: e["s3_key"] for k, e in by_key.items()} == {"3_a": "k-a", "3_b": "k-b"}
+    assert by_key["3_a"]["last_seen_fetched_at"] == "2026-10-22T00:00:00Z"
+    assert item["media_keys"] == ["3_a", "3_b"] and item["media_count"] == 2
+
+
+def test_a_first_write_racing_another_first_write_is_retried(aws: Aws) -> None:
+    plain = TweetStore(aws.tweets_table, aws.s3, aws.bucket)
+    racing = TweetStore(
+        racing_table(
+            aws.tweets_table,
+            lambda: plain.put_tweet(*photo_entry_message(OLD_FETCH, present=True)),
+            1,
+        ),
+        aws.s3,
+        aws.bucket,
+    )
+
+    assert racing.put_tweet(*photo_entry_message(NEW_FETCH, present=False)).written
+
+    (entry,) = ddb_get(aws.tweets_table, tweet_id=TWEET_ID)["media"]
+    assert entry["status"] == "stored"
+
+
+def test_a_tweet_that_keeps_changing_raises_a_retryable_error(aws: Aws) -> None:
+    plain = TweetStore(aws.tweets_table, aws.s3, aws.bucket)
+    plain.put_tweet(*photo_entry_message(OLD_FETCH, present=True))
+    counter = [0]
+
+    def always_another_writer() -> None:
+        counter[0] += 1
+        plain.put_tweet(
+            *photo_entry_message(f"2026-10-2{counter[0]}T00:00:00Z", present=True)
+        )
+
+    racing = TweetStore(
+        racing_table(aws.tweets_table, always_another_writer, 99), aws.s3, aws.bucket
+    )
+
+    with pytest.raises(WriteContentionError):
+        racing.put_tweet(*photo_entry_message("2026-10-28T00:00:00Z", present=False))
+
+    assert counter[0] == 3  # MERGE_ATTEMPTS
+    (entry,) = ddb_get(aws.tweets_table, tweet_id=TWEET_ID)["media"]
+    assert entry["status"] == "stored"
+
+
+def test_a_media_retry_result_between_the_read_and_the_put_survives(
+    aws: Aws,
+) -> None:
+    store = TweetStore(aws.tweets_table, aws.s3, aws.bucket)
+    retrying = StoredMedia(
+        media_key="3_a", type="photo", status="retrying", s3_key="media/k.jpg"
+    )
+    message, _ = photo_entry_message(OLD_FETCH, present=True)
+    store.put_tweet(message, [retrying])
+
+    def retry_lands() -> None:
+        assert store.resolve_media(
+            TWEET_ID,
+            0,
+            "3_a",
+            {"media_key": "3_a", "type": "photo", "status": "stored", "s3_key": "k2"},
+        )
+
+    racing = TweetStore(
+        racing_table(aws.tweets_table, retry_lands, 1), aws.s3, aws.bucket
+    )
+
+    assert racing.put_tweet(*photo_entry_message(NEW_FETCH, present=False)).written
+
+    (entry,) = ddb_get(aws.tweets_table, tweet_id=TWEET_ID)["media"]
+    assert (entry["status"], entry["s3_key"]) == ("stored", "k2")
+
+
+def test_a_media_retry_result_on_a_legacy_item_survives(aws: Aws) -> None:
+    # Items written before revisions existed take the attribute_not_exists(revision)
+    # branch on their first re-fetch; a retry landing mid-merge must still win.
+    aws.tweets_table.put_item(
+        Item={
+            "tweet_id": TWEET_ID,
+            "fetched_at": OLD_FETCH,
+            "media": [{"media_key": "3_a", "type": "photo", "status": "retrying"}],
+        }
+    )
+    store = TweetStore(aws.tweets_table, aws.s3, aws.bucket)
+
+    def retry_lands() -> None:
+        assert store.resolve_media(
+            TWEET_ID,
+            0,
+            "3_a",
+            {"media_key": "3_a", "type": "photo", "status": "stored", "s3_key": "k2"},
+        )
+
+    racing = TweetStore(
+        racing_table(aws.tweets_table, retry_lands, 1), aws.s3, aws.bucket
+    )
+
+    assert racing.put_tweet(*photo_entry_message(NEW_FETCH, present=False)).written
+
+    item = ddb_get(aws.tweets_table, tweet_id=TWEET_ID)
+    (entry,) = item["media"]
+    assert (entry["status"], entry["s3_key"]) == ("stored", "k2")
+    assert item["revision"] == 2  # resolve_media's ADD made it 1; the retried put, 2
+
+
+def test_every_write_bumps_the_revision(aws: Aws) -> None:
+    store = TweetStore(aws.tweets_table, aws.s3, aws.bucket)
+    message, stored = photo_entry_message(OLD_FETCH, present=True)
+
+    store.put_tweet(message, stored)
+    assert ddb_get(aws.tweets_table, tweet_id=TWEET_ID)["revision"] == 1
+    store.put_tweet(message, stored)
+    assert ddb_get(aws.tweets_table, tweet_id=TWEET_ID)["revision"] == 2
+    store.put_tweet(
+        message, [StoredMedia(media_key="3_a", type="photo", status="retrying")]
+    )
+    store.resolve_media(
+        TWEET_ID, 0, "3_a", {"media_key": "3_a", "type": "photo", "status": "stored"}
+    )
+    assert ddb_get(aws.tweets_table, tweet_id=TWEET_ID)["revision"] == 4
+
+
+def test_a_refetch_without_attachments_keeps_the_stored_media(aws: Aws) -> None:
+    store = TweetStore(aws.tweets_table, aws.s3, aws.bucket)
+    store.put_tweet(*photo_entry_message(OLD_FETCH, present=True))
+    bare = make_message(fetched_at=NEW_FETCH)  # no media_keys at all
+
+    assert store.put_tweet(bare, []).written
+
+    item = ddb_get(aws.tweets_table, tweet_id=TWEET_ID)
+    (entry,) = item["media"]
+    assert (entry["status"], entry["s3_key"], entry["alt_text"]) == (
+        "stored",
+        "media/k.jpg",
+        "a cat",
+    )
+    assert entry["missing_since"] == NEW_FETCH
+    assert item["media_keys"] == ["3_a"] and item["media_count"] == 1
+
+
+def test_a_stored_missing_entry_is_carried_as_is_when_the_key_is_unlisted(
+    aws: Aws,
+) -> None:
+    store = TweetStore(aws.tweets_table, aws.s3, aws.bucket)
+    store.put_tweet(*photo_entry_message(OLD_FETCH, present=False))
+
+    store.put_tweet(make_message(fetched_at=NEW_FETCH), [])
+
+    (entry,) = ddb_get(aws.tweets_table, tweet_id=TWEET_ID)["media"]
+    assert entry == {"media_key": "3_a", "type": "unknown", "status": "missing"}
+
+
+def test_every_put_reads_the_stored_item_first(aws: Aws) -> None:
+    reads: list[str] = []
+    aws.dynamodb.meta.client.meta.events.register(
+        "before-call.dynamodb.GetItem", lambda **_: reads.append("get")
+    )
+
+    TweetStore(aws.tweets_table, aws.s3, aws.bucket).put_tweet(
+        *photo_entry_message(OLD_FETCH, present=True)
+    )
+
+    assert reads == ["get"]
+
+
+def test_a_legacy_item_without_stamps_is_merged_too(aws: Aws) -> None:
+    aws.tweets_table.put_item(
+        Item={
+            "tweet_id": TWEET_ID,
+            "media": [
+                {"media_key": "3_a", "type": "photo", "status": "stored", "s3_key": "k"}
+            ],
+        }
+    )
+
+    result = TweetStore(aws.tweets_table, aws.s3, aws.bucket).put_tweet(
+        *photo_entry_message(NEW_FETCH, present=False)
+    )
+
+    assert result.written
+    (entry,) = ddb_get(aws.tweets_table, tweet_id=TWEET_ID)["media"]
+    assert (entry["status"], entry["s3_key"]) == ("stored", "k")
+    assert entry["last_seen_fetched_at"] == NEW_FETCH

@@ -30,6 +30,7 @@ from twitter_timeline_data_pipeline.storage import (
     StoredMedia,
     TransientMediaError,
     TweetStore,
+    WriteContentionError,
     estimated_size,
     media_hosts_override,
 )
@@ -127,6 +128,13 @@ def process_records(
             continue
         try:
             message = TweetMessage.from_json(record["body"])
+            if message.missing_media_keys:
+                logger.warning(
+                    "tweet %s: media keys missing from includes, recorded as "
+                    "missing: %s",
+                    message.tweet.id,
+                    list(message.missing_media_keys),
+                )
             # Media first: a transient failure must leave no metadata that points at
             # media that isn't there.
             stored: list[StoredMedia] = []
@@ -162,7 +170,7 @@ def process_records(
         except MessageError:
             logger.exception("message %s is malformed", message_id)
             failed.append(message_id)
-        except TransientMediaError as exc:
+        except (TransientMediaError, WriteContentionError) as exc:
             logger.warning("message %s will be retried: %s", message_id, exc)
             failed.append(message_id)
         except Exception:

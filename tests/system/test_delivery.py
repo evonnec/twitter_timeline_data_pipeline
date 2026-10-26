@@ -176,7 +176,8 @@ def test_media_unavailable_for_good_is_recorded_not_retried(sim: Simulation) -> 
     """A photo is gone (404) and a video URL redirects off the CDN.
 
     Expected: the Tweet is stored on the first receive with both media recorded as
-    ``unavailable`` and nothing in S3; it is not retried and nothing reaches the DLQ.
+    ``unavailable`` and neither file in S3 (the video's poster frame is); it is not
+    retried and nothing reaches the DLQ.
     """
     x, user = sim.x, sim.username
     gone, moved = x.photo(), x.video()
@@ -190,6 +191,8 @@ def test_media_unavailable_for_good_is_recorded_not_retried(sim: Simulation) -> 
     item = sim.tweets()[tweet.id]
     assert media_entry(item, gone.media_key)["status"] == "unavailable"
     assert media_entry(item, moved.media_key)["status"] == "unavailable"
-    assert sim.objects() == {}
+    # Only the video's poster frame is stored; neither file is.
+    moved_entry = media_entry(item, moved.media_key)
+    assert set(sim.objects()) == {moved_entry["preview_s3_key"]}
     assert [d.receive_count for d in sim.deliveries_of(tweet.id)] == [1]
     assert_quiet(sim)
