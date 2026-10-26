@@ -41,9 +41,9 @@ from twitter_timeline_data_pipeline.handlers.fetch import (
 )
 from twitter_timeline_data_pipeline.models import Media, Tweet, TweetMessage
 from twitter_timeline_data_pipeline.storage import (
-    ITEM_TEXT_LIMIT_BYTES,
     CheckpointStore,
     TweetStore,
+    estimate_item_size,
 )
 from twitter_timeline_data_pipeline.x_api import AuthError, NotFoundError, XApiError
 
@@ -742,26 +742,6 @@ class FakeS3:
         return {}
 
 
-def _utf8(text: str) -> bytes:
-    return text.encode("utf-8")
-
-
-def approx_item_size(item: Any) -> int:
-    """Approximate DynamoDB item size: UTF-8 bytes of names and strings, plus 8 per
-    number or boolean and 3 per container as an allowance for the structure."""
-    match item:
-        case dict():
-            return 3 + sum(
-                len(k.encode()) + approx_item_size(v) for k, v in item.items()
-            )
-        case list() | tuple():
-            return 3 + sum(approx_item_size(v) for v in item)
-        case str():
-            return len(item.encode())
-        case _:
-            return 8
-
-
 @pytest.mark.parametrize("unit", WORST_CASES.values(), ids=WORST_CASES.keys())
 def test_worst_case_posts_fit_one_message_and_one_dynamodb_item(unit: str) -> None:
     message = worst_case_message(unit)
@@ -773,21 +753,17 @@ def test_worst_case_posts_fit_one_message_and_one_dynamodb_item(unit: str) -> No
     s3 = FakeS3()
     store = TweetStore(cast(Any, None), cast("S3Client", s3), "bucket")
     item = store.build_item(message, [])
-    item["media"] = [
-        {"media_key": m.media_key, "alt_text": m.alt_text} for m in message.media
-    ]
-    assert approx_item_size(item) < 400_000
-    # What the item leaves out is in S3, in full.
-    assert [c["Body"] for c in s3.puts] in ([], [_utf8(unit * 12_500)])
-    assert bool(s3.puts) == (len(_utf8(unit * 12_500)) > ITEM_TEXT_LIMIT_BYTES)
-
-
-def test_the_35_byte_emoji_post_is_the_largest_body_and_item_text() -> None:
-    unit = WORST_CASES["zwj-kiss"]
-
-    assert len(unit.encode()) == 35
-    assert len(worst_case_message(unit).to_json().encode()) > 440_000
-    assert len(unit.encode()) * 12_500 > 400_000
+    # The item never holds more than the estimate allows; what it leaves out is in S3,
+    # in full.
+    assert estimate_item_size(item) < 400_000
+    text = unit * 12_500
+    if item.get("text_truncated"):
+        assert [json.loads(c["Body"]) for c in s3.puts] == [text]
+    else:
+        assert s3.puts == []
+        assert item["text"] == text
+    if len(text.encode()) > 400_000:
+        assert item["text_truncated"] is True
 
 
 def test_a_long_post_is_enqueued_in_full(aws: Aws) -> None:

@@ -107,10 +107,12 @@ Resources:
             - {AttributeName: username, KeyType: HASH}
             - {AttributeName: created_at, KeyType: RANGE}
           # Listings need only these; INCLUDE keeps GSI write units and storage well
-          # below ALL. Fetch other attributes with GetItem on tweet_id.
+          # below ALL. Fetch other attributes with GetItem on tweet_id. text may be a
+          # prefix of an offloaded text; text_truncated and text_s3_key say so.
           Projection:
             ProjectionType: INCLUDE
-            NonKeyAttributes: [text, media_count, public_metrics]
+            NonKeyAttributes:
+              [text, text_truncated, text_s3_key, media_count, public_metrics]
       PointInTimeRecoverySpecification:
         PointInTimeRecoveryEnabled: true
       SSESpecification:

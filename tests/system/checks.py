@@ -1,5 +1,6 @@
 """Assertions about the end state of a simulation, shared by the scenario tests."""
 
+import json
 from collections import Counter
 from collections.abc import Iterable
 from typing import Any
@@ -11,6 +12,15 @@ from system.harness import Simulation, message_tweet_id
 STORED_STATUSES = frozenset({"stored", "exists"})
 
 
+def full_text(sim: Simulation, item: dict[str, Any]) -> str:
+    """The item's text, read from S3 when the item only holds a prefix."""
+    if not item.get("text_truncated"):
+        return str(item["text"])
+    text: str = json.loads(sim.object_bytes(item["text_s3_key"]))
+    assert text.startswith(item["text"])
+    return text
+
+
 def assert_stored(sim: Simulation, tweets: Iterable[FakeTweet]) -> None:
     """Each Tweet has one item with its full text, and every attached medium is in S3
     with the bytes the CDN serves."""
@@ -19,7 +29,9 @@ def assert_stored(sim: Simulation, tweets: Iterable[FakeTweet]) -> None:
     for tweet in tweets:
         assert tweet.id in items, f"tweet {tweet.id} was never stored"
         item = items[tweet.id]
-        assert item["text"] == tweet.full_text, f"tweet {tweet.id}: text differs"
+        assert full_text(sim, item) == tweet.full_text, (
+            f"tweet {tweet.id}: text differs"
+        )
         assert item["author_id"] == tweet.author_id
         assert (
             int(item["public_metrics"]["like_count"])

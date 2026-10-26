@@ -7,8 +7,9 @@ re-send a Tweet after a retry:
   stored item only if it is not older (by ``fetched_at`` and ``schema_version``), so a
   stale redelivery can't overwrite newer data. A repeat of the same delivery rewrites
   the same data.
-- A post whose text is too big for a DynamoDB item has its full text uploaded to a
+- A post too big for a DynamoDB item has its text uploaded (create-only) to a
   deterministic S3 key first.
+- A preview-only message can't replace a stored long post.
 - Media objects get a deterministic S3 key, and an object that already exists is not
   downloaded again.
 - Media that couldn't be stored on a message's last receive is recorded as
@@ -17,9 +18,11 @@ re-send a Tweet after a retry:
 """
 
 import io
+import json
 import logging
 import mimetypes
 import posixpath
+import re
 import time
 from collections.abc import Buffer, Callable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass
@@ -35,6 +38,7 @@ from twitter_timeline_data_pipeline.models import (
     MediaRetry,
     TweetId,
     TweetMessage,
+    escape_disallowed_chars,
     utc_now_iso,
 )
 
@@ -408,20 +412,39 @@ class PutResult:
     stored_schema_version: int | None = None
 
 
-# DynamoDB items are limited to 400 KB (names and values together), and the
-# username-created_at-index projects ``text`` as well. Text over this many UTF-8 bytes
-# moves to S3, which leaves 100 KB for everything else in the item (the worst case is
-# about 50 KB: four photos with 1,000-character alt text, metrics and IDs) and for the
-# index entry's keys and the other projected attributes.
-ITEM_TEXT_LIMIT_BYTES = 300_000
+# DynamoDB items are limited to 400 KB (names and values together). A text is moved to
+# S3 when the estimated item size is over this, which leaves 50 KB for the estimate's
+# error and for the stored prefix and S3 keys. The username-created_at-index projects
+# ``text`` too, and an index entry is the key plus the projected attributes, so it
+# stays under the limit as well.
+ITEM_LIMIT_BYTES = 350_000
 # How much of an offloaded text stays in the item as a preview (code points).
 TEXT_PREVIEW_CHARS = 2_000
 
 
-def _utf8(text: str) -> bytes:
-    # ``surrogatepass`` keeps a lone surrogate (which the message format allows) from
-    # raising, so the text is never lost; it is stored as is.
-    return text.encode("utf-8", "surrogatepass")
+# DynamoDB can't take a lone surrogate (it isn't encodable as UTF-8); the message format
+# can carry one, so a text with one is always kept whole in S3 and the item's prefix
+# shows U+FFFD in its place.
+_LONE_SURROGATE = re.compile("[\ud800-\udfff]")
+
+
+def estimate_item_size(value: Any) -> int:
+    """Approximate DynamoDB size: attribute names and UTF-8 string values, 21 bytes per
+    number (the most one takes), 1 per boolean, and 3 per container plus 1 per element
+    for the structure. It errs high; DynamoDB's own count is a bit lower."""
+    match value:
+        case dict():
+            return 3 + sum(
+                len(k.encode()) + 1 + estimate_item_size(v) for k, v in value.items()
+            )
+        case list() | tuple():
+            return 3 + sum(1 + estimate_item_size(v) for v in value)
+        case str():
+            return len(value.encode("utf-8", "surrogatepass"))
+        case bool():
+            return 1
+        case _:
+            return 21
 
 
 class TweetStore:
@@ -433,39 +456,61 @@ class TweetStore:
         self._bucket = bucket
 
     @staticmethod
-    def text_key(message: TweetMessage) -> str:
-        """``text/<author_id>/<tweet_id>.txt``, with the same owner rule as media."""
+    def text_key(message: TweetMessage, field: str = "text") -> str:
+        """``text/<author_id>/<tweet_id>.json`` (``<tweet_id>.display_text.json`` for
+        the preview), with the same owner rule as media."""
         owner = message.tweet.author_id or message.username.lower()
-        return f"text/{owner}/{message.tweet.id}.txt"
+        suffix = "" if field == "text" else f".{field}"
+        return f"text/{owner}/{message.tweet.id}{suffix}.json"
+
+    def _offload(self, message: TweetMessage, item: dict[str, Any], field: str) -> None:
+        """Upload ``item[field]`` to S3 and leave a prefix and pointer in the item.
+
+        The object is the text as a JSON string (strict UTF-8; characters SQS and UTF-8
+        reject are escaped the same way as in the message), so any text, a lone
+        surrogate included, reads back exactly with ``json.loads``. The write is
+        create-only: a redelivery, or a stale message for the same Tweet (same ID, same
+        text), finds it already there and writes nothing.
+        """
+        key = self.text_key(message, field)
+        text: str = item[field]
+        body = escape_disallowed_chars(json.dumps(text, ensure_ascii=False))
+        try:
+            self._s3.put_object(
+                Bucket=self._bucket,
+                Key=key,
+                Body=body.encode("utf-8"),
+                ContentType="application/json",
+                Metadata={"tweet-id": message.tweet.id},
+                IfNoneMatch="*",
+            )
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") != "PreconditionFailed":
+                raise
+        item[field] = _LONE_SURROGATE.sub("\ufffd", text[:TEXT_PREVIEW_CHARS])
+        item[f"{field}_truncated"] = True
+        item[f"{field}_s3_key"] = key
 
     def build_item(
         self, message: TweetMessage, media: Sequence[StoredMedia]
     ) -> dict[str, Any]:
-        """``to_item``, with a too-big text moved to S3.
+        """``to_item``, with texts moved to S3 until the estimated size fits.
 
-        When the full text is over ``ITEM_TEXT_LIMIT_BYTES`` it is uploaded as UTF-8 to
-        ``text_key`` and the item keeps a prefix in ``text`` (cut on a code point),
-        ``text_truncated: true`` and ``text_s3_key``. Smaller items make no S3 call.
-
-        This runs before the conditional write. A stale message for the same Tweet
-        carries the same text, so overwriting the object is harmless.
+        While the item is over ``ITEM_LIMIT_BYTES``, the longer of ``text`` and
+        ``display_text`` (when longer than the preview) is offloaded: the item keeps a
+        prefix (cut on a code point), ``<field>_truncated: true`` and
+        ``<field>_s3_key``. A text with a lone surrogate is offloaded regardless of
+        size. Items that fit make no S3 call. This runs before the conditional write.
         """
         item = self.to_item(message, media)
-        full_text = item["text"]
-        body = _utf8(full_text)
-        if len(body) <= ITEM_TEXT_LIMIT_BYTES:
-            return item
-        key = self.text_key(message)
-        self._s3.put_object(
-            Bucket=self._bucket,
-            Key=key,
-            Body=body,
-            ContentType="text/plain; charset=utf-8",
-            Metadata={"tweet-id": message.tweet.id},
-        )
-        item["text"] = full_text[:TEXT_PREVIEW_CHARS]
-        item["text_truncated"] = True
-        item["text_s3_key"] = key
+        fields = [f for f in ("text", "display_text") if f in item]
+        for field in sorted(fields, key=lambda f: len(item[f]), reverse=True):
+            over = (
+                estimate_item_size(item) > ITEM_LIMIT_BYTES
+                and len(item[field]) > TEXT_PREVIEW_CHARS
+            )
+            if over or _LONE_SURROGATE.search(item[field]):
+                self._offload(message, item, field)
         return item
 
     @staticmethod
@@ -511,10 +556,24 @@ class TweetStore:
         not later than this message's and the stored ``schema_version`` (absent on
         legacy items) is not higher. ``fetched_at`` is an ISO 8601 UTC string with
         second precision, so string comparison is chronological. A tie rewrites the
-        item with the same data, which keeps a redelivery idempotent. A skipped stale
-        write returns ``written=False`` with the stored values; any other DynamoDB
-        error propagates.
+        item with the same data, which keeps a redelivery idempotent. A message
+        without ``note_text`` (a preview, e.g. from a fetcher that predates long posts)
+        never replaces a stored long post, whatever its ``fetched_at``: the preview
+        would erase the full text. A skipped write returns ``written=False`` with the
+        stored values; any other DynamoDB error propagates.
         """
+        is_long = bool(message.tweet.note_text)
+        keep_long_post = (
+            ""
+            if is_long
+            else " AND (attribute_not_exists(is_long_post) OR is_long_post = :no)"
+        )
+        values: dict[str, Any] = {
+            ":fetched_at": message.fetched_at,
+            ":schema_version": message.schema_version,
+        }
+        if not is_long:
+            values[":no"] = False
         try:
             self._table.put_item(
                 Item=self.build_item(message, media),
@@ -523,12 +582,9 @@ class TweetStore:
                     "(attribute_not_exists(fetched_at) "
                     "OR fetched_at <= :fetched_at) AND "
                     "(attribute_not_exists(schema_version) "
-                    "OR schema_version <= :schema_version))"
+                    f"OR schema_version <= :schema_version){keep_long_post})"
                 ),
-                ExpressionAttributeValues={
-                    ":fetched_at": message.fetched_at,
-                    ":schema_version": message.schema_version,
-                },
+                ExpressionAttributeValues=values,
                 ReturnValuesOnConditionCheckFailure="ALL_OLD",
             )
         except ClientError as exc:
@@ -537,6 +593,12 @@ class TweetStore:
             ):
                 old = cast("dict[str, Any]", exc.response.get("Item") or {})
                 version = old.get("schema_version", {}).get("N")
+                if not is_long and old.get("is_long_post", {}).get("BOOL"):
+                    logger.info(
+                        "preview-only message for tweet %s not stored: the stored "
+                        "item is a long post",
+                        message.tweet.id,
+                    )
                 return PutResult(
                     written=False,
                     stored_fetched_at=old.get("fetched_at", {}).get("S"),
