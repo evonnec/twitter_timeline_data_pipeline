@@ -77,16 +77,28 @@ _HOSTNAME_RE = re.compile(r"[a-z0-9]([a-z0-9.-]*[a-z0-9])?")
 def media_hosts_override(environ: Mapping[str, str] | None = None) -> frozenset[str]:
     """Extra media hosts from ``MEDIA_ALLOWED_HOSTS_OVERRIDE``; empty when unset.
 
+    Also empty, with an ERROR logged, when ``AWS_ENDPOINT_URL`` is not set: the override
+    only makes sense next to an emulated AWS, so a stray copy in a real deployment
+    (which uses the default endpoints) is ignored instead of widening the allowlist.
+
     Raises ``ValueError`` for an entry that isn't a bare hostname (no scheme, port or
     path), so a typo can't silently widen the allowlist.
     """
-    raw = (os.environ if environ is None else environ).get(MEDIA_HOSTS_OVERRIDE_ENV, "")
+    env = os.environ if environ is None else environ
+    raw = env.get(MEDIA_HOSTS_OVERRIDE_ENV, "")
     hosts = frozenset(h.strip().lower() for h in raw.split(",") if h.strip())
     for host in hosts:
         if not _HOSTNAME_RE.fullmatch(host):
             raise ValueError(
                 f"{MEDIA_HOSTS_OVERRIDE_ENV}: {host!r} is not a bare hostname"
             )
+    if hosts and not env.get("AWS_ENDPOINT_URL"):
+        logger.error(
+            "%s is set but AWS_ENDPOINT_URL is not, so this is not an emulated AWS: "
+            "ignoring the override. Remove it from this deployment.",
+            MEDIA_HOSTS_OVERRIDE_ENV,
+        )
+        return frozenset()
     return hosts
 
 
