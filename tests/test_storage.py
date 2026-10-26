@@ -2397,6 +2397,38 @@ def test_a_media_retry_result_between_the_read_and_the_put_survives(
     assert (entry["status"], entry["s3_key"]) == ("stored", "k2")
 
 
+def test_a_media_retry_result_on_a_legacy_item_survives(aws: Aws) -> None:
+    # Items written before revisions existed take the attribute_not_exists(revision)
+    # branch on their first re-fetch; a retry landing mid-merge must still win.
+    aws.tweets_table.put_item(
+        Item={
+            "tweet_id": TWEET_ID,
+            "fetched_at": OLD_FETCH,
+            "media": [{"media_key": "3_a", "type": "photo", "status": "retrying"}],
+        }
+    )
+    store = TweetStore(aws.tweets_table, aws.s3, aws.bucket)
+
+    def retry_lands() -> None:
+        assert store.resolve_media(
+            TWEET_ID,
+            0,
+            "3_a",
+            {"media_key": "3_a", "type": "photo", "status": "stored", "s3_key": "k2"},
+        )
+
+    racing = TweetStore(
+        racing_table(aws.tweets_table, retry_lands, 1), aws.s3, aws.bucket
+    )
+
+    assert racing.put_tweet(*photo_entry_message(NEW_FETCH, present=False)).written
+
+    item = ddb_get(aws.tweets_table, tweet_id=TWEET_ID)
+    (entry,) = item["media"]
+    assert (entry["status"], entry["s3_key"]) == ("stored", "k2")
+    assert item["revision"] == 2  # resolve_media's ADD made it 1; the retried put, 2
+
+
 def test_every_write_bumps_the_revision(aws: Aws) -> None:
     store = TweetStore(aws.tweets_table, aws.s3, aws.bucket)
     message, stored = photo_entry_message(OLD_FETCH, present=True)
