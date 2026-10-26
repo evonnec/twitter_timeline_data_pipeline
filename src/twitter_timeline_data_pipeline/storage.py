@@ -598,14 +598,46 @@ def estimate_item_size(value: Any) -> int:
 # of the stored item and its put; after that the message counts as stale.
 MERGE_ATTEMPTS = 3
 # What is read from the stored item to merge from, and to guard the put with.
-_MERGE_PROJECTION = "media, fetched_at, stored_at"
+_MERGE_PROJECTION = (
+    "media, referenced_tweets, entities, display_entities, fetched_at, stored_at"
+)
+# Characters and links that mean a text has entities (URLs, mentions, hashtags,
+# cashtags); a text without any is not worth a read to look for stored ones.
+_ENTITY_MARKERS = re.compile(r"https?://|[@#$]")
+# Fields of a stored referenced-post entry that are carried forward as a whole.
+_REFERENCE_KEYS = (
+    "text",
+    "text_truncated",
+    "text_s3_key",
+    "display_text",
+    "display_text_truncated",
+    "display_text_s3_key",
+    "is_long_post",
+    "author_id",
+    "author_username",
+    "created_at",
+)
+
+
+def _lacks_reference_text(item: Mapping[str, Any]) -> bool:
+    return any("text" not in r for r in item.get("referenced_tweets", ()))
+
+
+def _lacks_entities(item: Mapping[str, Any]) -> bool:
+    return "entities" not in item and any(
+        _ENTITY_MARKERS.search(str(item.get(f, ""))) for f in ("text", "display_text")
+    )
 
 
 def needs_previous(item: Mapping[str, Any]) -> bool:
     """Whether ``item`` lacks something the stored item may still hold, so the stored
     item must be read and merged before the write. Add a rule here (and in
     ``carry_forward``) for each field a later message can lose."""
-    return any(e.get("status") == "missing" for e in item.get("media", ()))
+    return (
+        any(e.get("status") == "missing" for e in item.get("media", ()))
+        or _lacks_reference_text(item)
+        or _lacks_entities(item)
+    )
 
 
 def carry_forward(
@@ -618,6 +650,13 @@ def carry_forward(
     stored entry (type, fields, S3 keys), unless that entry is itself ``missing``,
     with ``missing_since`` (this fetch's time, first noted) and ``last_seen_fetched_at``
     (the fetch that last saw it) added. A key that is present again simply replaces it.
+
+    Referenced posts: an incoming reference without the original's text (the expansion
+    is off, or the original is now ``unavailable``) keeps the stored reference's text,
+    author and date, with the new ``status`` (if any), ``stale_since`` (this fetch's
+    time, first noted) and ``last_seen_fetched_at``. Entities: when the incoming item
+    has none, the stored ``entities`` and ``display_entities`` are kept; entities the
+    API did return replace them.
     """
     old = {e.get("media_key"): e for e in previous.get("media") or ()}
     for i, entry in enumerate(item.get("media", ())):
@@ -634,6 +673,24 @@ def carry_forward(
                     "last_seen_fetched_at", previous.get("fetched_at", fetched_at)
                 ),
             }
+    stored_refs = {
+        (r.get("type"), r.get("id")): r for r in previous.get("referenced_tweets") or ()
+    }
+    for i, ref in enumerate(item.get("referenced_tweets", ())):
+        kept_ref = stored_refs.get((ref.get("type"), ref.get("id")))
+        if "text" not in ref and kept_ref and "text" in kept_ref:
+            merged = {k: kept_ref[k] for k in _REFERENCE_KEYS if k in kept_ref}
+            merged |= {"type": ref["type"], "id": ref["id"]}
+            if status := ref.get("status") or kept_ref.get("status"):
+                merged["status"] = status
+            merged["stale_since"] = kept_ref.get("stale_since", fetched_at)
+            merged["last_seen_fetched_at"] = kept_ref.get(
+                "last_seen_fetched_at", previous.get("fetched_at", fetched_at)
+            )
+            item["referenced_tweets"][i] = merged
+    for name in ("entities", "display_entities"):
+        if name not in item and name in previous:
+            item[name] = previous[name]
 
 
 class TweetStore:

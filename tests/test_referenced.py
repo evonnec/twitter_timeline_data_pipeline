@@ -535,3 +535,207 @@ def test_e2e_flags_off_reach_the_request(
     sent = stub.requests[0].url.params
     assert sent["expansions"] == "attachments.media_keys"
     assert "entities" not in sent["tweet.fields"]
+
+
+# ---- a re-fetch never erases richer data -------------------------------------
+
+OLD = "2026-10-21T00:00:00Z"
+NEW = "2026-10-22T00:00:00Z"
+URL_TEXT = "see https://t.co/x"
+ENTITIES = {
+    "urls": [
+        {
+            "url": "https://t.co/x",
+            "expanded_url": "https://example.com/x",
+            "display_url": "example.com/x",
+            "start": 4,
+            "end": 18,
+        }
+    ]
+}
+TWEET_REFS = [{"type": "retweeted", "id": "7"}]
+
+
+class ReadCounter:
+    """A table that counts ``get_item`` calls."""
+
+    def __init__(self, table: Any) -> None:
+        self.table = table
+        self.reads = 0
+
+    def get_item(self, **kw: Any) -> Any:
+        self.reads += 1
+        return self.table.get_item(**kw)
+
+    def put_item(self, **kw: Any) -> Any:
+        return self.table.put_item(**kw)
+
+
+def refetch(
+    fetched_at: str,
+    *,
+    original: ReferencedPost | None,
+    entities: dict[str, Any] | None = None,
+    text: str = URL_TEXT,
+) -> TweetMessage:
+    tweet: dict[str, Any] = {"text": text, "referenced_tweets": TWEET_REFS}
+    if entities:
+        tweet["entities"] = entities
+    return make_message(
+        tweet=tweet,
+        referenced=(original,) if original else (),
+        fetched_at=fetched_at,
+    )
+
+
+FULL = ReferencedPost(
+    id="7",
+    type="retweeted",
+    text="cut…",
+    note_text="the whole original",
+    author_id="111",
+    author_username="orig_author",
+    created_at="2026-10-01T08:00:00.000Z",
+)
+BARE = ReferencedPost(id="7", type="retweeted")
+
+
+def test_a_refetch_without_the_expansion_keeps_text_author_and_entities(
+    aws: Aws,
+) -> None:
+    store = TweetStore(aws.tweets_table, aws.s3, aws.bucket)
+    store.put_tweet(refetch(OLD, original=FULL, entities=ENTITIES), [])
+
+    result = store.put_tweet(refetch(NEW, original=BARE), [])
+
+    assert result.written
+    item = stored(aws, "1700000000000000005")
+    (ref,) = item["referenced_tweets"]
+    assert ref["text"] == "the whole original"
+    assert ref["display_text"] == "cut…"
+    assert (ref["author_id"], ref["author_username"]) == ("111", "orig_author")
+    assert ref["created_at"] == "2026-10-01T08:00:00.000Z"
+    assert ref["stale_since"] == NEW and ref["last_seen_fetched_at"] == OLD
+    assert "status" not in ref
+    assert item["entities"] == ENTITIES
+    assert item["fetched_at"] == NEW
+
+
+def test_stale_since_is_the_first_fetch_that_lacked_the_data(aws: Aws) -> None:
+    store = TweetStore(aws.tweets_table, aws.s3, aws.bucket)
+    store.put_tweet(refetch(OLD, original=FULL), [])
+    store.put_tweet(refetch(NEW, original=BARE), [])
+
+    store.put_tweet(refetch("2026-10-23T00:00:00Z", original=BARE), [])
+
+    (ref,) = stored(aws, "1700000000000000005")["referenced_tweets"]
+    assert ref["stale_since"] == NEW and ref["last_seen_fetched_at"] == OLD
+    assert ref["text"] == "the whole original"
+
+
+def test_an_original_that_became_unavailable_keeps_its_stored_text(
+    aws: Aws,
+) -> None:
+    store = TweetStore(aws.tweets_table, aws.s3, aws.bucket)
+    store.put_tweet(refetch(OLD, original=FULL), [])
+    gone = ReferencedPost(id="7", type="retweeted", status="unavailable")
+
+    store.put_tweet(refetch(NEW, original=gone), [])
+
+    (ref,) = stored(aws, "1700000000000000005")["referenced_tweets"]
+    assert ref["text"] == "the whole original"
+    assert ref["author_username"] == "orig_author"
+    assert ref["status"] == "unavailable"
+    assert ref["stale_since"] == NEW
+
+
+def test_a_refetch_with_the_expansion_updates_the_reference(aws: Aws) -> None:
+    store = TweetStore(aws.tweets_table, aws.s3, aws.bucket)
+    store.put_tweet(refetch(OLD, original=FULL, entities=ENTITIES), [])
+    edited = ReferencedPost(
+        id="7",
+        type="retweeted",
+        text="fresh",
+        author_id="111",
+        author_username="renamed",
+    )
+    new_entities = {"hashtags": [{"tag": "new", "start": 0, "end": 4}]}
+
+    store.put_tweet(refetch(NEW, original=edited, entities=new_entities), [])
+
+    item = stored(aws, "1700000000000000005")
+    (ref,) = item["referenced_tweets"]
+    assert ref["text"] == "fresh" and ref["author_username"] == "renamed"
+    assert "stale_since" not in ref and "display_text" not in ref
+    assert item["entities"] == new_entities
+
+
+def test_an_older_message_still_cannot_replace_a_newer_item(aws: Aws) -> None:
+    store = TweetStore(aws.tweets_table, aws.s3, aws.bucket)
+    store.put_tweet(refetch(NEW, original=FULL), [])
+
+    result = store.put_tweet(refetch(OLD, original=BARE), [])
+
+    assert not result.written
+    (ref,) = stored(aws, "1700000000000000005")["referenced_tweets"]
+    assert ref["text"] == "the whole original" and "stale_since" not in ref
+
+
+def test_an_offloaded_referenced_text_is_carried_with_its_pointer(aws: Aws) -> None:
+    store = TweetStore(aws.tweets_table, aws.s3, aws.bucket)
+    huge = ReferencedPost(id="7", type="retweeted", text="t", note_text="q" * 400_000)
+    message = make_message(
+        tweet={
+            "text": "x",
+            "note_text": "n" * 200_000,
+            "referenced_tweets": TWEET_REFS,
+        },
+        referenced=(huge,),
+        fetched_at=OLD,
+    )
+    store.put_tweet(message, [])
+    (first,) = stored(aws, message.tweet.id)["referenced_tweets"]
+    assert first["text_truncated"] is True
+
+    store.put_tweet(
+        make_message(
+            tweet={
+                "text": "x",
+                "note_text": "n" * 200_000,
+                "referenced_tweets": TWEET_REFS,
+            },
+            referenced=(BARE,),
+            fetched_at=NEW,
+        ),
+        [],
+    )
+
+    (ref,) = stored(aws, message.tweet.id)["referenced_tweets"]
+    assert ref["text_s3_key"] == first["text_s3_key"] and ref["text"] == first["text"]
+    assert ref["stale_since"] == NEW
+
+
+def test_the_stored_item_is_read_only_when_something_could_be_lost(
+    aws: Aws,
+) -> None:
+    table = ReadCounter(aws.tweets_table)
+    store = TweetStore(cast(Any, table), aws.s3, aws.bucket)
+
+    store.put_tweet(make_message("1", tweet={"text": "plain words"}), [])
+    store.put_tweet(
+        refetch(OLD, original=FULL, entities=ENTITIES),
+        [],
+    )
+    assert table.reads == 0  # plain text, and a full reference with entities
+
+    store.put_tweet(refetch(NEW, original=BARE, entities=ENTITIES), [])
+    assert table.reads == 1  # a reference with no text
+
+    store.put_tweet(make_message("2", tweet={"text": "hi @friend"}, fetched_at=NEW), [])
+    assert table.reads == 2  # entity markers, no entities
+
+    store.put_tweet(
+        make_message("3", tweet={"text": "x", "referenced_tweets": []}, fetched_at=NEW),
+        [],
+    )
+    assert table.reads == 2
