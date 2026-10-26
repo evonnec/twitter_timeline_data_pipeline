@@ -10,7 +10,7 @@ import logging
 import re
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, NoReturn, Self
 
 logger = logging.getLogger(__name__)
@@ -34,6 +34,30 @@ type JSONObject = dict[str, Any]
 
 class MessageError(ValueError):
     """An SQS message body that can never be processed (bad JSON or wrong schema)."""
+
+
+MAX_CLOCK_SKEW = timedelta(minutes=5)
+
+
+def normalize_fetched_at(value: object) -> str:
+    """``value`` as UTC ISO 8601 with ``Z``, to the second; ``MessageError`` if invalid.
+
+    Stored ``fetched_at`` values are compared as strings by the conditional write, so
+    every one must have exactly this format, carry a timezone, and not be in the future
+    (a far-future value would block every later write for that Tweet).
+    """
+    if not isinstance(value, str):
+        raise MessageError(f"fetched_at must be a string, got {value!r}")
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        raise MessageError(f"fetched_at is not an ISO 8601 time: {value!r}") from None
+    if parsed.tzinfo is None:
+        raise MessageError(f"fetched_at has no timezone: {value!r}")
+    parsed = parsed.astimezone(UTC)
+    if parsed > datetime.now(UTC) + MAX_CLOCK_SKEW:
+        raise MessageError(f"fetched_at is in the future: {value!r}")
+    return parsed.isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
 def utc_now_iso() -> str:
@@ -239,7 +263,7 @@ class TweetMessage:
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> Self:
         version = data.get("schema_version")
-        if version != SCHEMA_VERSION:
+        if type(version) is not int or version != SCHEMA_VERSION:
             raise MessageError(
                 f"unsupported schema_version {version!r}; expected {SCHEMA_VERSION}"
             )
@@ -247,7 +271,7 @@ class TweetMessage:
             username=str(data["username"]),
             tweet=Tweet.from_dict(data["tweet"]),
             media=tuple(Media.from_dict(m) for m in data.get("media") or ()),
-            fetched_at=str(data["fetched_at"]),
+            fetched_at=normalize_fetched_at(data["fetched_at"]),
             schema_version=version,
         )
 

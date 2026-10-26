@@ -3,8 +3,10 @@
 Every write is idempotent, because SQS delivers at least once and the fetch Lambda may
 re-send a Tweet after a retry:
 
-- Tweets are keyed by ``tweet_id``; a repeat ``put_item`` replaces the item with the
-  same data (plus refreshed metrics).
+- Tweets are keyed by ``tweet_id`` and written conditionally: a delivery replaces the
+  stored item only if it is not older (by ``fetched_at`` and ``schema_version``), so a
+  stale redelivery can't overwrite newer data. A repeat of the same delivery rewrites
+  the same data.
 - Media objects get a deterministic S3 key, and an object that already exists is not
   downloaded again.
 """
@@ -221,6 +223,19 @@ class MediaStore:
         )
 
 
+@dataclass(frozen=True, slots=True, kw_only=True)
+class PutResult:
+    """Outcome of ``TweetStore.put_tweet``.
+
+    When ``written`` is False the stored item was newer; ``stored_fetched_at`` and
+    ``stored_schema_version`` are its values (None if DynamoDB didn't return them).
+    """
+
+    written: bool
+    stored_fetched_at: str | None = None
+    stored_schema_version: int | None = None
+
+
 class TweetStore:
     """Writes Tweet metadata to the tweets table (partition key ``tweet_id``)."""
 
@@ -261,8 +276,48 @@ class TweetStore:
         }
         return {k: v for k, v in item.items() if v is not None}
 
-    def put_tweet(self, message: TweetMessage, media: Sequence[StoredMedia]) -> None:
-        self._table.put_item(Item=self.to_item(message, media))
+    def put_tweet(
+        self, message: TweetMessage, media: Sequence[StoredMedia]
+    ) -> PutResult:
+        """Write the item unless a newer one is stored; say whether it was written.
+
+        The write goes through if there is no item, or if the stored ``fetched_at`` is
+        not later than this message's and the stored ``schema_version`` (absent on
+        legacy items) is not higher. ``fetched_at`` is an ISO 8601 UTC string with
+        second precision, so string comparison is chronological. A tie rewrites the
+        item with the same data, which keeps a redelivery idempotent. A skipped stale
+        write returns ``written=False`` with the stored values; any other DynamoDB
+        error propagates.
+        """
+        try:
+            self._table.put_item(
+                Item=self.to_item(message, media),
+                ConditionExpression=(
+                    "attribute_not_exists(tweet_id) OR ("
+                    "(attribute_not_exists(fetched_at) "
+                    "OR fetched_at <= :fetched_at) AND "
+                    "(attribute_not_exists(schema_version) "
+                    "OR schema_version <= :schema_version))"
+                ),
+                ExpressionAttributeValues={
+                    ":fetched_at": message.fetched_at,
+                    ":schema_version": message.schema_version,
+                },
+                ReturnValuesOnConditionCheckFailure="ALL_OLD",
+            )
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") == (
+                "ConditionalCheckFailedException"
+            ):
+                old = cast("dict[str, Any]", exc.response.get("Item") or {})
+                version = old.get("schema_version", {}).get("N")
+                return PutResult(
+                    written=False,
+                    stored_fetched_at=old.get("fetched_at", {}).get("S"),
+                    stored_schema_version=None if version is None else int(version),
+                )
+            raise
+        return PutResult(written=True)
 
 
 class CheckpointStore:
