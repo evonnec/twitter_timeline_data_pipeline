@@ -595,17 +595,15 @@ def estimate_item_size(value: Any) -> int:
 
 
 # How often ``put_tweet`` re-reads and retries when another write lands between its read
-# of the stored item and its put; after that the message counts as stale.
+# of the stored item and its put; after that it raises ``WriteContentionError``.
 MERGE_ATTEMPTS = 3
 # What is read from the stored item to merge from, and to guard the put with.
-_MERGE_PROJECTION = "media, fetched_at, stored_at"
+_MERGE_PROJECTION = "media, fetched_at, revision"
 
 
-def needs_previous(item: Mapping[str, Any]) -> bool:
-    """Whether ``item`` lacks something the stored item may still hold, so the stored
-    item must be read and merged before the write. Add a rule here (and in
-    ``carry_forward``) for each field a later message can lose."""
-    return any(e.get("status") == "missing" for e in item.get("media", ()))
+class WriteContentionError(RuntimeError):
+    """The Tweet item kept changing between ``put_tweet``'s read and its put. The
+    message must be retried (nothing is stored), not treated as stale."""
 
 
 def carry_forward(
@@ -613,27 +611,38 @@ def carry_forward(
 ) -> None:
     """Merge what the stored item ``previous`` knows into the new ``item``, in place.
 
-    Enrichment is merged, not replaced: a newer fetch that no longer sees a thing must
-    not erase it (and orphan its S3 objects). Media: a key the API now omits keeps its
-    stored entry (type, fields, S3 keys), unless that entry is itself ``missing``,
-    with ``missing_since`` (this fetch's time, first noted) and ``last_seen_fetched_at``
-    (the fetch that last saw it) added. A key that is present again simply replaces it.
+    This is the one place where enrichment is merged, not replaced: a newer fetch that
+    no longer sees a thing must not erase it (and orphan its S3 objects). Add a rule
+    here for each field a later message can lose.
+
+    Media: a stored entry whose key the new item has as ``missing``, or does not list
+    at all (a re-fetch without ``attachments``), is kept whole (type, fields, S3
+    keys), unless it is itself ``missing``. A kept entry gets ``missing_since`` (the
+    first fetch that lost it) and ``last_seen_fetched_at`` (the fetch that last saw
+    it). A key that is present again simply replaces its entry.
     """
-    old = {e.get("media_key"): e for e in previous.get("media") or ()}
-    for i, entry in enumerate(item.get("media", ())):
-        kept = old.get(entry["media_key"])
-        if (
-            entry.get("status") == "missing"
-            and kept
-            and kept.get("status") != "missing"
-        ):
-            item["media"][i] = {
+    media: list[dict[str, Any]] = item.setdefault("media", [])
+    index = {e["media_key"]: i for i, e in enumerate(media)}
+    for kept in previous.get("media") or ():
+        key = kept.get("media_key")
+        i = index.get(key)
+        if i is not None and media[i].get("status") != "missing":
+            continue
+        if kept.get("status") != "missing":
+            kept = {
                 **kept,
                 "missing_since": kept.get("missing_since", fetched_at),
                 "last_seen_fetched_at": kept.get(
                     "last_seen_fetched_at", previous.get("fetched_at", fetched_at)
                 ),
             }
+        if i is None:
+            index[key] = len(media)
+            media.append(kept)
+            item.setdefault("media_keys", []).append(key)
+        else:
+            media[i] = kept
+    item["media_count"] = len(media)
 
 
 class TweetStore:
@@ -770,7 +779,13 @@ class TweetStore:
         without ``note_text`` (a preview, e.g. from a fetcher that predates long posts)
         never replaces a stored long post, whatever its ``fetched_at``: the preview
         would erase the full text. A skipped write returns ``written=False`` with the
-        stored values; any other DynamoDB error propagates.
+        stored values.
+
+        The stored item is read first (consistent) and merged in by ``carry_forward``;
+        the put is conditional on its ``revision``, which every write increments (any
+        other in-place updater of the item must ``ADD revision 1`` too, as
+        ``resolve_media`` does). ``WriteContentionError`` if it keeps changing; any
+        other DynamoDB error propagates.
         """
         is_long = bool(message.tweet.note_text)
         keep_long_post = (
@@ -792,34 +807,32 @@ class TweetStore:
             }
             if not is_long:
                 values[":no"] = False
-            previous: dict[str, Any] | None = None
-            condition = base
-            guarded = needs_previous(self.to_item(message, media))
-            if guarded:
-                # Read what is stored and guard the put with what was read, so a write
-                # that lands in between is merged on the next attempt, not overwritten.
-                previous = cast(
-                    "dict[str, Any] | None",
-                    self._table.get_item(
-                        Key={"tweet_id": message.tweet.id},
-                        ConsistentRead=True,
-                        ProjectionExpression=_MERGE_PROJECTION,
-                    ).get("Item"),
-                )
-                guard = ["attribute_not_exists(tweet_id)"]
-                if previous is not None:
-                    guard = []
-                    for name in ("fetched_at", "stored_at"):
-                        if name in previous:
-                            values[f":read_{name}"] = previous[name]
-                            guard.append(f"{name} = :read_{name}")
-                        else:
-                            guard.append(f"attribute_not_exists({name})")
-                condition = f"({base}) AND ({' AND '.join(guard)})"
+            # Read what is stored, merge it in, and guard the put with its revision,
+            # so any write that lands in between (another put, or a media-retry
+            # update, which bumps the revision too) is merged on the next attempt,
+            # not overwritten.
+            previous = cast(
+                "dict[str, Any] | None",
+                self._table.get_item(
+                    Key={"tweet_id": message.tweet.id},
+                    ConsistentRead=True,
+                    ProjectionExpression=_MERGE_PROJECTION,
+                ).get("Item"),
+            )
+            read_revision = None if previous is None else previous.get("revision")
+            if previous is None:
+                guard = "attribute_not_exists(tweet_id)"
+            elif read_revision is None:
+                guard = "attribute_not_exists(revision)"
+            else:
+                values[":read_revision"] = read_revision
+                guard = "revision = :read_revision"
+            item = self.build_item(message, media, previous)
+            item["revision"] = int(read_revision or 0) + 1
             try:
                 self._table.put_item(
-                    Item=self.build_item(message, media, previous),
-                    ConditionExpression=condition,
+                    Item=item,
+                    ConditionExpression=f"({base}) AND {guard}",
                     ExpressionAttributeValues=values,
                     ReturnValuesOnConditionCheckFailure="ALL_OLD",
                 )
@@ -829,15 +842,12 @@ class TweetStore:
                 ):
                     raise
                 old = cast("dict[str, Any]", exc.response.get("Item") or {})
-                # With the guard on, a failure is either a write since the read (the
-                # stored item differs from what was read) or the base condition on
-                # the state that was read, which is a stale message.
-                if guarded and (
-                    previous is None
-                    or any(
-                        old.get(n, {}).get("S") != previous.get(n)
-                        for n in ("fetched_at", "stored_at")
-                    )
+                now = old.get("revision", {}).get("N")
+                # A failure is either a write since the read (the revision moved, or
+                # the item appeared) or the base condition on the state that was
+                # read, which is a stale message.
+                if previous is None or (None if now is None else int(now)) != (
+                    None if read_revision is None else int(read_revision)
                 ):
                     logger.info(
                         "tweet %s changed while it was merged; reading it again",
@@ -846,10 +856,9 @@ class TweetStore:
                     continue
                 return self._stale(message, old, is_long=is_long)
             return PutResult(written=True)
-        logger.warning(
-            "tweet %s kept changing under its merge: treated as stale", message.tweet.id
+        raise WriteContentionError(
+            f"tweet {message.tweet.id} changed under {MERGE_ATTEMPTS} merge attempts"
         )
-        return PutResult(written=False)
 
     @staticmethod
     def _stale(
@@ -897,7 +906,8 @@ class TweetStore:
         try:
             self._table.update_item(
                 Key={"tweet_id": tweet_id},
-                UpdateExpression=f"SET {position} = :entry",
+                # ADD revision: this write must fail a concurrent put_tweet's guard.
+                UpdateExpression=f"SET {position} = :entry ADD revision :one",
                 ConditionExpression=(
                     f"attribute_exists(tweet_id) AND {position}.media_key = :key "
                     f"AND {position}.#status = :retrying"
@@ -907,6 +917,7 @@ class TweetStore:
                     ":entry": dict(entry),
                     ":key": media_key,
                     ":retrying": "retrying",
+                    ":one": 1,
                 },
             )
         except ClientError as exc:

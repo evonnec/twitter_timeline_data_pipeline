@@ -29,6 +29,7 @@ from twitter_timeline_data_pipeline.storage import (
     StoredMedia,
     TransientMediaError,
     TweetStore,
+    WriteContentionError,
     estimated_size,
 )
 
@@ -167,7 +168,7 @@ def process_records(
         except MessageError:
             logger.exception("message %s is malformed", message_id)
             failed.append(message_id)
-        except TransientMediaError as exc:
+        except (TransientMediaError, WriteContentionError) as exc:
             logger.warning("message %s will be retried: %s", message_id, exc)
             failed.append(message_id)
         except Exception:

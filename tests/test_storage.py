@@ -50,6 +50,7 @@ from twitter_timeline_data_pipeline.storage import (
     StoredMedia,
     TransientMediaError,
     TweetStore,
+    WriteContentionError,
     _extension,
     _IterReader,
     _MediaTooLarge,
@@ -955,6 +956,9 @@ def test_put_tweet_stale_result_reports_the_stored_values(aws: Aws) -> None:
 
 def test_put_tweet_reraises_other_dynamodb_errors(aws: Aws) -> None:
     class Failing:
+        def get_item(self, **_: Any) -> dict[str, Any]:
+            return {}
+
         def put_item(self, **_: Any) -> None:
             raise ClientError(
                 {"Error": {"Code": "ProvisionedThroughputExceededException"}},
@@ -2317,10 +2321,11 @@ def test_a_write_between_the_read_and_the_put_is_merged_not_overwritten(
     assert result.written
     item = ddb_get(aws.tweets_table, tweet_id=TWEET_ID)
     assert item["fetched_at"] == NEW_FETCH
-    (entry,) = item["media"]
+    by_key = {e["media_key"]: e for e in item["media"]}
     # Merged from the re-read item (the other writer's), not the first read.
-    assert entry["s3_key"] == "k-a"
-    assert entry["last_seen_fetched_at"] == "2026-10-22T00:00:00Z"
+    assert {k: e["s3_key"] for k, e in by_key.items()} == {"3_a": "k-a", "3_b": "k-b"}
+    assert by_key["3_a"]["last_seen_fetched_at"] == "2026-10-22T00:00:00Z"
+    assert item["media_keys"] == ["3_a", "3_b"] and item["media_count"] == 2
 
 
 def test_a_first_write_racing_another_first_write_is_retried(aws: Aws) -> None:
@@ -2341,47 +2346,114 @@ def test_a_first_write_racing_another_first_write_is_retried(aws: Aws) -> None:
     assert entry["status"] == "stored"
 
 
-def test_a_tweet_that_keeps_changing_is_treated_as_stale(
-    aws: Aws, caplog: pytest.LogCaptureFixture
-) -> None:
+def test_a_tweet_that_keeps_changing_raises_a_retryable_error(aws: Aws) -> None:
     plain = TweetStore(aws.tweets_table, aws.s3, aws.bucket)
     plain.put_tweet(*photo_entry_message(OLD_FETCH, present=True))
     counter = [0]
 
     def always_another_writer() -> None:
         counter[0] += 1
-        message, stored = photo_entry_message(
-            f"2026-10-2{counter[0]}T00:00:00Z", present=True
+        plain.put_tweet(
+            *photo_entry_message(f"2026-10-2{counter[0]}T00:00:00Z", present=True)
         )
-        plain.put_tweet(message, stored)
 
     racing = TweetStore(
         racing_table(aws.tweets_table, always_another_writer, 99), aws.s3, aws.bucket
     )
 
-    with caplog.at_level(logging.WARNING):
-        result = racing.put_tweet(
-            *photo_entry_message("2026-10-28T00:00:00Z", present=False)
-        )
+    with pytest.raises(WriteContentionError):
+        racing.put_tweet(*photo_entry_message("2026-10-28T00:00:00Z", present=False))
 
-    assert not result.written
     assert counter[0] == 3  # MERGE_ATTEMPTS
-    assert any("treated as stale" in m for m in caplog.messages)
     (entry,) = ddb_get(aws.tweets_table, tweet_id=TWEET_ID)["media"]
     assert entry["status"] == "stored"
 
 
-def test_only_a_message_with_missing_keys_reads_the_stored_item(aws: Aws) -> None:
+def test_a_media_retry_result_between_the_read_and_the_put_survives(
+    aws: Aws,
+) -> None:
+    store = TweetStore(aws.tweets_table, aws.s3, aws.bucket)
+    retrying = StoredMedia(
+        media_key="3_a", type="photo", status="retrying", s3_key="media/k.jpg"
+    )
+    message, _ = photo_entry_message(OLD_FETCH, present=True)
+    store.put_tweet(message, [retrying])
+
+    def retry_lands() -> None:
+        assert store.resolve_media(
+            TWEET_ID,
+            0,
+            "3_a",
+            {"media_key": "3_a", "type": "photo", "status": "stored", "s3_key": "k2"},
+        )
+
+    racing = TweetStore(
+        racing_table(aws.tweets_table, retry_lands, 1), aws.s3, aws.bucket
+    )
+
+    assert racing.put_tweet(*photo_entry_message(NEW_FETCH, present=False)).written
+
+    (entry,) = ddb_get(aws.tweets_table, tweet_id=TWEET_ID)["media"]
+    assert (entry["status"], entry["s3_key"]) == ("stored", "k2")
+
+
+def test_every_write_bumps_the_revision(aws: Aws) -> None:
+    store = TweetStore(aws.tweets_table, aws.s3, aws.bucket)
+    message, stored = photo_entry_message(OLD_FETCH, present=True)
+
+    store.put_tweet(message, stored)
+    assert ddb_get(aws.tweets_table, tweet_id=TWEET_ID)["revision"] == 1
+    store.put_tweet(message, stored)
+    assert ddb_get(aws.tweets_table, tweet_id=TWEET_ID)["revision"] == 2
+    store.put_tweet(
+        message, [StoredMedia(media_key="3_a", type="photo", status="retrying")]
+    )
+    store.resolve_media(
+        TWEET_ID, 0, "3_a", {"media_key": "3_a", "type": "photo", "status": "stored"}
+    )
+    assert ddb_get(aws.tweets_table, tweet_id=TWEET_ID)["revision"] == 4
+
+
+def test_a_refetch_without_attachments_keeps_the_stored_media(aws: Aws) -> None:
+    store = TweetStore(aws.tweets_table, aws.s3, aws.bucket)
+    store.put_tweet(*photo_entry_message(OLD_FETCH, present=True))
+    bare = make_message(fetched_at=NEW_FETCH)  # no media_keys at all
+
+    assert store.put_tweet(bare, []).written
+
+    item = ddb_get(aws.tweets_table, tweet_id=TWEET_ID)
+    (entry,) = item["media"]
+    assert (entry["status"], entry["s3_key"], entry["alt_text"]) == (
+        "stored",
+        "media/k.jpg",
+        "a cat",
+    )
+    assert entry["missing_since"] == NEW_FETCH
+    assert item["media_keys"] == ["3_a"] and item["media_count"] == 1
+
+
+def test_a_stored_missing_entry_is_carried_as_is_when_the_key_is_unlisted(
+    aws: Aws,
+) -> None:
+    store = TweetStore(aws.tweets_table, aws.s3, aws.bucket)
+    store.put_tweet(*photo_entry_message(OLD_FETCH, present=False))
+
+    store.put_tweet(make_message(fetched_at=NEW_FETCH), [])
+
+    (entry,) = ddb_get(aws.tweets_table, tweet_id=TWEET_ID)["media"]
+    assert entry == {"media_key": "3_a", "type": "unknown", "status": "missing"}
+
+
+def test_every_put_reads_the_stored_item_first(aws: Aws) -> None:
     reads: list[str] = []
     aws.dynamodb.meta.client.meta.events.register(
         "before-call.dynamodb.GetItem", lambda **_: reads.append("get")
     )
-    store = TweetStore(aws.tweets_table, aws.s3, aws.bucket)
 
-    store.put_tweet(*photo_entry_message(OLD_FETCH, present=True))
-    assert reads == []
+    TweetStore(aws.tweets_table, aws.s3, aws.bucket).put_tweet(
+        *photo_entry_message(OLD_FETCH, present=True)
+    )
 
-    store.put_tweet(*photo_entry_message(NEW_FETCH, present=False))
     assert reads == ["get"]
 
 

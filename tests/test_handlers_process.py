@@ -44,6 +44,7 @@ from twitter_timeline_data_pipeline.storage import (
     MediaStore,
     PutResult,
     TweetStore,
+    WriteContentionError,
 )
 
 SAMPLE_EVENT = Path(__file__).parent.parent / "events" / "sqs.json"
@@ -1334,3 +1335,27 @@ def test_missing_media_keys_are_recorded_and_logged(
     ]
     assert item["media_count"] == 2
     assert any("3_gone" in m and "missing" in m for m in caplog.messages)
+
+
+def photo_cdn() -> CdnStub:
+    cdn = CdnStub()
+    cdn.serve(PHOTO_URL, b"x", "image/jpeg")
+    return cdn
+
+
+def test_write_contention_fails_the_record_for_redelivery(aws: Aws) -> None:
+    class Contended(TweetStore):
+        def put_tweet(self, *_a: Any, **_k: Any) -> PutResult:
+            raise WriteContentionError("changed under its merge")
+
+    queue = RecordingRetryQueue()
+    failed = process_records(
+        [receives(sqs_record("m1", body(photo_message(GOOD))), "5")],
+        media_store=MediaStore(aws.s3, aws.bucket, photo_cdn().client()),
+        tweet_store=Contended(aws.tweets_table, aws.s3, aws.bucket),
+        max_receive_count=5,
+        retry_queue=queue,
+    )
+
+    assert failed == ["m1"]  # not acked as stale: SQS redelivers, then the DLQ alarm
+    assert queue.sent == []
