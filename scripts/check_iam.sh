@@ -13,6 +13,10 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
+# The SAM translator fills in pseudo parameters and needs some region to do it; the
+# value doesn't affect the IAM checks. CI runners have none configured.
+export AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-us-east-1}"
+
 # CI-only tools, pinned so a new checkov release can't fail the build on its own.
 CHECKOV="checkov==3.3.30"
 TRANSLATOR="aws-sam-translator==1.115.0"
