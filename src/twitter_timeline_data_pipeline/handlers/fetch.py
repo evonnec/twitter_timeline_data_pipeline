@@ -20,7 +20,11 @@ import boto3
 
 from twitter_timeline_data_pipeline.config import ConfigError, Settings
 from twitter_timeline_data_pipeline.credentials import clear_cache, get_bearer_token
-from twitter_timeline_data_pipeline.models import TweetId, is_newer
+from twitter_timeline_data_pipeline.models import (
+    TweetId,
+    is_newer,
+    normalize_username,
+)
 from twitter_timeline_data_pipeline.storage import CheckpointStore
 from twitter_timeline_data_pipeline.x_api import AuthError, XClient
 
@@ -99,7 +103,7 @@ def run_fetch(
     stored checkpoint (the checkpoint is still advanced). Duplicates are possible after
     a failed run; with ``truncated`` set, older Tweets in the page-cap gap are skipped.
     """
-    username = username.removeprefix("@").lower()
+    username = normalize_username(username)
     user_id = x_client.get_user_id(username)
     since_id = since_id or checkpoints.get(username)
 
@@ -123,10 +127,10 @@ def run_fetch(
 
     # The client stops with a token outstanding only when it hits the page cap; a
     # trailing empty page yields nothing, so `page` is the last one with data.
-    truncated = pages == max_pages and page.next_token is not None
+    truncated = pages == max_pages and bool(page.next_token)
     if newest_id is not None and not checkpoints.advance(username, newest_id):
         logger.info(
-            "checkpoint for %s not moved: another run already stored a newer mark",
+            "checkpoint for %s not moved: the stored mark is the same or newer",
             username,
         )
     if truncated and since_id is not None:

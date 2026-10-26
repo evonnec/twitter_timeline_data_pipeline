@@ -29,4 +29,6 @@ if ((${#overrides[@]})); then
   args+=(--parameter-overrides "${overrides[@]}")
 fi
 
-sam deploy "${args[@]}" "$@"
+# ${args[@]+...} expands to nothing for an empty array; bash 3.2 (macOS) treats a
+# plain "${args[@]}" on an empty array as unbound under set -u.
+sam deploy ${args[@]+"${args[@]}"} "$@"

@@ -39,6 +39,12 @@ def is_newer(candidate: TweetId, than: TweetId | None) -> bool:
     return than is None or int(candidate) > int(than)
 
 
+def normalize_username(username: str) -> str:
+    """The form used everywhere: no leading ``@``, lower case (X handles are
+    case-insensitive), so one account always maps to one checkpoint and GSI key."""
+    return username.removeprefix("@").lower()
+
+
 def _opt_int(value: Any) -> int | None:
     return None if value is None else int(value)
 
