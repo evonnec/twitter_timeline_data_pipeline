@@ -17,12 +17,12 @@
         "1700000000000000009"
       ],
       "note_tweet": {
-        "text": "Shipping notes for the long-form post feature. Shipping notes for the long-form post feature. Shipping notes for the long-form post feature. Shipping notes for the long-form post feature. Shipping notes for the long-form post feature. Shipping notes for the long-form post feature. Shipping notes for the long-form post feature. Shipping notes for the long-form post feature. Shipping notes for the long-form post feature. Shipping notes for the long-form post feature. Shipping notes for the long-form post feature. Shipping notes for the long-form post feature. Read the whole thing at https://example.com/t/long1",
+        "text": "Shipping notes for the long-form post feature. Shipping notes for the long-form post feature. Shipping notes for the long-form post feature. Shipping notes for the long-form post feature. Shipping notes for the long-form post feature. Shipping notes for the long-form post feature. Shipping notes for the long-form post feature. Shipping notes for the long-form post feature. Shipping notes for the long-form post feature. Shipping notes for the long-form post feature. Shipping notes for the long-form post feature. Shipping notes for the long-form post feature. Read the whole thing at https://t.co/FakeLong1",
         "entities": {
           "urls": [
             {
               "start": 588,
-              "end": 615,
+              "end": 610,
               "url": "https://t.co/FakeLong1",
               "expanded_url": "https://example.com/t/long1",
               "display_url": "example.com/t/long1"

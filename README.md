@@ -55,7 +55,6 @@ One message per Tweet. The body is compact, ASCII-escaped JSON (so odd character
   "tweet": {
     "id": "1850000000000000001",
     "text": "Launch day. https://t.co/abc",
-    "note_text": null,
     "created_at": "2024-10-25T14:30:00.000Z",
     "author_id": "11348282",
     "conversation_id": "1850000000000000001",
@@ -68,7 +67,8 @@ One message per Tweet. The body is compact, ASCII-escaped JSON (so odd character
       "quote_count": 1
     },
     "edit_history_tweet_ids": ["1850000000000000001"],
-    "media_keys": ["3_1850000000000000002"]
+    "media_keys": ["3_1850000000000000002"],
+    "note_text": null
   },
   "media": [
     {
@@ -90,11 +90,13 @@ One message per Tweet. The body is compact, ASCII-escaped JSON (so odd character
 
 You can regenerate it with `TweetMessage(...).to_json()` from `twitter_timeline_data_pipeline.models`.
 
-**Long posts.** For a post over 280 characters the API's `text` is only a truncated preview; the full body is in `note_tweet.text`, which the fetch Lambda requests. It travels as `tweet.note_text` (`null` for a short post). Entities of the long text are not collected.
+**Long posts.** For a post over 280 characters the API's `text` is only a truncated preview; the full body is in `note_tweet.text`, which the fetch Lambda requests. It travels as `tweet.note_text` (`null` for a short post, and absent from messages queued by the old fetch Lambda). Entities of the long text are not collected.
 
 **Compatibility.** `note_text` is an additive, optional field, so `schema_version` stays 1. A reader builds a Tweet from explicit keys and ignores unknown ones, so a processor from before this field still parses a new message (and stores the preview), and a new processor reading an old message gets `note_text = null`. The version only changes for a change a reader cannot ignore.
 
-**Size guard.** The fetch Lambda checks each body against 256 KiB, the SQS default message size limit (queues can be configured for more; 256 KiB is the conservative choice). A body over the limit is logged at ERROR with the Tweet ID and size, skipped without stopping the run, and counted as `oversized` in the run summary. The largest possible post (25,000 weighted characters: 12,500 emoji or 12,500 CJK characters) is about 150 KB or 75 KB once ASCII-escaped, so this should only trigger on a malformed payload.
+**Size.** Each Tweet is one message, encoded as UTF-8. Only the characters SQS rejects or UTF-8 cannot encode (lone surrogates, U+FFFE, U+FFFF) are escaped, because escaping every non-ASCII character made emoji three to six times larger. The queues' `MaximumMessageSize` is 1 MiB (SQS's maximum; the dead-letter queue matches so redriven messages fit), and the fetch Lambda also groups messages so one `SendMessageBatch` call stays under 1 MiB in total. The worst case measured is about 363 KB: a 25,000-weighted-character post (12,500 emoji, skin-tone emoji, family emoji, tag flags or CJK characters) with four photos whose alt text is 1,000 characters each. The DynamoDB item for that post stays under DynamoDB's 400 KB item limit. A body over the limit stops the run with `MessageTooLargeError` instead of dropping data: the checkpoint is not advanced and the Lambda's Errors alarm fires.
+
+**Field name.** X's docs and OpenAPI spec show a `post.fields` / `note_post` rename in progress. `Tweet.from_api` reads `note_tweet` and falls back to `note_post`, but the request still asks for `note_tweet`: run a smoke test with a real token before deploying to confirm long posts come back with their full text.
 
 ### Tweets table (`TweetsTable`)
 
@@ -104,7 +106,7 @@ You can regenerate it with `TweetMessage(...).to_json()` from `twitter_timeline_
 | GSI `username-created_at-index` | partition `username` (S), sort `created_at` (S), projects `text`, `media_count` and `public_metrics` only |
 | Billing | on demand; point-in-time recovery and encryption on |
 
-`created_at` is stored as the API's ISO 8601 string, which sorts chronologically. The index projects `INCLUDE` rather than `ALL`: that roughly halves its write units and storage per Tweet. The trade-off is that a listing returns only those three attributes plus the keys, so read anything else (`media`, `referenced_tweets`, ...) with `GetItem` on `tweet_id`. Attributes written by `TweetStore.to_item` (attributes whose value is `None` are omitted):
+`created_at` is stored as the API's ISO 8601 string, which sorts chronologically. The index projects `INCLUDE` rather than `ALL`: that roughly halves its write units and storage per Tweet. The trade-off is that a listing returns only those three attributes plus the keys, so read anything else (`media`, `referenced_tweets`, ...) with `GetItem` on `tweet_id`. The projected `text` is the full text for a long post (the preview is `display_text`, which the index does not project), so an index entry can be large. Attributes written by `TweetStore.to_item` (attributes whose value is `None` are omitted):
 
 | Attribute | Type | Notes |
 | --- | --- | --- |
@@ -113,7 +115,7 @@ You can regenerate it with `TweetMessage(...).to_json()` from `twitter_timeline_
 | `author_id` | S | |
 | `text` | S | The full text; for a long post, `note_tweet.text` |
 | `display_text` | S | Only for a long post: the API's truncated preview |
-| `is_long_post` | BOOL | `true` when the post has a `note_tweet`, else `false` |
+| `is_long_post` | BOOL | `true` when the post has a `note_tweet`, else `false`. Absent on items written before this field existed, and `false` for messages queued by the old fetch Lambda |
 | `created_at` | S | ISO 8601 |
 | `conversation_id` | S | |
 | `lang` | S | |

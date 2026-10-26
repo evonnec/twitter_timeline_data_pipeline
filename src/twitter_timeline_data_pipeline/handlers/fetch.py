@@ -37,13 +37,20 @@ logger = logging.getLogger(__name__)
 SQS_BATCH_SIZE = 10  # SendMessageBatch limit
 SEND_RETRIES = 2  # extra attempts for entries SQS reports as Failed
 RETRY_BACKOFF_SECONDS = 0.5
-# SQS's default message size limit. Larger queue limits exist (up to 1 MiB), but
-# 256 KiB is the conservative default and what the template's queue gets.
-SQS_MAX_MESSAGE_BYTES = 256 * 1024
+# SQS's maximum for one message and for the total of one SendMessageBatch call (1 MiB).
+# The queues' MaximumMessageSize in template.yaml must equal it. The DynamoDB item
+# holds the same text as UTF-8, so a body under this limit stays under its 400 KB item
+# limit (checked in the tests); re-check that if the limit or the item layout changes.
+SQS_MAX_MESSAGE_BYTES = 1_048_576
 
 
 class EnqueueError(RuntimeError):
     """Some messages could not be sent to SQS even after retries."""
+
+
+class MessageTooLargeError(EnqueueError):
+    """A Tweet's message body is over the SQS limit. Nothing is dropped: the run fails
+    (checkpoint unmoved, alarm fires) so the data can be handled deliberately."""
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -57,8 +64,6 @@ class FetchResult:
     enqueued: int
     truncated: bool
     """The page cap cut the run short: the last page still had a ``next_token``."""
-    oversized: int = 0
-    """Tweets skipped because their message body exceeded ``SQS_MAX_MESSAGE_BYTES``."""
 
 
 def _send_batch(
@@ -89,25 +94,19 @@ def _send_batch(
     raise EnqueueError(f"{len(pending)} messages still failing after retries")
 
 
-def _fit_bodies(messages: Sequence[TweetMessage]) -> tuple[list[str], int]:
-    """The JSON bodies that fit an SQS message, and how many Tweets were skipped.
-
-    One oversized body must not stall the timeline, so it is logged and dropped.
-    """
+def _encode(messages: Sequence[TweetMessage]) -> list[str]:
+    """The JSON bodies, or ``MessageTooLargeError`` if any exceeds the SQS limit."""
     bodies = []
     for message in messages:
         body = message.to_json()
         size = len(body.encode())
         if size > SQS_MAX_MESSAGE_BYTES:
-            logger.error(
-                "tweet %s skipped: message body is %d bytes, over the %d byte limit",
-                message.tweet.id,
-                size,
-                SQS_MAX_MESSAGE_BYTES,
+            raise MessageTooLargeError(
+                f"tweet {message.tweet.id}: message body is {size} bytes, over the "
+                f"{SQS_MAX_MESSAGE_BYTES} byte SQS limit"
             )
-            continue
         bodies.append(body)
-    return bodies, len(messages) - len(bodies)
+    return bodies
 
 
 def _chunk_bodies(bodies: Sequence[str]) -> Iterator[list[str]]:
@@ -152,7 +151,7 @@ def run_fetch(
     user_id = x_client.get_user_id(username)
     since_id = since_id or checkpoints.get(username)
 
-    pages = tweets = enqueued = oversized = 0
+    pages = tweets = enqueued = 0
     newest_id: TweetId | None = None
     oldest_id: TweetId | None = None
     for page in x_client.iter_timeline(
@@ -161,9 +160,7 @@ def run_fetch(
         pages += 1
         messages = page.messages(username)
         tweets += len(messages)
-        bodies, skipped = _fit_bodies(messages)
-        oversized += skipped
-        for chunk in _chunk_bodies(bodies):
+        for chunk in _chunk_bodies(_encode(messages)):
             _send_batch(sqs, queue_url, chunk, sleep)
             enqueued += len(chunk)
         for tweet in page.tweets:
@@ -197,7 +194,6 @@ def run_fetch(
         tweets=tweets,
         enqueued=enqueued,
         truncated=truncated,
-        oversized=oversized,
     )
 
 

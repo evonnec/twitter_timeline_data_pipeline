@@ -162,6 +162,8 @@ Resources:
     Type: AWS::SQS::Queue
     Properties:
       MessageRetentionPeriod: 1209600  # 14 days
+      # Matches SQS_MAX_MESSAGE_BYTES; the DLQ must take whatever the main queue does.
+      MaximumMessageSize: 1048576
       SqsManagedSseEnabled: true
       RedriveAllowPolicy:
         redrivePermission: byQueue
@@ -177,6 +179,7 @@ Resources:
       # 6 x ProcessFunction timeout (120 s) + its 10 s batching window, per AWS guidance
       # for SQS event sources.
       VisibilityTimeout: 730
+      MaximumMessageSize: 1048576  # matches SQS_MAX_MESSAGE_BYTES
       RedrivePolicy:
         deadLetterTargetArn: !GetAtt TweetsDeadLetterQueue.Arn
         maxReceiveCount: 5

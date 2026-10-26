@@ -398,7 +398,6 @@ def test_fetch_enqueues_and_checkpoints_against_aws(
         "tweets": 7,
         "enqueued": 7,
         "truncated": False,
-        "oversized": 0,
     }
     attrs = pipeline_env.sqs.get_queue_attributes(
         QueueUrl=pipeline_env.queue_url, AttributeNames=["ApproximateNumberOfMessages"]

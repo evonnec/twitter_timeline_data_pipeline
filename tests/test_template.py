@@ -349,3 +349,12 @@ def test_process_function_can_abort_multipart_uploads(template: Template) -> Non
     actions = {a for s in statements for a in _as_list(s["Action"])}
 
     assert "s3:AbortMultipartUpload" in actions
+
+
+@pytest.mark.parametrize("name", ["TweetsQueue", "TweetsDeadLetterQueue"])
+def test_queues_accept_messages_up_to_the_size_the_fetch_guard_allows(
+    template: Template, name: str
+) -> None:
+    from twitter_timeline_data_pipeline.handlers.fetch import SQS_MAX_MESSAGE_BYTES
+
+    assert properties(template, name)["MaximumMessageSize"] == SQS_MAX_MESSAGE_BYTES
