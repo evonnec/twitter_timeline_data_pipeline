@@ -8,6 +8,7 @@ from typing import Self
 DEFAULT_X_API_BASE_URL = "https://api.x.com/2"
 DEFAULT_MAX_MEDIA_BYTES = 512 * 1024 * 1024
 DEFAULT_USER_ID_TTL_HOURS = 24.0
+MAX_USER_ID_TTL_HOURS = 8760.0  # one year
 
 # Settings attribute -> environment variable, also used in error messages.
 ENV_VARS: Mapping[str, str] = {
@@ -74,10 +75,10 @@ class Settings:
             raise ConfigError(
                 f"{ENV_VARS['max_pages']} must be >= 1, got {self.max_pages}"
             )
-        if self.user_id_ttl_hours < 0:
+        if not 0 <= self.user_id_ttl_hours <= MAX_USER_ID_TTL_HOURS:
             raise ConfigError(
-                f"{ENV_VARS['user_id_ttl_hours']} must be >= 0, "
-                f"got {self.user_id_ttl_hours}"
+                f"{ENV_VARS['user_id_ttl_hours']} must be "
+                f"0..{MAX_USER_ID_TTL_HOURS:g}, got {self.user_id_ttl_hours}"
             )
         if self.http_timeout <= 0:
             raise ConfigError(

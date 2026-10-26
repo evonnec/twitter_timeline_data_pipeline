@@ -196,7 +196,11 @@ def test_a_gap_beyond_the_apis_window_is_dropped_after_three_runs_over_a_day(
         results.append(run(aws, timeline, FakeSqs(), now=at(24)))
 
     assert [r.gaps_open for r in results] == [1, 1, 1, 0]
-    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    warnings = [
+        r
+        for r in caplog.records
+        if r.levelno == logging.WARNING and "binding handle" not in r.getMessage()
+    ]
     assert [r.getMessage() for r in warnings] == [
         f"dropping gap for {USERNAME} (since_id=5, until_id=30): out of the API's "
         f"reach (empty 3 runs since {iso(0)})"
@@ -383,7 +387,9 @@ def test_a_gap_that_ends_with_a_trailing_token_warns_about_nothing(
     assert not [
         r
         for r in caplog.records
-        if r.name == fetch.logger.name and r.levelno >= logging.WARNING
+        if r.name == fetch.logger.name
+        and r.levelno >= logging.WARNING
+        and "binding handle" not in r.getMessage()
     ]
 
 

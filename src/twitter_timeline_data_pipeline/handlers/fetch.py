@@ -65,10 +65,15 @@ class IdentityChangedError(RuntimeError):
 
 
 IDENTITY_CHANGED_MESSAGE = (
-    "identity changed for handle %s: stored user_id %s, now %s; nothing ingested"
+    "identity changed for handle %s: %s user_id %s, now %s; nothing ingested"
 )
 """Stable, greppable text of the ERROR logged on an identity change (a CloudWatch
 metric filter can match on it)."""
+
+FIRST_BINDING_MESSAGE = "binding handle %s to user_id %s (no user ID was stored)"
+"""Stable, greppable text of the WARNING logged when a handle is first tied to an ID
+(a new account, a legacy item, or an operator-cleared ``user_id``): the one moment a
+takeover could not be told from the account itself."""
 
 DEFAULT_USER_ID_TTL = timedelta(hours=24)
 
@@ -491,13 +496,15 @@ def _anchored(backfill: Gap | None, newest_id: TweetId | None) -> Gap | None:
     return replace(backfill, until_id=str(until))
 
 
-def _check_identity(username: str, stored: str | None, found: str) -> None:
-    """Raise ``IdentityChangedError`` if ``found`` differs from a stored user ID."""
-    if stored is not None and stored != found:
-        logger.error(IDENTITY_CHANGED_MESSAGE, username, stored, found)
+def _check_identity(
+    username: str, expected: str | None, found: str, source: str = "stored"
+) -> None:
+    """Raise ``IdentityChangedError`` if ``found`` differs from the ``expected`` user
+    ID (``source`` says where that came from: the state item or the event)."""
+    if expected is not None and expected != found:
+        logger.error(IDENTITY_CHANGED_MESSAGE, username, source, expected, found)
         raise IdentityChangedError(
-            f"identity changed for handle {username}: stored user_id {stored}, "
-            f"now {found}"
+            IDENTITY_CHANGED_MESSAGE % (username, source, expected, found)
         )
 
 
@@ -506,8 +513,13 @@ def _is_fresh(state: CheckpointState, moment: datetime, ttl: timedelta) -> bool:
     the future does not count)."""
     if state.user_id is None or state.user_id_resolved_at is None:
         return False
-    age = moment - datetime.fromisoformat(state.user_id_resolved_at)
-    return timedelta(0) <= age < ttl
+    try:
+        resolved = datetime.fromisoformat(state.user_id_resolved_at)
+    except ValueError:
+        return False  # unreadable: look it up again
+    if resolved.tzinfo is None:
+        return False
+    return timedelta(0) <= moment - resolved < ttl
 
 
 def run_fetch(
@@ -540,8 +552,10 @@ def run_fetch(
 
     The user ID is stored with the state and reused for ``user_id_ttl``; it is looked
     up again when missing, expired, or when the timeline reports the user not found.
-    ``user_id`` (e.g. from the event) skips the lookup. Whenever the ID found differs
-    from the stored one, ``IdentityChangedError`` is raised before anything is
+    ``user_id`` (e.g. from the event) is an assertion, not a source: it must equal the
+    stored ID, and when nothing is stored the handle is looked up and must resolve to
+    it. Only a lookup sets ``user_id_resolved_at``. Whenever the ID found differs from
+    the stored or asserted one, ``IdentityChangedError`` is raised before anything is
     ingested or saved.
     """
     username = normalize_username(username)
@@ -549,14 +563,18 @@ def run_fetch(
     moment = now()
     resolved_at = _iso(moment)
     cached = False
-    if user_id is not None:
-        _check_identity(username, state.user_id, user_id)
-    elif _is_fresh(state, moment, user_id_ttl):
+    asserted = user_id
+    if asserted is not None:
+        _check_identity(username, state.user_id, asserted)  # stored vs the event
+    if _is_fresh(state, moment, user_id_ttl):
         assert state.user_id is not None and state.user_id_resolved_at is not None
         user_id, resolved_at, cached = state.user_id, state.user_id_resolved_at, True
     else:
         user_id = x_client.get_user_id(username)
         _check_identity(username, state.user_id, user_id)
+        _check_identity(username, asserted, user_id, "event")
+        if state.user_id is None:
+            logger.warning(FIRST_BINDING_MESSAGE, username, user_id)
     run = _Run(
         username=username,
         user_id=user_id,

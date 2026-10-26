@@ -29,6 +29,7 @@ Parameters:
     Type: Number
     Default: 24
     MinValue: 0
+    MaxValue: 8760
     Description: Hours a resolved user ID is reused before the handle is looked up again (0 looks it up on every run).
   MaxResults:
     Type: Number

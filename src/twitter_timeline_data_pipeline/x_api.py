@@ -341,7 +341,12 @@ def _first_error_text(body: Mapping[str, Any]) -> str | None:
 def _is_not_found(errors: Any) -> bool:
     """Whether the first entry of an ``errors`` array is a resource-not-found."""
     first = errors[0] if isinstance(errors, list) and errors else None
-    return isinstance(first, Mapping) and first.get("title") == "Not Found Error"
+    return (
+        isinstance(first, Mapping)
+        and first.get("title") == "Not Found Error"
+        and first.get("resource_type") == "user"
+        and first.get("parameter") == "id"
+    )
 
 
 def _describe(info: Mapping[str, Any]) -> str | None:

@@ -1,5 +1,7 @@
 """What the X API can answer that the fetch function must not misread."""
 
+import logging
+
 import pytest
 
 from system.checks import assert_quiet, assert_stored
@@ -11,6 +13,7 @@ OTHER_USER_ID = "2000000002"
 
 def test_handle_taken_over_by_another_account_is_not_ingested(
     make_sim: MakeSim,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """The account renames itself and another account registers the old handle and
     posts. (Snowflake IDs are global, so its posts are newer than the checkpoint.)
@@ -27,14 +30,27 @@ def test_handle_taken_over_by_another_account_is_not_ingested(
     x.add_user(user, OTHER_USER_ID)
     for _ in range(2):
         x.post(user)
+    # The original account posts again under its new handle (its ID is still
+    # USER_ID); the new owner of the old handle posts too.
+    mine.append(x.post(f"{user}_renamed"))
+
+    (inside,) = sim.run(1)  # within the TTL: the cached ID reads the original account
+
+    assert inside.outcome == "ok"
+    assert_stored(sim, mine)
 
     sim.advance(25 * 3600)  # past the 24 h user-ID TTL
 
-    (run,) = sim.run(1)
+    with caplog.at_level(logging.ERROR):
+        (run,) = sim.run(1)
 
+    assert run.outcome == "error"
+    assert (
+        f"identity changed for handle {user.lower()}: stored user_id {USER_ID}"
+        in caplog.text
+    )
     assert_stored(sim, mine)
     assert {i["author_id"] for i in sim.tweets().values()} == {USER_ID}
-    assert run.outcome == "error"
 
 
 def test_errors_only_timeline_fails_the_run(make_sim: MakeSim) -> None:

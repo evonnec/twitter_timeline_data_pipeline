@@ -12,6 +12,7 @@ from helpers import FakeSqs, x_client
 from twitter_timeline_data_pipeline.cli import main
 from twitter_timeline_data_pipeline.handlers import fetch
 from twitter_timeline_data_pipeline.handlers.fetch import (
+    FIRST_BINDING_MESSAGE,
     IDENTITY_CHANGED_MESSAGE,
     FetchResult,
     IdentityChangedError,
@@ -29,6 +30,14 @@ T0 = datetime(2026, 10, 1, 12, 0, tzinfo=UTC)
 TTL = timedelta(hours=24)
 
 
+NOT_FOUND = {
+    "title": "Not Found Error",
+    "detail": "gone",
+    "resource_type": "user",
+    "parameter": "id",
+}
+
+
 class Api:
     """Counts user lookups and timeline calls; ``owner`` is who the handle resolves to.
 
@@ -40,6 +49,7 @@ class Api:
         self.owner = owner
         self.timelines = {OLD_ID, NEW_ID}
         self.lookups = 0
+        self.empty = False
         self.timeline_calls: list[str] = []
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
@@ -52,8 +62,10 @@ class Api:
         if user_id not in self.timelines:
             return httpx.Response(
                 200,
-                json={"errors": [{"title": "Not Found Error", "detail": "gone"}]},
+                json={"errors": [NOT_FOUND]},
             )
+        if self.empty:
+            return httpx.Response(200, json={"meta": {"result_count": 0}})
         body: dict[str, Any] = {
             "data": [{"id": "500", "text": "hi", "author_id": user_id}],
             "meta": {"result_count": 1},
@@ -178,8 +190,8 @@ def test_a_different_id_raises_enqueues_nothing_and_leaves_the_state_alone(
     assert sqs.calls == []
     assert api.timeline_calls == []
     assert stored(aws) == before
-    assert [r.getMessage() for r in caplog.records] == [
-        IDENTITY_CHANGED_MESSAGE % (USERNAME, OLD_ID, NEW_ID)
+    assert [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR] == [
+        IDENTITY_CHANGED_MESSAGE % (USERNAME, "stored", OLD_ID, NEW_ID)
     ]
     assert "identity changed for handle example_user" in caplog.text
 
@@ -224,15 +236,27 @@ def test_a_freshly_looked_up_id_that_is_not_found_is_not_looked_up_twice(
     assert api.lookups == 1
 
 
-def test_an_event_user_id_skips_the_lookup_and_is_stored(aws: Aws) -> None:
-    api, clock = Api(), Clock()
+def test_an_event_user_id_is_checked_against_a_lookup_when_nothing_is_stored(
+    aws: Aws, caplog: pytest.LogCaptureFixture
+) -> None:
+    api, clock = Api(owner=OLD_ID), Clock()
+    sqs = FakeSqs()
 
-    result = go(aws, api, clock, user_id=NEW_ID)
+    with pytest.raises(
+        IdentityChangedError, match=f"event user_id {NEW_ID}, now {OLD_ID}"
+    ):
+        go(aws, api, clock, sqs, user_id=NEW_ID)  # the handle belongs to OLD_ID
 
-    assert api.lookups == 0
-    assert result.user_id == NEW_ID
-    assert api.timeline_calls == [NEW_ID]
-    assert stored(aws).user_id == NEW_ID
+    assert api.lookups == 1
+    assert api.timeline_calls == [] and sqs.calls == []
+    assert stored(aws) == CheckpointState()
+
+    with caplog.at_level(logging.WARNING):
+        result = go(aws, api, clock, user_id=OLD_ID)
+
+    assert result.user_id == OLD_ID
+    assert stored(aws).user_id_resolved_at == "2026-10-01T12:00:00Z"
+    assert FIRST_BINDING_MESSAGE % (USERNAME, OLD_ID) in caplog.text
 
 
 def test_an_event_user_id_that_differs_from_the_stored_one_raises(aws: Aws) -> None:
@@ -291,6 +315,7 @@ def test_a_zero_ttl_looks_up_every_run(aws: Aws) -> None:
 
 def test_a_state_conflict_while_storing_the_id_stops_the_run(aws: Aws) -> None:
     api, clock = Api(), Clock()
+    api.empty = True  # no page commit: storing the ID is the run's only save
     store = CheckpointStore(aws.state_table)
 
     def raced(*args: Any, **kwargs: Any) -> bool:
@@ -309,6 +334,7 @@ def test_a_state_conflict_while_storing_the_id_stops_the_run(aws: Aws) -> None:
             now=clock,
         )
     assert result.stopped_reason == "state_conflict"
+    assert stored(aws) == CheckpointState()
 
 
 @pytest.mark.parametrize(
@@ -402,3 +428,34 @@ def test_cli_reports_an_identity_change_as_a_failure(
     assert main(["fetch", "--username", USERNAME]) == 1
 
     assert "identity changed for handle" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("resolved_at", ["garbage", "2026-10-01T12:00:00"])
+def test_an_unreadable_or_naive_timestamp_counts_as_expired(
+    aws: Aws, resolved_at: str
+) -> None:
+    api, clock = Api(), Clock()
+    go(aws, api, clock)
+    aws.state_table.update_item(
+        Key={"username": USERNAME},
+        UpdateExpression="SET user_id_resolved_at = :t",
+        ExpressionAttributeValues={":t": resolved_at},
+    )
+
+    go(aws, api, clock)
+
+    assert api.lookups == 2
+    assert stored(aws).user_id_resolved_at == "2026-10-01T12:00:00Z"
+
+
+def test_a_cleared_user_id_is_rebound_with_a_warning(
+    aws: Aws, caplog: pytest.LogCaptureFixture
+) -> None:
+    aws.state_table.put_item(
+        Item={"username": USERNAME, "newest_id": 400, "version": 3}
+    )
+
+    with caplog.at_level(logging.WARNING):
+        go(aws, Api(), Clock())
+
+    assert FIRST_BINDING_MESSAGE % (USERNAME, OLD_ID) in caplog.text

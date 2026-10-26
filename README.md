@@ -176,8 +176,8 @@ One item per account: partition key `username` (S, lower case) and
 | --- | --- | --- |
 | `newest_id` | N | Highest Tweet ID reached by the new-Tweets phase (a gap page can enqueue a higher one, which is re-fetched later). Never decreases. Absent until the first Tweet. |
 | `gaps` | L of M | Exclusive ID ranges known to be unfetched, each `{until_id, since_id, empty_runs, first_empty_at}` (N; `empty_runs` and the ISO-8601 UTC `first_empty_at` only when `empty_runs` is above 0). A missing `since_id` means "down to the end of what the API serves" (about the 3,200 most recent posts); a missing `until_id` means "up from the newest Tweet". |
-| `user_id` | S | Numeric user ID the handle resolved to. Absent on items written before this existed (the next run looks the handle up and stores it). |
-| `user_id_resolved_at` | S | ISO-8601 UTC time (`...Z`) the ID was last confirmed by a lookup. The ID is reused until it is `USER_ID_TTL_HOURS` old, then looked up again (and this time refreshed if unchanged). |
+| `user_id` | S | Numeric user ID the handle resolved to. Absent on items written before this existed (the next run looks the handle up, logs the binding and stores it). |
+| `user_id_resolved_at` | S | ISO-8601 UTC time (`...Z`) the ID was last confirmed by a lookup (only a lookup sets it; an unreadable or timezone-less value counts as expired). The ID is reused until it is `USER_ID_TTL_HOURS` old, then looked up again (and this time refreshed if unchanged). |
 | `version` | N | Optimistic lock, incremented on every write. |
 | `updated_at` | S | UTC timestamp of the last write. |
 
@@ -189,14 +189,29 @@ Every write is conditional on the `version` that run read (a missing `version` c
 
 #### Identity changes
 
-The checkpoint belongs to the account, not just the handle. If the account renames and someone else registers the old handle, the lookup returns a different user ID. Whenever a lookup (or the `user_id` in the fetch event) differs from the stored `user_id`, the run raises `IdentityChangedError`: nothing is ingested, the state item is left untouched, and the invocation fails (so the `Errors` alarm fires). It logs at ERROR, stable text for a metric filter to match: `identity changed for handle <handle>: stored user_id <old>, now <new>; nothing ingested`. A timeline response of "user not found" for a stored ID also triggers a fresh lookup, with the same check.
+The checkpoint belongs to the account, not just the handle. If the account renames and someone else registers the old handle, a lookup returns a different user ID. Whenever a lookup (or the `user_id` in the fetch event) differs from the stored `user_id`, the run raises `IdentityChangedError` and the invocation fails (so the `Errors` alarm fires). It logs at ERROR, stable text for a metric filter to match: `identity changed for handle <handle>: stored user_id <old>, now <new>; nothing ingested`. The lookup happens when the stored ID is missing or older than `USER_ID_TTL_HOURS`, so a takeover is caught at the next expiry (up to 24 h by default); until then the cached ID keeps reading the original account, never the new owner. A timeline response of "user not found" for a cached ID also triggers a fresh lookup with the same check. No Tweet of the new owner is ever enqueued. On a lookup-time change nothing is enqueued and the state is untouched. On the cached-ID not-found path, pages enqueued earlier in that run stay enqueued and a backfill requested by the event has already been saved; nothing is lost or attributed to the wrong account. A CloudWatch metric and alarm on that log text is planned (#19); until then the failed invocation is the signal.
 
-To resolve it, decide which account you want:
+The first time a handle is tied to an ID (a new account, an item from before `user_id` existed, or one whose `user_id` was removed) the run logs a WARNING, `binding handle <handle> to user_id <id> (no user ID was stored)`. That is the one moment a takeover could not be told apart from the account itself, so check it is the account you mean.
 
-- You still want the original account: it has a new handle now. Delete the state item as below (or fetch under the new handle, which has its own cursor) and run with the new handle; the stored Tweets stay. Re-pointing the old handle's state at the original ID would mix its cursor with a different handle.
-- You deliberately want the new account under this handle: delete the state item (`aws dynamodb delete-item --table-name <StateTable> --key '{"username": {"S": "<handle>"}}'`, which restarts that handle's cursor from scratch) or set `user_id` on it to the new ID with `update-item`.
+**Runbook after an identity change (or when the old handle is freed).** The schedule carries no input, so every run keeps using `TwitterUsername`. The old handle's state item is what catches the takeover: never delete it or its `user_id`, or the next run binds the handle to its new owner and ingests that person's posts.
 
-The event may carry `"user_id": "<numeric id>"` to skip the lookup; it is checked against the stored ID the same way. The CLI `--dry-run` has no state table and resolves the handle on every call.
+1. Stop the bleeding first: either set `TwitterUsername` to the account's new handle and redeploy, or disable the schedule (`ScheduleState=false`).
+2. Optionally carry the cursor over so the new handle does not refetch everything. Read the old item, then write a new item under the new handle (lower case) with the same `newest_id`, `gaps` and `user_id` (set `user_id_resolved_at` to now, `version` to 1):
+
+   ```bash
+   aws dynamodb get-item --table-name "$STATE_TABLE" --consistent-read \
+     --key '{"username": {"S": "<old handle>"}}'
+   aws dynamodb put-item --table-name "$STATE_TABLE" --item '{
+     "username": {"S": "<new handle>"}, "user_id": {"S": "<original id>"},
+     "user_id_resolved_at": {"S": "<now, e.g. 2026-10-01T12:00:00Z>"},
+     "newest_id": {"N": "<newest_id>"}, "gaps": {"L": []}, "version": {"N": "1"}}'
+   ```
+
+   Copy `gaps` as read (or `[]` to drop them). Without this step the new handle starts from scratch and fetches the account's most recent ~3,200 posts, as a first run does. Stored Tweets are not affected either way.
+3. If the old handle is simply freed (nobody took it), runs after the TTL expires fail with a not-found error until you do step 1; the cached ID is used until then.
+4. If you really want the handle's new owner under the old handle, that is a new account for this pipeline: use a different state table or the new-handle approach above, not the old item.
+
+The event may carry `"user_id": "<numeric id>"` as an assertion: it must equal the stored ID, and when none is stored the handle is looked up and must resolve to it (otherwise `IdentityChangedError`). It never replaces a lookup, so it cannot bind a handle to an ID the handle does not have. The CLI `--dry-run` has no state table and resolves the handle on every call.
 
 ### S3 media bucket
 
@@ -337,7 +352,7 @@ Other options: `--max-pages`, `--max-results` (5 to 100), `--since-id` and `--lo
 | `MEDIA_BUCKET` | process, media-retry | none | Name of the media bucket |
 | `MAX_RESULTS` | fetch | `100` | Tweets per API page, 5 to 100 |
 | `MAX_PAGES` | fetch | `5` | Maximum pages per run, at least 1 |
-| `USER_ID_TTL_HOURS` | fetch | `24` | Hours a stored user ID is reused before the handle is looked up again; 0 looks it up on every run. Set from the `UserIdTtlHours` parameter |
+| `USER_ID_TTL_HOURS` | fetch | `24` | Hours a stored user ID is reused before the handle is looked up again; 0 looks it up on every run, at most 8760. Set from the `UserIdTtlHours` parameter |
 | `X_API_BASE_URL` | fetch | `https://api.x.com/2` | API base URL, for testing against a stub |
 | `HTTP_TIMEOUT_SECONDS` | both | `10` | Timeout for API and media HTTP requests, must be above 0 |
 | `MAX_MEDIA_BYTES` | process, media-retry | `536870912` (512 MiB) | Largest media file stored, must be above 0 |
