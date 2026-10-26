@@ -54,7 +54,12 @@ def without_redactions(page: TimelinePage, redactions: tuple[str, ...]) -> Timel
     dropped = {key for t in page.tweets if t.id in gone for key in t.media_keys}
     media = {k: m for k, m in page.media.items() if k in used or k not in dropped}
     quarantined = tuple(q for q in page.quarantined if q.tweet_id not in gone)
-    return replace(page, tweets=kept, media=media, quarantined=quarantined)
+    # A redacted Tweet quoted by another is no longer an included copy either: the
+    # reference then reads as unavailable, never as the deleted content.
+    included = {i: p for i, p in page.included.items() if i not in gone}
+    return replace(
+        page, tweets=kept, media=media, quarantined=quarantined, included=included
+    )
 
 
 def messages_from_raw(

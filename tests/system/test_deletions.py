@@ -65,6 +65,7 @@ def test_deleted_post_is_tombstoned_then_removed_with_all_its_objects(
             "deleted_at",
             "deletion_reason",
             "purged_at",
+            "revision",
         }
     assert set(sim.objects()) == set(media_keys(sim, keep.id))
     assert invocation.result is not None

@@ -88,15 +88,18 @@ Parameters:
       source are still propagated.
   ComplianceSchedule:
     Type: String
-    Default: rate(1 day)
+    Default: rate(6 hours)
     Description: EventBridge schedule expression for the deletion-compliance run.
   ComplianceMaxLookups:
     Type: Number
     Default: 1000
     MinValue: 1
     Description: >-
-      Most stored Tweet IDs one compliance run checks against the X API (100 per
-      request). The run resumes where the last stopped and wraps around.
+      Most Tweet IDs one compliance run checks against the X API (100 per request):
+      the account's stored Tweets and the posts they quote, reply to or retweet.
+      Up to half goes to the posts the stored items hold copies of (at least 6 is
+      needed for that); the rest to the stored Tweets. Both walks resume where the
+      last run stopped and wrap around.
   DeletionGraceHours:
     Type: Number
     Default: 24
@@ -525,7 +528,10 @@ Resources:
               Action: dynamodb:Query
               Resource: !Sub "${TweetsTable.Arn}/index/*"
             - Effect: Allow
-              Action: [dynamodb:GetItem, dynamodb:UpdateItem, dynamodb:DeleteItem]
+              # Scan: the references walk reads the items' referenced_tweets in bounded
+              # pages. UpdateItem does every write (tombstone, copy scrub, purge), so
+              # the function can neither put nor delete an item.
+              Action: [dynamodb:GetItem, dynamodb:UpdateItem, dynamodb:Scan]
               Resource: !GetAtt TweetsTable.Arn
             # Its own cursor items only (`compliance#<handle>`), not the fetch checkpoints.
             - Effect: Allow

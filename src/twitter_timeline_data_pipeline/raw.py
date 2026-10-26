@@ -131,18 +131,25 @@ class Envelope:
 def redact_envelope(body: bytes, tweet_ids: Collection[str]) -> tuple[bytes, set[str]]:
     """``body`` (a landed object) without the Tweets in ``tweet_ids``.
 
-    Removes them from ``response.data``, drops the ``includes.media`` only they used,
-    and adds their IDs to ``redactions`` (which replay honors). Returns the new object
-    and the IDs it removed; with none removed the new object is ``body`` unchanged.
-    Raises ``RawPageError`` if ``body`` can't be read.
+    Removes them from ``response.data`` and from ``response.includes.tweets`` (the
+    posts another Tweet quotes, replies to or retweets), drops the ``includes.media``
+    only they used, and adds their IDs to ``redactions`` (which replay honors).
+    Returns the new object and the IDs it removed; with none removed the new object
+    is ``body`` unchanged. Raises ``RawPageError`` if ``body`` can't be read.
     """
     envelope = Envelope.from_bytes(body)
     response = envelope.response
+    includes = response.get("includes")
+    included = includes.get("tweets") if isinstance(includes, dict) else None
     data = response.get("data")
-    if not isinstance(data, list):
-        return body, set()
-    gone = {str(t["id"]) for t in data if isinstance(t, dict) and "id" in t}
-    gone &= {str(i) for i in tweet_ids}
+    tweets = [
+        t
+        for source in (data, included)
+        if isinstance(source, list)
+        for t in source
+        if isinstance(t, dict) and "id" in t
+    ]
+    gone = {str(t["id"]) for t in tweets} & {str(i) for i in tweet_ids}
     if not gone:
         return body, set()
 
@@ -154,23 +161,30 @@ def redact_envelope(body: bytes, tweet_ids: Collection[str]) -> tuple[bytes, set
             for k in (t.get("attachments") or {}).get("media_keys", ())
         }
 
-    kept = [t for t in data if not (isinstance(t, dict) and str(t.get("id")) in gone)]
-    dropped = media_keys([t for t in data if t not in kept])
-    still_used = media_keys(kept)
-    new_response: JSONObject = {**response, "data": kept}
-    includes = response.get("includes")
-    if isinstance(includes, dict) and isinstance(includes.get("media"), list):
-        new_response["includes"] = {
-            **includes,
-            "media": [
+    def keep(source: list[Any]) -> list[Any]:
+        return [
+            t for t in source if not (isinstance(t, dict) and str(t.get("id")) in gone)
+        ]
+
+    dropped = media_keys([t for t in tweets if str(t["id"]) in gone])
+    still_used = media_keys([t for t in tweets if str(t["id"]) not in gone])
+    new_response: JSONObject = dict(response)
+    if isinstance(data, list):
+        new_response["data"] = keep(data)
+    if isinstance(includes, dict):
+        new_includes = dict(includes)
+        if isinstance(included, list):
+            new_includes["tweets"] = keep(included)
+        if isinstance(includes.get("media"), list):
+            new_includes["media"] = [
                 m
                 for m in includes["media"]
                 if not (
                     isinstance(m, dict)
                     and str(m.get("media_key")) in dropped - still_used
                 )
-            ],
-        }
+            ]
+        new_response["includes"] = new_includes
     redacted = replace(
         envelope,
         response=new_response,

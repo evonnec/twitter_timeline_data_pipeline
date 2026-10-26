@@ -664,6 +664,7 @@ _REFERENCE_KEYS = (
     "author_username",
     "created_at",
     "entities",
+    "source_gone_since",  # set by the compliance job (see handlers/compliance.py)
 )
 # Fields a message only carries when the API was asked for entities: when it wasn't,
 # a stored value is kept (when it was, the API's answer wins, absent included).

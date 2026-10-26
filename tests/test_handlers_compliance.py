@@ -130,7 +130,13 @@ def assert_purged(aws: Aws, tweet_id: str) -> None:
     """Only the content-free tombstone is left."""
     stored = item(aws, tweet_id)
     assert stored is not None
-    assert set(stored) == {"tweet_id", "deleted_at", "deletion_reason", "purged_at"}
+    assert set(stored) == {
+        "tweet_id",
+        "deleted_at",
+        "deletion_reason",
+        "purged_at",
+        "revision",
+    }
 
 
 def versions(aws: Aws, key: str) -> list[str]:
@@ -600,6 +606,8 @@ def test_handler_runs_the_job_end_to_end(
         "unknown": 0,
         "wrapped": True,
         "raw_pages_redacted": 0,
+        "references_checked": 0,
+        "copies_scrubbed": 0,
     }
     assert_purged(aws, gone)
     assert item(aws, kept) is not None

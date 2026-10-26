@@ -675,7 +675,7 @@ def test_compliance_function_has_its_own_schedule_and_settings(
     props = properties(template, "ComplianceFunction")
     parameters = template["Parameters"]
 
-    assert parameters["ComplianceSchedule"]["Default"] == "rate(1 day)"
+    assert parameters["ComplianceSchedule"]["Default"] == "rate(6 hours)"
     assert parameters["ComplianceMaxLookups"]["Default"] == 1000
     assert parameters["DeletionGraceHours"]["Default"] == 24
     assert props["Timeout"] == 300
@@ -698,7 +698,7 @@ def test_compliance_function_permissions(template: Template) -> None:
 
     assert set(by_actions) == {
         frozenset({"dynamodb:Query"}),
-        frozenset({"dynamodb:GetItem", "dynamodb:UpdateItem", "dynamodb:DeleteItem"}),
+        frozenset({"dynamodb:GetItem", "dynamodb:UpdateItem", "dynamodb:Scan"}),
         frozenset({"dynamodb:GetItem", "dynamodb:PutItem"}),
         frozenset({"s3:ListBucketVersions", "s3:ListBucket"}),
         frozenset({"s3:DeleteObject", "s3:DeleteObjectVersion"}),

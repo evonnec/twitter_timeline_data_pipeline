@@ -197,7 +197,8 @@ def test_purge_rewrites_every_raw_page_holding_the_tweet(
 
     result = purge_with_pages(aws, clock, tweet=doomed)
 
-    assert result.raw_pages_redacted == 2
+    # a later page too: another Tweet quoting this one holds it in includes.tweets
+    assert result.raw_pages_redacted == 3
     for key in (first, second):
         page = read(aws, key)
         assert ids_in(page) == [other]
@@ -207,7 +208,7 @@ def test_purge_rewrites_every_raw_page_holding_the_tweet(
     assert ids_in(read(aws, unrelated)) == [other]
     assert read(aws, unrelated).redactions == ()
     assert len(versions(aws, unrelated)) == 1  # not rewritten
-    assert doomed in ids_in(read(aws, later))  # outside the Tweet's day range
+    assert doomed not in ids_in(read(aws, later))  # no upper day limit
     assert doomed in ids_in(read(aws, elsewhere))  # another account's pages
     assert_purged(aws, doomed)
     assert f"redacted raw page {first}" in caplog.text
