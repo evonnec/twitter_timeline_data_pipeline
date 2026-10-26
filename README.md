@@ -34,7 +34,7 @@ flowchart LR
 
 A run, step by step:
 
-1. EventBridge invokes `FetchFunction` on the schedule (`rate(1 hour)` by default). The event may carry `{"username": "..."}`; otherwise the `TWITTER_USERNAME` setting is used.
+1. EventBridge invokes `FetchFunction` on the schedule (`rate(1 hour)` by default). The event may carry `{"username": "..."}`; otherwise the `TWITTER_USERNAME` setting is used. The name is normalized once (leading `@` removed, lower-cased) and used everywhere below.
 2. The function reads the bearer token from Secrets Manager (cached in memory for 15 minutes), resolves the username to a user ID, and reads the account's checkpoint (the newest Tweet ID already fetched) from the state table.
 3. It pages through `GET /2/users/:id/tweets` with `since_id` set to the checkpoint, up to `MAX_PAGES` pages of `MAX_RESULTS` Tweets, newest first.
 4. Each page becomes one message per Tweet, sent to the queue with `SendMessageBatch` (10 at a time; only entries SQS reports as failed are retried).
@@ -47,11 +47,11 @@ A run, step by step:
 
 ### SQS message
 
-One message per Tweet. The body is compact JSON with `"schema_version": 1`; the processor rejects any other version. This example is generated from the real model, with fake IDs:
+One message per Tweet. The body is compact, ASCII-escaped JSON (so odd characters in Tweet text cannot make SQS reject it) with `"schema_version": 1`; the processor rejects any other version. This example is generated from the real model, with fake IDs:
 
 ```json
 {
-  "username": "NASA",
+  "username": "nasa",
   "tweet": {
     "id": "1850000000000000001",
     "text": "Launch day. https://t.co/abc",
@@ -102,7 +102,7 @@ You can regenerate it with `TweetMessage(...).to_json()` from `twitter_timeline_
 | Attribute | Type | Notes |
 | --- | --- | --- |
 | `tweet_id` | S | Tweet ID |
-| `username` | S | Account as given to the fetch run |
+| `username` | S | Normalized account name (lower case) |
 | `author_id` | S | |
 | `text` | S | |
 | `created_at` | S | ISO 8601 |
@@ -117,11 +117,11 @@ You can regenerate it with `TweetMessage(...).to_json()` from `twitter_timeline_
 | `stored_at` | S | when the item was written |
 | `schema_version` | N | |
 
-Each `media` entry has `media_key`, `type`, `status` (`stored`, `exists`, `unavailable` or `skipped`) and, when known, `s3_key`, `content_type`, `source_url` and `size_bytes`.
+Each `media` entry has `media_key`, `type`, `status` (`stored` and `exists` for files in S3, `unavailable` or `skipped`) and, when known, `s3_key`, `content_type`, `source_url` and `size_bytes`.
 
 ### State table (`StateTable`)
 
-One item per account: partition key `username` (S, lower-cased), `newest_id` (N, the newest Tweet ID enqueued) and `updated_at` (S). The checkpoint only ever moves forward, through a conditional write.
+One item per account: partition key `username` (S, lower case), `newest_id` (N, the newest Tweet ID enqueued) and `updated_at` (S). The checkpoint only ever moves forward, through a conditional write.
 
 ### S3 media bucket
 
@@ -131,7 +131,7 @@ Key layout:
 media/<author_id>/<tweet_id>/<media_key><extension>
 ```
 
-If a Tweet has no `author_id`, the lower-cased username is used instead. The key is deterministic, so a repeat delivery finds the object and skips the download. Photos are fetched at original size. For videos and animated GIFs, the highest-bit-rate `video/mp4` variant is stored.
+If a Tweet has no `author_id`, the lower-cased username is used instead. The key is deterministic, so a repeat delivery finds the object and skips the download. Photos are fetched at original size (`name=orig`, other query parameters are kept). For videos and animated GIFs, the highest-bit-rate `video/mp4` variant is stored.
 
 Each object has the `Content-Type` of the source and user metadata `tweet-id`, `media-key` and `source-url`. The bucket is encrypted (SSE-S3), blocks all public access, refuses non-TLS requests, and aborts incomplete multipart uploads after 7 days.
 
@@ -139,13 +139,14 @@ Each object has the `Content-Type` of the source and user metadata `tweet-id`, `
 
 - **`GET /2/users/:id/tweets`.** It returns an account's own Tweets and works with an app-only bearer token (the home timeline endpoint needs user-context OAuth). One request returns up to 100 Tweets with their media expanded, instead of one lookup per Tweet, which keeps API usage low.
 - **At-least-once and idempotent.** SQS can deliver a message twice, and a failed fetch run is re-run from the old checkpoint. Tweets are written with `PutItem` keyed by `tweet_id`, so a repeat overwrites the same item. Media keys are deterministic and existing objects are not downloaded again.
-- **Checkpoint after enqueue.** If a run fails midway, the next run re-sends some Tweets (harmless duplicates) rather than losing any. Concurrent runs cannot move the checkpoint backwards because the write is conditional.
+- **Checkpoint after enqueue.** If a run fails midway, the next run re-sends some Tweets (harmless duplicates) rather than losing any. The one known loss case is the page-cap gap (see limitations).
+- **Overlapping fetch runs are harmless.** The fetch function has no reserved concurrency. The checkpoint write is conditional, so it never moves backwards, and duplicate messages are handled by idempotent processing.
 - **Partial batch responses, DLQ and alarms.** `ProcessFunction` returns the IDs of failed records, so one bad message does not retry the other nine. Transient media errors (timeouts, 429, 5xx) fail the record for retry. Malformed messages and unexpected errors fail it too and end up in the DLQ after 5 receives (kept 14 days). Alarms cover a non-empty DLQ, fetch errors (1 hour window) and process errors (5 minute window). Set `AlarmTopicArn` to get notified through SNS.
-- **Streaming uploads.** Media is streamed from the CDN straight into S3 `upload_fileobj` through a small file-like adapter, so a large video is never held in memory.
+- **Streaming uploads.** Media is downloaded only over https from `pbs.twimg.com` and `video.twimg.com` (message bodies are treated as untrusted), redirects are not followed, and the file is streamed from the CDN straight into S3 `upload_fileobj` through a small file-like adapter, so a large video is never held in memory.
 - **Least-privilege IAM.** The fetch function can send to its queue, read one secret, and get/put items in the state table. The process function can write to the tweets table, put/get objects in the bucket and list it (so a missing key is a 404, not a 403). Neither can touch the other's resources.
-- **Secrets handling.** The stack creates an empty secret, so the token is never in the template, a parameter or an environment variable. `scripts/put_secret.sh` fills it in without putting the token in the process arguments. The fetch function only gets the secret's ARN. It caches the token for 15 minutes, so a rotated secret is picked up without a redeploy, and drops the cache on a 401/403. The token is sent only in the `Authorization` header and is excluded from log output and `repr`.
+- **Secrets handling.** The stack creates an empty secret, so the token is never in the template, a parameter or an environment variable. `scripts/put_secret.sh` fills it in without putting the token in the process arguments. The fetch function only gets the secret's ARN. It caches the token for 15 minutes, so a rotated secret is picked up without a redeploy, and drops the cache on a 401/403. The token is sent only in the `Authorization` header and is excluded from log output and `repr`. The AWS SDK and HTTP library loggers (`botocore`, `boto3`, `s3transfer`, `urllib3`, `httpcore`, `httpx`) are held at WARNING even when `LogLevel` is `DEBUG`, since at DEBUG they can log secret values.
 - **Retained data stores.** The tweets table and the media bucket have `DeletionPolicy: Retain`, so deleting the stack does not delete collected data.
-- **Reserved concurrency of 1 for fetch.** Runs never overlap, so there is no race on the checkpoint. The function has no automatic retries (`MaximumRetryAttempts: 0`), because the next scheduled run is the retry and a retry would only use up API rate limit.
+- **No automatic fetch retries.** The function has `MaximumRetryAttempts: 0`, because the next scheduled run is the retry and a retry would only use up API rate limit.
 - **Runtime.** Python 3.14 on arm64 (Graviton). The dependency bundle is built for `aarch64-manylinux_2_28` wheels so it can be built on any machine.
 
 ## Repository layout
@@ -234,7 +235,8 @@ Prerequisites:
 Steps:
 
 ```bash
-# 1. Build the Lambda bundle into build/lambda/ (Python 3.14, arm64 wheels)
+# 1. Build the Lambda bundle into build/lambda/ (Python 3.14, arm64 wheels, from uv.lock via --locked;
+#    the console script bin/ and direct_url.json are stripped)
 scripts/build_lambda.sh
 
 # 2. Build (again) and deploy; sam shows the change set and asks for confirmation
@@ -244,7 +246,7 @@ scripts/deploy.sh
 scripts/put_secret.sh
 ```
 
-`scripts/deploy.sh` runs the build itself, so step 1 is only needed to inspect the bundle. Defaults come from `samconfig.toml` (stack `twitter-timeline-pipeline`, region `us-east-1`, IAM capabilities, change set confirmation). To override the account or schedule, set variables for that run:
+`scripts/deploy.sh` runs the build itself, so step 1 is only needed to inspect the bundle. Defaults come from `samconfig.toml` (stack `twitter-timeline-pipeline`, region `us-east-1`, IAM capabilities, change set confirmation, and `resolve_s3` for the artifact bucket, so no flag is needed). Override values that contain spaces are quoted for you. To override the account or schedule, set variables for that run:
 
 ```bash
 TWITTER_USERNAME=NASA SCHEDULE_EXPRESSION='rate(30 minutes)' scripts/deploy.sh
@@ -258,10 +260,10 @@ Extra arguments are passed to `sam deploy`, for example `scripts/deploy.sh --reg
 | --- | --- | --- |
 | `TwitterUsername` | `NASA` | Account whose timeline is fetched |
 | `ScheduleExpression` | `rate(1 hour)` | EventBridge schedule for the fetch run |
-| `ScheduleEnabled` | `true` | Set to `false` to pause the schedule |
+| `ScheduleEnabled` | `true` | Set to `false` to disable the schedule rule |
 | `MaxPages` | `5` | Maximum timeline pages per run |
 | `MaxResults` | `100` | Tweets per page (5 to 100) |
-| `LogLevel` | `INFO` | Lambda application log level (`DEBUG`, `INFO`, `WARNING`, `ERROR`); logs are JSON |
+| `LogLevel` | `INFO` | Lambda application log level (`DEBUG`, `INFO`, `WARN`, `ERROR`); logs are JSON. SDK and HTTP library loggers stay at WARNING regardless |
 | `AlarmTopicArn` | empty | Optional SNS topic notified by the alarms |
 
 ### Stack outputs
@@ -307,14 +309,14 @@ aws dynamodb scan --table-name "$TABLE" --max-items 5
 aws dynamodb query --table-name "$TABLE" \
   --index-name username-created_at-index \
   --key-condition-expression 'username = :u' \
-  --expression-attribute-values '{":u": {"S": "NASA"}}' \
+  --expression-attribute-values '{":u": {"S": "nasa"}}' \
   --no-scan-index-forward --limit 10
 
 aws dynamodb get-item --table-name "$TABLE" \
   --key '{"tweet_id": {"S": "1850000000000000001"}}'
 ```
 
-The `username` in the query must match the case used for the fetch (the table stores it as given).
+Usernames are stored lower case, so query with a lower-case name.
 
 **4. List the media:**
 
@@ -358,13 +360,14 @@ The script reads the table and bucket names from the stack outputs, runs `sam de
 
 - X API access now requires a paid tier, and rate limits and monthly Tweet caps depend on the tier. Check yours; lower `MaxPages` or the schedule frequency if you hit limits.
 - The first run backfills at most `MAX_PAGES x MAX_RESULTS` Tweets (500 by default). The API itself only exposes a limited number of an account's most recent Tweets.
-- If a run reaches the page cap while a checkpoint is set, Tweets older than those fetched but newer than the checkpoint are skipped, and a warning is logged. Raise `MaxPages` or run more often.
+- The one known case where Tweets are lost: if a run reaches the page cap while a checkpoint is set, Tweets older than those fetched but newer than the checkpoint are skipped, and a warning is logged. Raise `MaxPages` or run more often.
+- Large videos have no size or time budget yet. A batch that times out is retried and can end up in the DLQ.
 - Edited Tweets get a new ID and are stored as new items; the old ones remain. `edit_history_tweet_ids` links them.
 - Deletions are not propagated: a Tweet deleted at the source stays in the table.
 - Metrics (`public_metrics`) are a snapshot at fetch time and are not refreshed.
 - Videos that only have HLS variants (no `video/mp4`) are recorded with status `skipped` and nothing is downloaded.
-- Media that returns 403, 404 or 410 is recorded as `unavailable`; the Tweet is still stored.
-- One account is fetched per stack through `TwitterUsername`. The fetch event can override the username, but the checkpoint is shared by lower-cased username while Tweet items keep the username as given.
+- Media whose download returns a 4xx other than 429, or a redirect, is recorded as `unavailable`; the Tweet is still stored. Media at a non-https URL or a host other than the two X CDN hosts is recorded as `skipped`. 429 and 5xx responses and timeouts are retried.
+- One account is fetched per stack through `TwitterUsername`. The fetch event can override the username; names are normalized to lower case, with each account keeping its own checkpoint.
 - The bearer token is app-only, so protected accounts and private data are not available.
 
 ## Python 3.14 features used

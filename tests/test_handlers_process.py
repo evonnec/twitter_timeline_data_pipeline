@@ -25,7 +25,7 @@ from twitter_timeline_data_pipeline.models import TweetMessage
 from twitter_timeline_data_pipeline.storage import MediaStore, TweetStore
 
 SAMPLE_EVENT = Path(__file__).parent.parent / "events" / "sqs.json"
-SAMPLE_PHOTO_URL = "https://example.com/media/photo1.jpg"
+SAMPLE_PHOTO_URL = "https://pbs.twimg.com/media/ExamplePhoto1.jpg"
 
 GOOD = "1700000000000000010"
 TRANSIENT = "1700000000000000020"
@@ -330,7 +330,7 @@ def test_http_client_factory_configuration() -> None:
     client = process._http_client(7.0)
     try:
         assert client.timeout.read == 7.0
-        assert client.follow_redirects is True
+        assert client.follow_redirects is False
         assert (
             client.headers["User-Agent"]
             == f"twitter-timeline-data-pipeline/{__version__}"
@@ -346,7 +346,3 @@ def test_aws_client_factories_are_cached(aws: Aws) -> None:
     assert process._s3_client() is process._s3_client()
     assert process._tweet_store("t") is process._tweet_store("t")
     assert process._tweet_store("t") is not process._tweet_store("u")
-
-
-def test_user_agent_constant() -> None:
-    assert process.USER_AGENT.startswith("twitter-timeline-data-pipeline/")

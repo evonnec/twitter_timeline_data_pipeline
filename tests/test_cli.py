@@ -1,5 +1,5 @@
 import json
-from importlib.metadata import PackageNotFoundError
+import logging
 from typing import Any
 
 import httpx
@@ -79,20 +79,6 @@ def test_version_prints_package_version(capsys: pytest.CaptureFixture[str]) -> N
 
     assert info.value.code == 0
     assert capsys.readouterr().out.startswith("twitter-pipeline ")
-
-
-def test_version_falls_back_when_not_installed(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    def missing(_name: str) -> str:
-        raise PackageNotFoundError
-
-    monkeypatch.setattr(cli, "version", missing)
-
-    with pytest.raises(SystemExit):
-        main(["--version"])
-
-    assert capsys.readouterr().out == "twitter-pipeline unknown\n"
 
 
 @pytest.mark.parametrize(
@@ -216,20 +202,46 @@ def test_bad_environment_value_exits_two(
 
 @pytest.mark.parametrize(
     ("option", "value"),
-    [("--max-pages", "-1"), ("--max-results", "4"), ("--max-results", "101")],
+    [
+        ("--max-pages", "0"),
+        ("--max-pages", "-1"),
+        ("--max-pages", "many"),
+        ("--max-results", "0"),
+        ("--max-results", "4"),
+        ("--max-results", "101"),
+        ("--max-results", "-5"),
+        ("--max-results", "10.5"),
+    ],
 )
-def test_out_of_range_options_exit_two(api: XApiStub, option: str, value: str) -> None:
-    assert main([*FETCH, "--dry-run", option, value]) == EXIT_USAGE
+def test_out_of_range_options_are_rejected_by_argparse(
+    api: XApiStub, option: str, value: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with pytest.raises(SystemExit) as info:
+        main([*FETCH, "--dry-run", option, value])
+
+    assert info.value.code == EXIT_USAGE
+    assert option in capsys.readouterr().err
     assert api.requests == []
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="bug: --max-pages/--max-results 0 is falsy so the env default is used",
+@pytest.mark.parametrize(
+    ("option", "value"),
+    [("--max-pages", "1"), ("--max-results", "5"), ("--max-results", "100")],
 )
-@pytest.mark.parametrize("option", ["--max-pages", "--max-results"])
-def test_zero_valued_options_are_rejected(api: XApiStub, option: str) -> None:
-    assert main([*FETCH, "--dry-run", option, "0"]) == EXIT_USAGE
+def test_boundary_option_values_are_accepted(
+    api: XApiStub, option: str, value: str
+) -> None:
+    assert main([*FETCH, "--dry-run", option, value]) == EXIT_OK
+
+
+def test_debug_log_level_keeps_sdk_loggers_at_warning(api: XApiStub) -> None:
+    names = ("botocore", "boto3", "s3transfer", "urllib3", "httpcore", "httpx")
+    for name in names:
+        logging.getLogger(name).setLevel(logging.NOTSET)
+
+    main([*FETCH, "--dry-run", "--log-level", "DEBUG"])
+
+    assert [logging.getLogger(n).level for n in names] == [logging.WARNING] * 6
 
 
 def test_invalid_username_exits_two(

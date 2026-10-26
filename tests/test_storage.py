@@ -1,5 +1,6 @@
 import io
 from typing import Any, cast
+from urllib.parse import urlsplit
 
 import httpx
 import pytest
@@ -20,6 +21,7 @@ from mypy_boto3_s3 import S3Client
 
 from twitter_timeline_data_pipeline.models import Media, TweetMessage
 from twitter_timeline_data_pipeline.storage import (
+    ALLOWED_MEDIA_HOSTS,
     CheckpointStore,
     MediaStore,
     StoredMedia,
@@ -59,6 +61,14 @@ def media_store(aws: Aws, cdn: CdnStub) -> MediaStore:
         (
             "https://pbs.twimg.com/media/Abc.jpg",
             "https://pbs.twimg.com/media/Abc.jpg?name=orig",
+        ),
+        (
+            "https://pbs.twimg.com/media/Abc?format=jpg&name=small",
+            "https://pbs.twimg.com/media/Abc?format=jpg&name=orig",
+        ),
+        (
+            "https://pbs.twimg.com/media/Abc?name=large&format=png&x=",
+            "https://pbs.twimg.com/media/Abc?format=png&x=&name=orig",
         ),
         ("https://pbs.twimg.com/ext_tw_video_thumb/1/a.jpg", None),
         ("https://video.twimg.com/media/x.mp4", None),
@@ -300,14 +310,59 @@ def test_store_transport_errors_are_transient(aws: Aws, error: Exception) -> Non
         store.store(make_message(media=(PHOTO,)), PHOTO)
 
 
-def test_store_follows_cdn_redirects(aws: Aws) -> None:
+@pytest.mark.parametrize("status", [301, 302, 307, 308])
+def test_store_does_not_follow_redirects(aws: Aws, status: int) -> None:
     cdn = CdnStub()
-    cdn.responses[f"{PHOTO_URL}"] = lambda: httpx.Response(
-        302, headers={"Location": "https://cdn.example/final.jpg"}
+    cdn.responses[PHOTO_URL] = lambda: httpx.Response(
+        status, headers={"Location": "https://cdn.example/final.jpg"}
     )
     cdn.serve("https://cdn.example/final.jpg", JPEG, "image/jpeg")
 
     stored = media_store(aws, cdn).store(make_message(media=(PHOTO,)), PHOTO)
+
+    assert stored.status == "unavailable"
+    assert [r.url.host for r in cdn.requests] == ["pbs.twimg.com"]
+    assert "Contents" not in aws.s3.list_objects_v2(Bucket=aws.bucket)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://pbs.twimg.com/media/Abc.jpg",
+        "https://example.com/media/Abc.jpg",
+        "https://pbs.twimg.com.evil.example/media/Abc.jpg",
+        "https://evil.example/pbs.twimg.com/media/Abc.jpg",
+        "https://169.254.169.254/latest/meta-data/",
+        "https://localhost/media/Abc.jpg",
+        "ftp://pbs.twimg.com/media/Abc.jpg",
+    ],
+)
+def test_store_skips_urls_outside_the_media_hosts(
+    aws: Aws, url: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    cdn = CdnStub()
+    item = photo(url=url)
+
+    with caplog.at_level("WARNING"):
+        stored = media_store(aws, cdn).store(make_message(media=(item,)), item)
+
+    assert stored == StoredMedia(
+        media_key=item.media_key, type="photo", status="skipped"
+    )
+    assert cdn.requests == []
+    assert "not an allowed media host" in caplog.text
+    assert repr(urlsplit(url).hostname) in caplog.text
+    assert "Contents" not in aws.s3.list_objects_v2(Bucket=aws.bucket)
+
+
+@pytest.mark.parametrize("host", sorted(ALLOWED_MEDIA_HOSTS))
+def test_store_allows_both_x_media_hosts(aws: Aws, host: str) -> None:
+    url = f"https://{host}/ext/file.mp4"
+    cdn = CdnStub()
+    cdn.serve(url, b"data", "video/mp4")
+    item = video(url=url)
+
+    stored = media_store(aws, cdn).store(make_message(media=(item,)), item)
 
     assert stored.status == "stored"
 

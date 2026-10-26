@@ -11,7 +11,9 @@ from helpers import (
     USER_ID,
     FakeSqs,
     XApiStub,
+    ddb_get,
     install_x_api,
+    load_fixture,
     synthetic_timeline,
     x_client,
 )
@@ -328,6 +330,90 @@ def test_not_truncated_when_last_page_has_no_next_token(
 
     assert result.truncated is False
     assert not any("page cap reached" in m for m in caplog.messages)
+
+
+def test_next_token_followed_by_an_empty_page_is_not_truncated(
+    aws: Aws, caplog: pytest.LogCaptureFixture
+) -> None:
+    stub = XApiStub()
+    first = load_fixture("timeline_page1.json")
+
+    def api(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/tweets"):
+            stub.requests.append(request)
+            if request.url.params.get("pagination_token"):
+                return httpx.Response(200, json=load_fixture("timeline_empty.json"))
+            return httpx.Response(200, json=first)
+        return stub(request)
+
+    with caplog.at_level(logging.WARNING):
+        result = run(aws, api, since_id="1", max_pages=2)
+
+    assert result.pages == 1
+    assert result.truncated is False
+    assert not any("page cap reached" in m for m in caplog.messages)
+
+
+def test_hitting_the_cap_exactly_on_the_last_page_is_not_truncated(aws: Aws) -> None:
+    result = run(aws, XApiStub(), max_pages=2)
+
+    assert (result.pages, result.truncated) == (2, False)
+
+
+# ---- run_fetch: username normalisation ---------------------------------------
+
+
+@pytest.mark.parametrize("given", ["@Example_User", "EXAMPLE_USER", "@example_user"])
+def test_username_is_normalised_once_for_lookup_messages_and_checkpoint(
+    aws: Aws, given: str
+) -> None:
+    api = XApiStub()
+    sqs = FakeSqs()
+
+    with x_client(api) as client:
+        result = run_fetch(
+            username=given,
+            x_client=client,
+            sqs=sqs.client,
+            queue_url=aws.queue_url,
+            checkpoints=CheckpointStore(aws.state_table),
+            max_results=100,
+            max_pages=5,
+            sleep=lambda _s: None,
+        )
+
+    assert result.username == "example_user"
+    assert api.requests[0].url.path == "/2/users/by/username/example_user"
+    bodies = [e["MessageBody"] for call in sqs.calls for e in call]
+    assert {TweetMessage.from_json(b).username for b in bodies} == {"example_user"}
+    assert ddb_get(aws.state_table, username="example_user")["newest_id"] == int(NEWEST)
+    assert aws.state_table.scan()["Count"] == 1
+
+
+# ---- run_fetch: checkpoint races ---------------------------------------------
+
+
+def test_unmoved_checkpoint_is_logged_at_info(
+    aws: Aws, caplog: pytest.LogCaptureFixture
+) -> None:
+    CheckpointStore(aws.state_table).advance(USERNAME, "9" * 19)
+
+    with caplog.at_level(logging.INFO, logger=fetch.logger.name):
+        run(aws, synthetic_timeline(ids(2)), since_id="1")
+
+    assert (
+        f"checkpoint for {USERNAME} not moved: another run already stored a newer mark"
+        in caplog.messages
+    )
+
+
+def test_moved_checkpoint_logs_nothing(
+    aws: Aws, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.INFO, logger=fetch.logger.name):
+        run(aws, synthetic_timeline(ids(2)))
+
+    assert not any("not moved" in m for m in caplog.messages)
 
 
 # ---- handler ------------------------------------------------------------------

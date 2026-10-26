@@ -305,12 +305,34 @@ def test_message_json_round_trip_preserves_everything() -> None:
     assert TweetMessage.from_json(original.to_json()) == original
 
 
-def test_message_json_is_compact_and_keeps_unicode() -> None:
+def test_message_json_is_compact_and_ascii_escaped() -> None:
     body = make_message(tweet={"text": "caf\u00e9 \U0001f680"}).to_json()
 
     assert ", " not in body
     assert ": " not in body
-    assert "caf\u00e9 \U0001f680" in body
+    assert body.isascii()
+    assert "\\u00e9" in body
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "caf\u00e9 \U0001f680 \u65e5\u672c\u8a9e",
+        "\ud83d",
+        "a\ud83db",
+        "\uffff",
+        "x\ufffe",
+    ],
+    ids=["non-ascii", "lone-surrogate", "embedded-surrogate", "uffff", "ufffe"],
+)
+def test_message_json_round_trips_awkward_text(text: str) -> None:
+    message = make_message(tweet={"text": text})
+
+    body = message.to_json()
+
+    body.encode("utf-8")  # a lone surrogate would raise here if left unescaped
+    assert body.isascii()
+    assert TweetMessage.from_json(body).tweet.text == text
 
 
 def test_message_to_dict_carries_schema_version_and_fetched_at() -> None:
@@ -386,10 +408,6 @@ def test_from_json_rejects_tweet_missing_id() -> None:
         TweetMessage.from_json(json.dumps(data))
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="bug: from_json leaks AttributeError for non-object tweet/metrics",
-)
 @pytest.mark.parametrize(
     "mutate",
     [

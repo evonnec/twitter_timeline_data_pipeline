@@ -1,4 +1,5 @@
 import json
+import logging
 from typing import Any, cast
 
 import boto3
@@ -15,6 +16,7 @@ from twitter_timeline_data_pipeline.credentials import (
     clear_cache,
     get_bearer_token,
 )
+from twitter_timeline_data_pipeline.handlers import quiet_library_loggers
 
 SECRET_ID = "x-api/bearer-token"
 SECRET = "AAAA-fake-bearer-token-value"
@@ -262,3 +264,29 @@ def test_binary_secret_in_moto_is_a_credentials_error() -> None:
 
         with pytest.raises(CredentialsError, match="binary secrets unsupported"):
             get_bearer_token(settings())
+
+
+def test_debug_logging_never_puts_the_secret_into_logs(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    secret = "AAAA-debug-log-canary-token"
+    quiet_library_loggers()
+    with mock_aws(), caplog.at_level(logging.DEBUG):
+        boto3.client("secretsmanager").create_secret(
+            Name=SECRET_ID, SecretString=secret
+        )
+
+        assert get_bearer_token(settings()) == secret
+
+    assert secret not in caplog.text
+    assert secret not in "".join(r.getMessage() for r in caplog.records)
+
+
+def test_quiet_library_loggers_pins_sdk_loggers_to_warning() -> None:
+    names = ("botocore", "boto3", "s3transfer", "urllib3", "httpcore", "httpx")
+    for name in names:
+        logging.getLogger(name).setLevel(logging.DEBUG)
+
+    quiet_library_loggers()
+
+    assert [logging.getLogger(n).level for n in names] == [logging.WARNING] * 6
