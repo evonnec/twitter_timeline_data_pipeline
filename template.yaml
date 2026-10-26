@@ -81,8 +81,11 @@ Resources:
           KeySchema:
             - {AttributeName: username, KeyType: HASH}
             - {AttributeName: created_at, KeyType: RANGE}
+          # Listings need only these; INCLUDE keeps GSI write units and storage well
+          # below ALL. Fetch other attributes with GetItem on tweet_id.
           Projection:
-            ProjectionType: ALL
+            ProjectionType: INCLUDE
+            NonKeyAttributes: [text, media_count, public_metrics]
       PointInTimeRecoverySpecification:
         PointInTimeRecoveryEnabled: true
       SSESpecification:
@@ -114,6 +117,8 @@ Resources:
         BlockPublicPolicy: true
         IgnorePublicAcls: true
         RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled  # a deleted or overwritten media object stays recoverable
       OwnershipControls:
         Rules:
           - ObjectOwnership: BucketOwnerEnforced
@@ -123,6 +128,16 @@ Resources:
             Status: Enabled
             AbortIncompleteMultipartUpload:
               DaysAfterInitiation: 7
+          - Id: expire-noncurrent-versions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+          - Id: tier-media
+            Status: Enabled
+            Prefix: media/
+            Transitions:
+              - StorageClass: INTELLIGENT_TIERING
+                TransitionInDays: 0
 
   MediaBucketPolicy:
     Type: AWS::S3::BucketPolicy
@@ -148,13 +163,20 @@ Resources:
     Properties:
       MessageRetentionPeriod: 1209600  # 14 days
       SqsManagedSseEnabled: true
+      RedriveAllowPolicy:
+        redrivePermission: byQueue
+        sourceQueueArns:
+          # Built from the name, not !GetAtt: TweetsQueue already depends on this queue.
+          - !Sub "arn:${AWS::Partition}:sqs:${AWS::Region}:${AWS::AccountId}:${AWS::StackName}-tweets"
 
   TweetsQueue:
     Type: AWS::SQS::Queue
     Properties:
+      QueueName: !Sub "${AWS::StackName}-tweets"  # fixed so the DLQ can name it
       SqsManagedSseEnabled: true
-      # 6 x ProcessFunction timeout (120 s), per AWS guidance for SQS event sources.
-      VisibilityTimeout: 720
+      # 6 x ProcessFunction timeout (120 s) + its 10 s batching window, per AWS guidance
+      # for SQS event sources.
+      VisibilityTimeout: 730
       RedrivePolicy:
         deadLetterTargetArn: !GetAtt TweetsDeadLetterQueue.Arn
         maxReceiveCount: 5

@@ -65,6 +65,10 @@ class XApiError(RuntimeError):
         self.status_code = status_code
 
 
+class InvalidUsernameError(ValueError):
+    """The username is not a valid X handle (a caller mistake, not an API fault)."""
+
+
 class AuthError(XApiError):
     """401/403: the bearer token is missing, invalid, expired or lacks access."""
 
@@ -141,7 +145,7 @@ class XClient:
         """
         handle = username.removeprefix("@")
         if not _USERNAME_RE.fullmatch(handle):
-            raise ValueError(f"invalid X username: {username!r}")
+            raise InvalidUsernameError(f"invalid X username: {username!r}")
         body = self._request(f"/users/by/username/{handle}")
         data = body.get("data")
         if not isinstance(data, Mapping) or "id" not in data:

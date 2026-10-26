@@ -368,10 +368,23 @@ def test_message_matches_sample_sqs_event() -> None:
         ("[1, 2]", "expected a JSON object, got list"),
         ('"text"', "expected a JSON object, got str"),
         ("null", "expected a JSON object, got NoneType"),
+        ('{"schema_version": Infinity}', "non-finite JSON constant Infinity"),
+        ('{"schema_version": -Infinity}', "non-finite JSON constant -Infinity"),
+        ('{"schema_version": NaN}', "non-finite JSON constant NaN"),
+        ("[" * 200_000, "RecursionError"),
     ],
 )
 def test_from_json_rejects_non_objects_and_bad_json(body: str, fragment: str) -> None:
     with pytest.raises(MessageError, match=fragment):
+        TweetMessage.from_json(body)
+
+
+def test_from_json_rejects_overflowing_integers() -> None:
+    data = full_message().to_dict()
+    data["tweet"]["public_metrics"]["like_count"] = "__HUGE__"
+    body = json.dumps(data).replace('"__HUGE__"', "1e999")  # parses as a float inf
+
+    with pytest.raises(MessageError, match="OverflowError"):
         TweetMessage.from_json(body)
 
 

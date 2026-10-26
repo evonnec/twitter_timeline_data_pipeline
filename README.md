@@ -8,7 +8,7 @@ The project does the following:
 
 - Authenticates to the X API v2 with a bearer token and collects a given user's timeline Tweets, each Tweet's metadata (`created_at`, `text`, `referenced_tweets`, and more), and any attached media.
 - Uses Lambda, SQS, S3 and DynamoDB. A scheduled Lambda fetches and enqueues. A queue-triggered Lambda stores metadata in DynamoDB and media in S3.
-- Is efficient, reliable and scalable: paginated fetches with media expanded inline, idempotent writes, retries, a dead-letter queue, alarms, and bounded concurrency.
+- Is efficient, reliable and scalable: paginated fetches with media expanded inline, at-least-once delivery with repeatable writes, retries, a dead-letter queue, alarms, and bounded concurrency.
 - Keeps the token in Secrets Manager.
 - Is deployable from a YAML CloudFormation (SAM) template that creates the tables, bucket and queues, with a separate Python module for each Lambda function.
 - Is documented, including the architecture, data models and assumptions (this file).
@@ -94,10 +94,10 @@ You can regenerate it with `TweetMessage(...).to_json()` from `twitter_timeline_
 | Item | Value |
 | --- | --- |
 | Partition key | `tweet_id` (S) |
-| GSI `username-created_at-index` | partition `username` (S), sort `created_at` (S), projects all attributes |
+| GSI `username-created_at-index` | partition `username` (S), sort `created_at` (S), projects `text`, `media_count` and `public_metrics` only |
 | Billing | on demand; point-in-time recovery and encryption on |
 
-`created_at` is stored as the API's ISO 8601 string, which sorts chronologically. Attributes written by `TweetStore.to_item` (attributes whose value is `None` are omitted):
+`created_at` is stored as the API's ISO 8601 string, which sorts chronologically. The index projects `INCLUDE` rather than `ALL`: that roughly halves its write units and storage per Tweet. The trade-off is that a listing returns only those three attributes plus the keys, so read anything else (`media`, `referenced_tweets`, ...) with `GetItem` on `tweet_id`. Attributes written by `TweetStore.to_item` (attributes whose value is `None` are omitted):
 
 | Attribute | Type | Notes |
 | --- | --- | --- |
@@ -133,15 +133,15 @@ media/<author_id>/<tweet_id>/<media_key><extension>
 
 If a Tweet has no `author_id`, the lower-cased username is used instead. The key is deterministic, so a repeat delivery finds the object and skips the download. Photos are fetched at original size (`name=orig`, other query parameters are kept). For videos and animated GIFs, the highest-bit-rate `video/mp4` variant is stored.
 
-Each object has the `Content-Type` of the source and user metadata `tweet-id`, `media-key` and `source-url`. The bucket is encrypted (SSE-S3), blocks all public access, refuses non-TLS requests, and aborts incomplete multipart uploads after 7 days.
+Each object has the `Content-Type` of the source and user metadata `tweet-id`, `media-key` and `source-url`. The bucket is encrypted (SSE-S3), blocks all public access, refuses non-TLS requests, and aborts incomplete multipart uploads after 7 days. Versioning is on, so a deleted or overwritten object can be recovered for 30 days (noncurrent versions then expire). Objects under `media/` move to S3 Intelligent-Tiering on day 0, so cold video stops costing Standard rates; the trade-off is a small per-object monitoring fee, and objects under 128 KB are never tiered.
 
 ## Design decisions
 
 - **`GET /2/users/:id/tweets`.** It returns an account's own Tweets and works with an app-only bearer token (the home timeline endpoint needs user-context OAuth). One request returns up to 100 Tweets with their media expanded, instead of one lookup per Tweet, which keeps API usage low.
-- **At-least-once and idempotent.** SQS can deliver a message twice, and a failed fetch run is re-run from the old checkpoint. Tweets are written with `PutItem` keyed by `tweet_id`, so a repeat overwrites the same item. Media keys are deterministic and existing objects are not downloaded again.
-- **Checkpoint after enqueue.** If a run fails midway, the next run re-sends some Tweets (harmless duplicates) rather than losing any. The one known loss case is the page-cap gap (see limitations).
+- **At-least-once, with repeatable writes.** SQS can deliver a message twice, and a failed fetch run is re-run from the old checkpoint. Tweets are written with `PutItem` keyed by `tweet_id`, so a repeat overwrites the same item. Writes are last-write-wins, not conditional: a stale redelivery (for example a DLQ redrive of an old message) overwrites newer data such as `public_metrics`. Media keys are deterministic and existing objects are not downloaded again.
+- **Checkpoint after enqueue.** If a run fails midway, the next run re-sends some Tweets (harmless duplicates) rather than losing any. Loss and delay cases are listed under limitations: the page-cap gap loses Tweets, and a batch that fails repeatedly (for example a media timeout) ends in the DLQ without its metadata being written.
 - **Overlapping fetch runs are harmless.** The fetch function has no reserved concurrency. The checkpoint write is conditional, so it never moves backwards, and duplicate messages are handled by idempotent processing.
-- **Partial batch responses, DLQ and alarms.** `ProcessFunction` returns the IDs of failed records, so one bad message does not retry the other nine. Transient media errors (timeouts, 429, 5xx) fail the record for retry. Malformed messages and unexpected errors fail it too and end up in the DLQ after 5 receives (kept 14 days). Alarms cover a non-empty DLQ, fetch errors (1 hour window) and process errors (5 minute window). Set `AlarmTopicArn` to get notified through SNS.
+- **Partial batch responses, DLQ and alarms.** `ProcessFunction` returns the IDs of failed records, so one bad message does not retry the other nine. Transient media errors (timeouts, 429, 5xx) fail the record for retry. Malformed messages and unexpected errors fail it too and end up in the DLQ after 5 receives (kept 14 days). Alarms cover a non-empty DLQ, fetch errors (1 hour window) and whole-invocation process errors (5 minute window). Because of partial batch responses, a failed record is not a Lambda `Errors` datapoint, so the DLQ alarm is the signal for record-level failures. DLQ messages expire after 14 days. Set `AlarmTopicArn` to get notified through SNS.
 - **Streaming uploads.** Media is downloaded only over https from `pbs.twimg.com` and `video.twimg.com` (message bodies are treated as untrusted), redirects are not followed, and the file is streamed from the CDN straight into S3 `upload_fileobj` through a small file-like adapter, so a large video is never held in memory.
 - **Least-privilege IAM.** The fetch function can send to its queue, read one secret, and get/put items in the state table. The process function can write to the tweets table, put/get objects in the bucket and list it (so a missing key is a 404, not a 403). Neither can touch the other's resources.
 - **Secrets handling.** The stack creates an empty secret, so the token is never in the template, a parameter or an environment variable. `scripts/put_secret.sh` fills it in without putting the token in the process arguments. The fetch function only gets the secret's ARN. It caches the token for 15 minutes, so a rotated secret is picked up without a redeploy, and drops the cache on a 401/403. The token is sent only in the `Authorization` header and is excluded from log output and `repr`. The AWS SDK and HTTP library loggers (`botocore`, `boto3`, `s3transfer`, `urllib3`, `httpcore`, `httpx`) are held at WARNING even when `LogLevel` is `DEBUG`, since at DEBUG they can log secret values.
@@ -156,6 +156,9 @@ Each object has the `Content-Type` of the source and user metadata `tweet-id`, `
 ├── template.yaml                      SAM/CloudFormation template for the whole stack
 ├── samconfig.toml                     sam deploy defaults (stack name, region, capabilities)
 ├── pyproject.toml, uv.lock            package metadata and locked dependencies
+├── renovate.json                      dependency update configuration
+├── LICENSE                            GPL-3.0
+├── .github/workflows/ci.yml           CI, release and optional PyPI publish
 ├── .python-version                    3.14
 ├── events/
 │   ├── fetch.json                     sample event for FetchFunction
@@ -240,7 +243,7 @@ uv run twitter-pipeline fetch --username NASA --dry-run
 
 It resolves the username, pages through the timeline, and prints one SQS message body per Tweet to stdout, as compact JSON on one line each. Logs go to stderr. Nothing is sent to SQS and no checkpoint is read or written. Without `--dry-run` it does the real fetch (needs `QUEUE_URL`, `STATE_TABLE` and AWS credentials) and prints a JSON summary of the run.
 
-Other options: `--max-pages`, `--max-results` (5 to 100), `--since-id` and `--log-level`; see `uv run twitter-pipeline fetch --help`. Exit codes: 0 success, 1 an upstream failure (API, credentials, enqueue), 2 bad configuration or arguments.
+Other options: `--max-pages`, `--max-results` (5 to 100), `--since-id` and `--log-level`; see `uv run twitter-pipeline fetch --help`. Exit codes: 0 success; 1 an upstream or runtime failure (X API, malformed API data, an unreadable secret, enqueue, or an AWS SDK error such as SQS or DynamoDB access denied; the one-line message goes to stderr and the traceback shows with `--log-level DEBUG`); 2 bad arguments or configuration (invalid username, out-of-range option, missing `QUEUE_URL` or `STATE_TABLE`, or no bearer token configured).
 
 ### Environment variables
 
@@ -277,14 +280,19 @@ Steps:
 #    the console script bin/ and direct_url.json are stripped)
 scripts/build_lambda.sh
 
-# 2. Build (again) and deploy; sam shows the change set and asks for confirmation
-scripts/deploy.sh
+# 2. Build (again) and deploy with the schedule off; sam shows the change set and asks
+#    for confirmation. Enabling the schedule before the secret has a value would make
+#    the first runs fail and trip the fetch alarm.
+SCHEDULE_ENABLED=false scripts/deploy.sh
 
 # 3. Store the token in the stack's secret (prompts silently if the variable is unset)
 scripts/put_secret.sh
+
+# 4. Enable the schedule
+SCHEDULE_ENABLED=true scripts/deploy.sh
 ```
 
-`scripts/deploy.sh` runs the build itself, so step 1 is only needed to inspect the bundle. Defaults come from `samconfig.toml` (stack `twitter-timeline-pipeline`, region `us-east-1`, IAM capabilities, change set confirmation, and `resolve_s3` for the artifact bucket, so no flag is needed). Override values that contain spaces are quoted for you. To override the account or schedule, set variables for that run:
+`scripts/deploy.sh` runs the build itself, so step 1 is only needed to inspect the bundle. A deploy that omits `SCHEDULE_ENABLED` resets it to the template default, `true`, so set it explicitly if you want the schedule to stay off. Defaults come from `samconfig.toml` (stack `twitter-timeline-pipeline`, region `us-east-1`, IAM capabilities, change set confirmation, and `resolve_s3` for the artifact bucket, so no flag is needed). Override values that contain spaces are quoted for you. To override the account or schedule, set variables for that run:
 
 ```bash
 TWITTER_USERNAME=NASA SCHEDULE_EXPRESSION='rate(30 minutes)' scripts/deploy.sh
@@ -386,6 +394,33 @@ sam local invoke ProcessFunction --event events/sqs.json
 
 **Automated tests.** `tests/` holds unit tests for each module, a test of the template, and an end-to-end test that runs both handlers against each other. AWS is mocked with moto and HTTP with `httpx.MockTransport`, so `uv run pytest` needs no AWS account, credentials or network.
 
+## Operations
+
+Use the stack outputs from [Testing a deployment](#testing-a-deployment) (`$QUEUE`, `$DLQ`, `$FETCH`) in these runbooks.
+
+**Redrive the DLQ.** An alarm on the DLQ means records failed 5 times. Read the process function's logs first (a malformed message will fail again, and a stale redelivery overwrites newer data), fix the cause, then move the messages back before the 14-day retention expires them:
+
+```bash
+DLQ_ARN=$(aws sqs get-queue-attributes --queue-url "$DLQ" --attribute-names QueueArn \
+  --query Attributes.QueueArn --output text)
+aws sqs start-message-move-task --source-arn "$DLQ_ARN"   # defaults to the original source queue
+aws sqs list-message-move-tasks --source-arn "$DLQ_ARN"   # progress
+```
+
+**Backfill or re-fetch.** The scheduled run only reads Tweets newer than the checkpoint, and a first run reads at most `MAX_PAGES x MAX_RESULTS`. To fetch a specific range, run the CLI against the real stack (it needs the stack's `QUEUE_URL` and `STATE_TABLE`, a token and AWS credentials), with `--since-id` set to the Tweet ID before the range and a higher `--max-pages`:
+
+```bash
+export QUEUE_URL=$QUEUE STATE_TABLE=$(out StateTableName)
+export BEARER_TOKEN_SECRET_ARN=$(out BearerTokenSecretArn)
+uv run twitter-pipeline fetch --username NASA --since-id 1850000000000000000 --max-pages 32
+```
+
+Re-sent Tweets are written again over the same items, so a backfill is safe to repeat. Add `--dry-run` to preview without sending. The API exposes only an account's 3,200 most recent Tweets (800 with `exclude=replies`), so nothing older can be backfilled.
+
+**Rotate the token.** Run `scripts/put_secret.sh` with the new token. Running fetch containers keep the old token for up to 15 minutes (the cache TTL) and drop it earlier on a 401/403, so no redeploy is needed. To switch immediately, invoke the fetch function after the 15 minutes or update its configuration to recycle the containers.
+
+**Pause or resume the schedule.** Redeploy with `SCHEDULE_ENABLED=false scripts/deploy.sh` (and `true` to resume). For a quick stop without a deploy, disable the rule in the console or with `aws events disable-rule`; the next deploy resets it to the `ScheduleEnabled` value. Messages already queued are still processed while paused.
+
 ## Tearing down
 
 ```bash
@@ -396,10 +431,12 @@ The script reads the table and bucket names from the stack outputs, runs `sam de
 
 ## Assumptions and limitations
 
-- X API access now requires a paid tier, and rate limits and monthly Tweet caps depend on the tier. Check yours; lower `MaxPages` or the schedule frequency if you hit limits.
-- The first run backfills at most `MAX_PAGES x MAX_RESULTS` Tweets (500 by default). The API itself only exposes a limited number of an account's most recent Tweets.
-- The one known case where Tweets are lost: if a run reaches the page cap while a checkpoint is set, Tweets older than those fetched but newer than the checkpoint are skipped, and a warning is logged. Raise `MaxPages` or run more often.
-- Large videos have no size or time budget yet. A batch that times out is retried and can end up in the DLQ.
+- X API access now requires a paid plan. Billing is currently pay-per-use, charged per post read, and rate limits depend on the plan; check current pricing before deploying. Cost scales with Tweets read per run, which is bounded by `MaxPages x MaxResults` and multiplied by the schedule frequency, so lower `MaxPages` or run less often to spend less.
+- The first run backfills at most `MAX_PAGES x MAX_RESULTS` Tweets (500 by default). The API itself only exposes an account's 3,200 most recent Tweets (800 with `exclude=replies`).
+- Tweets can be lost in the page-cap case: if a run reaches the page cap while a checkpoint is set, Tweets older than those fetched but newer than the checkpoint are skipped, and a warning is logged. Raise `MaxPages` or run more often.
+- Large videos have no size or time budget yet. A batch that times out is retried and can end up in the DLQ, and the Tweets in it have no metadata stored until it is redriven. DLQ messages expire after 14 days, after which they are gone.
+- A media key that is missing from the response's `includes` (deleted or withheld media) is dropped with a warning, so the Tweet is stored without that media entry.
+- Writes are last-write-wins: a stale redelivery or DLQ redrive overwrites a newer item.
 - Edited Tweets get a new ID and are stored as new items; the old ones remain. `edit_history_tweet_ids` links them.
 - Deletions are not propagated: a Tweet deleted at the source stays in the table.
 - Metrics (`public_metrics`) are a snapshot at fetch time and are not refreshed.

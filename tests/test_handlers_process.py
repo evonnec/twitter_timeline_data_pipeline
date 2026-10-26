@@ -219,18 +219,22 @@ def test_unexpected_exception_in_media_store_is_isolated_to_its_record(
         "42",
         '{"schema_version": 1}',
         '{"schema_version": 1, "username": "u"}',
+        '{"schema_version": Infinity}',
+        "[" * 200_000,
     ],
 )
 def test_malformed_bodies_fail_their_record(
-    aws: Aws, cdn: CdnStub, bad_body: str
+    aws: Aws, cdn: CdnStub, caplog: pytest.LogCaptureFixture, bad_body: str
 ) -> None:
-    failed = process_records(
-        [sqs_record("bad", bad_body)],
-        media_store=MediaStore(aws.s3, aws.bucket, cdn.client()),
-        tweet_store=TweetStore(aws.tweets_table),
-    )
+    with caplog.at_level(logging.INFO):
+        failed = process_records(
+            [sqs_record("bad", bad_body)],
+            media_store=MediaStore(aws.s3, aws.bucket, cdn.client()),
+            tweet_store=TweetStore(aws.tweets_table),
+        )
 
     assert failed == ["bad"]
+    assert "message bad is malformed" in caplog.messages
 
 
 # ---- handler -------------------------------------------------------------------
