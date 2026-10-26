@@ -50,7 +50,7 @@ A run, step by step:
 1. EventBridge invokes `FetchFunction` on the schedule (`rate(1 hour)` by default). The event may carry `{"username": "..."}`; otherwise the `TWITTER_USERNAME` setting is used. The name is normalized once (leading `@` removed, lower-cased) and used everywhere below.
 2. The function reads the bearer token from Secrets Manager (cached in memory for 15 minutes), resolves the username to a user ID, and reads the account's cursor from the state table: the newest Tweet ID already fetched, plus any *gaps* (ID ranges known to be unfetched; see the [state table](#state-table-statetable)).
 3. New Tweets first. It pages through `GET /2/users/:id/tweets` with `since_id` set to the newest ID, newest first, in pages of `MAX_RESULTS` Tweets. A first run has no `since_id`. `MAX_PAGES` is a budget of API requests, counting empty and failed ones; when gaps exist it is at least 2, one request is kept for the oldest gap, and the rest go to the new Tweets and the newest gaps.
-4. Each page becomes one message per Tweet, sent to the queue with `SendMessageBatch` (10 at a time; only entries SQS reports as failed are retried).
+4. Each page is first written, unchanged, to the media bucket under `raw/` (see [Raw API pages](#raw-api-pages)). Only then does it become one message per Tweet, sent to the queue with `SendMessageBatch` (10 at a time; only entries SQS reports as failed are retried). Each message carries the raw object's key as `raw_key`. If the upload fails, nothing from that page is enqueued and the run fails with its cursor unmoved, so the page is fetched again by the next run.
 5. After each page is fully enqueued, the cursor is saved. While the page still has a `next_token`, the not-yet-fetched rest is recorded as a gap just below the lowest ID seen; a page without `next_token` closes it. So a run that hits the cap, a rate limit or an error leaves a gap, never a hole.
 6. Then the gaps. Whatever remains of the shared `MAX_PAGES` budget goes to the gaps, newest gap first, with `since_id` and `until_id` set to the gap's bounds. Each saved page lowers the gap's `until_id`, and the gap is removed when a page has no `next_token`.
 7. A 429 that resets later than the function will wait ends the run cleanly after saving: the invocation succeeds and the summary has `stopped_reason: "rate_limited"` (alerting on that comes with issue #19). Any other error fails the invocation, with progress up to the last full page saved; an error in one gap is raised only after the other gaps have had their turn. The next run resumes from the cursor and re-sends at most the page that was in flight.
@@ -211,7 +211,7 @@ If a Tweet has no `author_id`, the lower-cased username is used instead. The key
 
 The same bucket also holds the full text of oversized long posts at `text/<author_id>/<tweet_id>.json` (a JSON string, `application/json`, user metadata `tweet-id`); see the Tweets table. These objects are not tiered.
 
-Each object has the `Content-Type` of the source and user metadata `tweet-id`, `media-key` and `source-url`. The bucket is encrypted (SSE-S3), blocks all public access, refuses non-TLS requests, and aborts incomplete multipart uploads after 7 days. Versioning is on, so a deleted or overwritten object can be recovered for 30 days (noncurrent versions then expire). Objects under `media/` move to S3 Intelligent-Tiering on day 0, so cold video stops costing Standard rates; the trade-off is a small per-object monitoring fee, and objects under 128 KB are never tiered. With `RetentionDays` above 0, lifecycle rules also expire `media/` and `text/` objects after that many days. The compliance function deletes the objects of removed Tweets version by version, so nothing stays recoverable.
+Each object has the `Content-Type` of the source and user metadata `tweet-id`, `media-key` and `source-url`. The bucket is encrypted (SSE-S3), blocks all public access, refuses non-TLS requests, and aborts incomplete multipart uploads after 7 days. Versioning is on, so a deleted or overwritten object can be recovered for 30 days (noncurrent versions under `media/` and `text/` then expire; `raw/` versions never do). Objects under `media/` move to S3 Intelligent-Tiering on day 0, so cold video stops costing Standard rates; the trade-off is a small per-object monitoring fee, and objects under 128 KB are never tiered. With `RetentionDays` above 0, lifecycle rules also expire `media/` and `text/` objects after that many days (never `raw/`). The compliance function deletes the objects of removed Tweets version by version, so nothing stays recoverable.
 
 ## Design decisions
 
@@ -227,6 +227,35 @@ Each object has the `Content-Type` of the source and user metadata `tweet-id`, `
 - **Retained data stores.** The tweets table and the media bucket have `DeletionPolicy: Retain`, so deleting the stack does not delete collected data.
 - **No automatic fetch retries.** The function has `MaximumRetryAttempts: 0`, because the next scheduled run is the retry and a retry would only use up API rate limit.
 - **Runtime.** Python 3.14 on arm64 (Graviton). The dependency bundle is built for `aarch64-manylinux_2_28` wheels so it can be built on any machine.
+
+### Raw API pages
+
+Every timeline page the fetch receives is kept as it came from the API, so a field the processor doesn't store today (`note_tweet`, `entities`, referenced posts) can be recovered later without calling the API again; the API serves only an account's 3,200 most recent posts, so for older posts this is the only chance. The fetch writes the page to the media bucket before enqueuing its messages. An empty page that still points to a next page is landed too; a clean empty response (no data, no next page) is not.
+
+```text
+raw/<user_id>/dt=YYYY-MM-DD/<run_id>-<page_no>.json.gz
+```
+
+`dt` is the UTC date of the fetch, `run_id` a random ID per fetch run and `page_no` the page's number within that run, from 0001. Keys are unique, so nothing is overwritten. The object is gzipped JSON (`Content-Type: application/json`, `Content-Encoding: gzip`), an envelope:
+
+```json
+{
+  "schema_version": 1,
+  "username": "nasa",
+  "user_id": "1000000001",
+  "fetched_at": "2026-10-25T08:30:00Z",
+  "request": {"endpoint": "/users/1000000001/tweets", "params": {"max_results": 100, "...": "..."}},
+  "response": {"data": ["..."], "includes": {"media": ["..."]}, "meta": {"next_token": "..."}}
+}
+```
+
+`request.params` holds the query parameters (the bearer token is a header and is never stored); `response` is the body as received. `fetched_at` is the same value the page's messages carry. Each message has an optional `raw_key` (additive, `schema_version` stays 1) and the Tweet item stores it as `raw_key`, so any item can be traced to the page it came from.
+
+Pages are written once (`If-None-Match: *`; an existing key is the same page from an earlier attempt and is left alone). The `FetchFunction` role may only `s3:PutObject` under `raw/*`, and `ProcessFunction` is limited to `media/*` and `text/*`, so neither can overwrite or delete a raw page; only `ComplianceFunction` can, to redact a purged Tweet. No lifecycle rule touches `raw/`: nothing is expired, and noncurrent versions are expired only under `media/` and `text/`. There is no storage-class transition either: gzipped pages are far below the 128 KB minimum S3 applies to lifecycle transitions, so one would do nothing. The pages are encrypted, private and versioned like the media.
+
+A page the parser rejects (valid JSON of an unexpected shape) is landed first and then fails the run with the cursor unmoved, so the data is kept and can be replayed once the parser is fixed.
+
+**Retention and deletion.** A raw page holds up to 100 Tweets, so it is never deleted for one Tweet; pages are kept indefinitely. When a Tweet is purged (see [Data classification, retention and deletion](#data-classification-retention-and-deletion)), the compliance job rewrites every raw page that holds it: the Tweet and any `includes.media` only it used are removed, its ID is added to the envelope field `redactions` (a list of Tweet IDs), the page is put back at the same key and the older versions of that key are deleted. `replay` never replays a Tweet listed in `redactions`.
 
 ## Repository layout
 
@@ -252,6 +281,8 @@ Each object has the `Content-Type` of the source and user metadata `tweet-id`, `
 │   ├── credentials.py                 bearer token lookup and TTL cache
 │   ├── x_api.py                       X API v2 client (retries, rate limits, pagination)
 │   ├── models.py                      Tweet, Media, SQS messages (schema_version 1)
+│   ├── raw.py                         raw API pages: envelope, S3 keys, writer, reader
+│   ├── replay.py                      rebuild messages from raw pages (no API calls)
 │   ├── storage.py                     DynamoDB and S3 persistence, checkpoint store
 │   ├── cli.py                         `twitter-pipeline` command
 │   └── handlers/
@@ -322,9 +353,19 @@ export TWITTER_BEARER_TOKEN='<your bearer token>'
 uv run twitter-pipeline fetch --username NASA --dry-run
 ```
 
-It resolves the username, pages through the timeline, and prints one SQS message body per Tweet to stdout, as compact JSON on one line each. Logs go to stderr. Nothing is sent to SQS and no checkpoint is read or written. Without `--dry-run` it does the real fetch (needs `QUEUE_URL`, `STATE_TABLE` and AWS credentials) and prints a JSON summary of the run.
+It resolves the username, pages through the timeline, and prints one SQS message body per Tweet to stdout, as compact JSON on one line each. Logs go to stderr. Nothing is sent to SQS and no checkpoint is read or written. Without `--dry-run` it does the real fetch (needs `QUEUE_URL`, `STATE_TABLE` and AWS credentials) and prints a JSON summary of the run. A real CLI fetch lands raw pages in S3 like the Lambda and so needs `MEDIA_BUCKET` (exit 2 without it) unless you pass `--no-raw`; a dry run never writes anything.
 
 Other options: `--max-pages`, `--max-results` (5 to 100), `--since-id` and `--log-level`; see `uv run twitter-pipeline fetch --help`. Exit codes: 0 success; 1 an upstream or runtime failure (X API, malformed API data, an unreadable secret, enqueue, or an AWS SDK error such as SQS or DynamoDB access denied; the one-line message goes to stderr and the traceback shows with `--log-level DEBUG`); 2 bad arguments or configuration (invalid username, out-of-range option, missing `QUEUE_URL` or `STATE_TABLE`, or no bearer token configured).
+
+### Replay raw pages
+
+```bash
+export QUEUE_URL=$QUEUE   # not needed with --dry-run
+uv run twitter-pipeline replay --raw "s3://$(out MediaBucketName)/raw/1000000001/dt=2026-10-25/" --dry-run
+uv run twitter-pipeline replay --raw "s3://$(out MediaBucketName)/raw/1000000001/"
+```
+
+`replay` lists every object under the prefix (it must start with `raw/`; a trailing `/` is added, so the prefix matches whole path segments: `raw/1` selects `raw/1/...`, not `raw/10/...`; from a whole user down to one `dt=` day), reads the envelopes, re-parses each response with the same code the fetch uses and enqueues the messages to `QUEUE_URL`, in key order. It calls no API and never reads or changes the fetch cursor. Messages are rebuilt with the envelope's `username`, its original `fetched_at` and the object's key as `raw_key`: for an unchanged parser the bodies are identical to what the fetch sent. Because `fetched_at` is the original one, the processor's conditional write keeps a replay from overwriting an item fetched later; it rewrites items of the same fetch. `--dry-run` prints the bodies to stdout and makes no queue calls. Zero-byte keys ending in `/` (console folders) are skipped and listed in the summary. An object that can't be read (not gzip, wrong envelope, an invalid `fetched_at`) stops the replay with its key in the error (exit 1), and so does a prefix with no pages (zero objects); the log has a `replayed <key>` line per object, and `--start-after <key>` resumes after the last one. Needed permissions: `s3:ListBucket` on the bucket (prefix `raw/`), `s3:GetObject` on `raw/*` and, unless `--dry-run`, `sqs:SendMessage` on the queue. a bad URI or a missing `QUEUE_URL` exits 2. Replay is safe to repeat. It is the way to reprocess after a parser change or to restore a wiped table; use the DLQ redrive below for messages that merely failed.
 
 ### Environment variables
 
@@ -336,7 +377,7 @@ Other options: `--max-pages`, `--max-results` (5 to 100), `--since-id` and `--lo
 | `QUEUE_URL` | fetch | none | URL of the tweets queue |
 | `STATE_TABLE` | fetch | none | Name of the checkpoint table |
 | `TWEETS_TABLE` | process, media-retry | none | Name of the tweets table |
-| `MEDIA_BUCKET` | process, media-retry | none | Name of the media bucket |
+| `MEDIA_BUCKET` | fetch, process, media-retry, CLI fetch | none | Name of the media bucket. The fetch needs it to land raw pages and fails without it. A non-dry CLI fetch also requires it (exit 2) unless `--no-raw` is given: the fetch moves the shared cursor, so skipping raw pages loses them for good |
 | `MAX_RESULTS` | fetch | `100` | Tweets per API page, 5 to 100 |
 | `MAX_PAGES` | fetch | `5` | Maximum pages per run, at least 1 |
 | `X_API_BASE_URL` | fetch | `https://api.x.com/2` | API base URL, for testing against a stub |
@@ -493,11 +534,13 @@ sam local invoke ProcessFunction --event events/sqs.json
 
 **Policy of this pipeline.** Apart from source deletions, data is kept forever by default; the owner's never-lose-data rule is not overridden by anything else. Deleting at the source is the one deliberate exception.
 
-- *Deleted, protected, withheld or suspended at the source.* A scheduled compliance function re-checks stored Tweet IDs with `GET /2/tweets?ids=` (100 per request). A Tweet the API reports as unavailable is **tombstoned** at once: `deleted_at`, `deletion_reason` and the index marker `tombstone` are set, and its content stays in place. If the Tweet is seen again while still inside the grace period (a protected account may come back) the tombstone is cleared. After `DeletionGraceHours` the function **purges** it: every S3 object the item points to (`media[].s3_key`, any `preview_s3_key`, `text_s3_key`, `display_text_s3_key`) is deleted with **all its versions and delete markers** (the bucket is versioned), then the item is deleted. S3 goes first, so a failed run still finds the keys on retry.
+- *Deleted, protected, withheld or suspended at the source.* A scheduled compliance function re-checks stored Tweet IDs with `GET /2/tweets?ids=` (100 per request). A Tweet the API reports as unavailable is **tombstoned** at once: `deleted_at`, `deletion_reason` and the index marker `tombstone` are set, and its content stays in place. If the Tweet is seen again while still inside the grace period (a protected account may come back) the tombstone is cleared. After `DeletionGraceHours` the function **purges** it: every S3 object the item points to (`media[].s3_key`, any `preview_s3_key`, `text_s3_key`, `display_text_s3_key`) is deleted with **all its versions and delete markers** (the bucket is versioned), and the Tweet is removed from every **raw page** that holds it and from any `quarantine/` object that names it (below). Last, the item is replaced by a content-free **tombstone** that keeps only `tweet_id`, `deleted_at`, `deletion_reason` and `purged_at`. S3 goes first, so a failed run still finds the keys on retry.
 - *Never on ambiguity.* A response that omits an ID from both `data` and `errors`, or an error it doesn't recognize, is "unknown": the Tweet is left alone and checked again next cycle. Only `resource-not-found` (deleted), `not-authorized-for-resource` (protected) and errors whose text says suspended or withheld tombstone a Tweet.
 - *Optional retention.* `RetentionDays` above 0 writes `expires_at = stored_at + days` on each item, which the table's TTL deletes (TTL runs within about 48 hours of expiry), and adds S3 expiration rules for `media/` and `text/`. TTL deletes the item but not S3 objects, so the lifecycle rules are what remove those; the two clocks start at different moments (item write and object upload) and refetching an item moves its `expires_at`. With the default 0 nothing expires.
 - *Edits.* An edited post gets a new ID; the old versions stay and are checked like any other Tweet, so they go when X reports them unavailable.
-- *Permissions.* Only `ComplianceFunction` can delete: `dynamodb:DeleteItem`/`UpdateItem` on the tweets table and `s3:DeleteObject`/`DeleteObjectVersion` on `media/*` and `text/*` (a template test enforces that no other function has any).
+- *Raw pages and quarantine.* The pages are found from the item's `raw_key` and by listing `raw/<author_id>/` from the Tweet's creation day to the day of its `raw_key` (a re-fetch lands the same Tweet in more than one page; an item without a `raw_key` is searched to the end of the account's pages). Each page found is rewritten as described under [Raw API pages](#raw-api-pages). Objects under `quarantine/<author_id>/` (written by the malformed-Tweet handling of issue #16, where present) whose JSON has this `tweet_id` are deleted with all their versions; a bucket without that prefix is fine. If rewriting a page fails, nothing of that run's purge happens (the items keep naming what is left) and the function errors. The listing reads every page in the span, so a very large archive makes a purge run long; the run stops starting work when under 30 s remain and the rest waits for the next run.
+- *No resurrection.* `TweetStore.put_tweet` refuses any Tweet whose item has a `deleted_at`, tombstoned or purged, so neither a replay, a DLQ redrive nor an overlapping fetch can write it back (a refused write is logged and counts as processed). The process function also checks for a tombstone before it downloads any media, so a redelivered message can't put the media back either. A Tweet that reappears on X after a purge therefore stays out. To deliberately re-ingest one, delete its tombstone item (`aws dynamodb delete-item --table-name "$TWEETS_TABLE" --key '{"tweet_id":{"S":"<id>"}}'`) and then replay or refetch it; a raw page that was redacted keeps the ID in `redactions`, so edit that envelope's `redactions` too if a replay should include it. Tombstones inside the grace period are cleared by the job itself when X reports the Tweet present again.
+- *Permissions.* Only `ComplianceFunction` can delete: `dynamodb:DeleteItem`/`UpdateItem` on the tweets table and `s3:DeleteObject`/`DeleteObjectVersion` on `media/*`, `text/*`, `raw/*` and `quarantine/*`. It can also `s3:GetObject` on `raw/*` and `quarantine/*`, `s3:PutObject` on `raw/*` (the page rewrite) and list those prefixes. A template test enforces that no other function has any delete permission.
 
 **How often deletions are checked, and the worst-case window.** Each run walks the stored Tweets of the configured account oldest first through the GSI, checking at most `ComplianceMaxLookups` IDs (default 1,000, ten requests) and resuming where the last run stopped, wrapping around at the end. With N stored Tweets, B = `ComplianceMaxLookups`, S = the schedule period and G = `DeletionGraceHours`:
 
@@ -506,19 +549,21 @@ sam local invoke ProcessFunction --event events/sqs.json
 
 With the defaults and up to 1,000 stored Tweets that is one day to find it, plus 24 hours of grace, plus up to one more day for the purge run: at most about 3 days. To tighten it, run more often (`ComplianceSchedule: rate(1 hour)`), raise `ComplianceMaxLookups` so that N / B stays at 1, and lower `DeletionGraceHours`. Each checked ID is a post read on the X API, so the lookups are billed like any other read: 1,000 a day is small, but an archive of 100,000 Tweets checked daily is not. The function logs `tombstoned tweet ...` and `purged tweet ...` lines (stable text for metric filters, which come with issue #19) and a per-run `compliance run for ...` summary; an alarm fires when the function fails (a failed lookup, a failed purge, an invalid token).
 
-**Open item.** Raw API pages saved under the `raw/` prefix (issue #20) can contain deleted Tweets. The compliance function does not touch that prefix (its IAM scope is `media/` and `text/` only, and it refuses other keys), so the raw-pages lifecycle must cover it, by expiry or by the same purge, before raw pages are kept long term.
+**Worst-case window for raw pages.** Raw pages and quarantine objects are cleaned in the same run as the item's other content, so the window above covers them too; the only added delay is a purge run that fails or runs out of time and retries on the next schedule.
 
 ### Runbook: deletions and retention
 
 - *See what was tombstoned:* `aws dynamodb query --table-name "$TWEETS_TABLE" --index-name tombstone-deleted_at-index --key-condition-expression 'tombstone = :t' --expression-attribute-values '{":t":{"S":"1"}}'`.
 - *Run it now:* `sam remote invoke ComplianceFunction --stack-name "$STACK"`. The result counts `checked`, `tombstoned`, `cleared`, `purged`, `unknown` and says whether the walk `wrapped`.
 - *The alarm fired:* read the function's log group. A `purge <id>: ...` failure leaves the item in place with its keys, so the next run retries it; a refusal of a key outside `media/` and `text/` needs a manual look. A `lookup walk` failure keeps the cursor of the last good batch. An `AuthError` means the bearer token is wrong.
-- *Stop a wrongly tombstoned Tweet from being purged:* remove `deleted_at`, `deletion_reason` and `tombstone` from the item before the grace period ends (the next run clears it anyway if X reports it present). Inside the grace period nothing has been deleted.
+- *Stop a wrongly tombstoned Tweet from being purged:* remove `deleted_at`, `deletion_reason` and `tombstone` from the item before the grace period ends (the next run clears it anyway if X reports it present). Inside the grace period nothing has been deleted. After the purge there is nothing to restore except from a backup: the item is a tombstone, the S3 versions are gone and the raw pages are redacted (point-in-time recovery of the table is the only way back, and it would restore the deleted content, so don't).
 - *Change the policy:* update the stack parameters `RetentionDays`, `ComplianceSchedule`, `ComplianceMaxLookups` or `DeletionGraceHours`. Lowering `RetentionDays` does not retroactively set `expires_at` on stored items; it applies to items written afterwards.
 
 ## Operations
 
 Use the stack outputs from [Testing a deployment](#testing-a-deployment) (`$QUEUE`, `$DLQ`, `$FETCH`) in these runbooks.
+
+**Replay from raw pages.** To rebuild Tweet items without calling the API (a parser fix, a lost table, a new field), run `twitter-pipeline replay` on the affected `raw/` prefix; see [Replay raw pages](#replay-raw-pages). Unlike `--since-id`, it costs no API reads.
 
 **Redrive the DLQ.** An alarm on the DLQ means records failed `MaxReceiveCount` times. Read the process function's logs first (a malformed message will fail again; a stale message is skipped with a `stale write skipped ...` log line and can't overwrite newer data), fix the cause, then move the messages back before the 14-day retention expires them:
 

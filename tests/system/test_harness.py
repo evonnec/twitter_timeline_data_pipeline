@@ -84,7 +84,8 @@ def test_resources_have_the_template_settings(sim: Simulation) -> None:
     process_env = sim.process.spec.environment
     assert process_env["TWEETS_TABLE"] == sim.tweets_table.name
     assert process_env["MEDIA_BUCKET"] == sim.bucket
-    assert not set(fetch_env) & {"TWEETS_TABLE", "MEDIA_BUCKET"}
+    assert fetch_env["MEDIA_BUCKET"] == sim.bucket  # for the raw pages
+    assert "TWEETS_TABLE" not in fetch_env
     (event,) = sim.process.spec.sqs_events
     assert (event.batch_size, event.report_batch_item_failures) == (10, True)
     (schedule,) = sim.fetch.spec.schedules

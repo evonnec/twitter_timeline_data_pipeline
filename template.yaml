@@ -199,8 +199,15 @@ Resources:
             Status: Enabled
             AbortIncompleteMultipartUpload:
               DaysAfterInitiation: 7
+          # Per prefix, never bucket-wide: raw/ versions are never expired.
           - Id: expire-noncurrent-versions
             Status: Enabled
+            Prefix: media/
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+          - Id: expire-noncurrent-text-versions
+            Status: Enabled
+            Prefix: text/
             NoncurrentVersionExpiration:
               NoncurrentDays: 30
           - Id: tier-media
@@ -225,6 +232,9 @@ Resources:
               Prefix: text/
               ExpirationInDays: !Ref RetentionDays
             - !Ref AWS::NoValue
+          # No rule for raw/ on purpose: those pages are the only copy of fields the
+          # processor doesn't keep, so they are never expired or tiered (gzipped pages
+          # are far below the 128 KB S3 minimum for lifecycle transitions anyway).
 
   MediaBucketPolicy:
     Type: AWS::S3::BucketPolicy
@@ -340,6 +350,7 @@ Resources:
           BEARER_TOKEN_SECRET_ARN: !Ref BearerTokenSecret
           QUEUE_URL: !Ref TweetsQueue
           STATE_TABLE: !Ref StateTable
+          MEDIA_BUCKET: !Ref MediaBucket
           MAX_PAGES: !Ref MaxPages
           MAX_RESULTS: !Ref MaxResults
       Policies:
@@ -352,6 +363,10 @@ Resources:
             - Effect: Allow
               Action: [dynamodb:GetItem, dynamodb:PutItem]
               Resource: !GetAtt StateTable.Arn
+            # Raw API pages only: the fetcher can't touch media/ or text/ objects.
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub "${MediaBucket.Arn}/raw/*"
       EventInvokeConfig:
         # The next scheduled run retries; a retry would only burn API rate limit.
         MaximumRetryAttempts: 0
@@ -388,7 +403,10 @@ Resources:
           Statement:
             - Effect: Allow
               Action: [s3:PutObject, s3:GetObject, s3:AbortMultipartUpload]
-              Resource: !Sub "${MediaBucket.Arn}/*"
+              # media/ and text/ only: the processor can't touch raw/ pages.
+              Resource:
+                - !Sub "${MediaBucket.Arn}/media/*"
+                - !Sub "${MediaBucket.Arn}/text/*"
             # ListBucket makes HeadObject return 404 instead of 403 for missing keys.
             - Effect: Allow
               Action: s3:ListBucket
@@ -485,12 +503,24 @@ Resources:
               Resource: !GetAtt MediaBucket.Arn
               Condition:
                 StringLike:
-                  "s3:prefix": ["media/*", "text/*"]
+                  "s3:prefix": ["media/*", "text/*", "raw/*", "quarantine/*"]
             - Effect: Allow
               Action: [s3:DeleteObject, s3:DeleteObjectVersion]
               Resource:
                 - !Sub "${MediaBucket.Arn}/media/*"
                 - !Sub "${MediaBucket.Arn}/text/*"
+                - !Sub "${MediaBucket.Arn}/raw/*"
+                - !Sub "${MediaBucket.Arn}/quarantine/*"
+            # Raw pages are rewritten without a deleted Tweet; quarantined objects are
+            # only read (to find a Tweet) and deleted.
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource:
+                - !Sub "${MediaBucket.Arn}/raw/*"
+                - !Sub "${MediaBucket.Arn}/quarantine/*"
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub "${MediaBucket.Arn}/raw/*"
       EventInvokeConfig:
         # The next scheduled run retries; the cursor and tombstones persist.
         MaximumRetryAttempts: 0

@@ -690,6 +690,8 @@ def test_compliance_function_permissions(template: Template) -> None:
         frozenset({"dynamodb:GetItem", "dynamodb:PutItem"}),
         frozenset({"s3:ListBucketVersions", "s3:ListBucket"}),
         frozenset({"s3:DeleteObject", "s3:DeleteObjectVersion"}),
+        frozenset({"s3:GetObject"}),
+        frozenset({"s3:PutObject"}),
     }
     assert all(s["Effect"] == "Allow" for s in statements)
     state = by_actions[frozenset({"dynamodb:GetItem", "dynamodb:PutItem"})]
@@ -699,11 +701,24 @@ def test_compliance_function_permissions(template: Template) -> None:
     }
     deletes = by_actions[frozenset({"s3:DeleteObject", "s3:DeleteObjectVersion"})]
     assert [json_key(r) for r in deletes["Resource"]] == [
-        json_key({"Fn::Sub": "${MediaBucket.Arn}/media/*"}),
-        json_key({"Fn::Sub": "${MediaBucket.Arn}/text/*"}),
+        json_key({"Fn::Sub": f"${{MediaBucket.Arn}}/{prefix}/*"})
+        for prefix in ("media", "text", "raw", "quarantine")
     ]
+    reads = by_actions[frozenset({"s3:GetObject"})]
+    assert [json_key(r) for r in reads["Resource"]] == [
+        json_key({"Fn::Sub": f"${{MediaBucket.Arn}}/{prefix}/*"})
+        for prefix in ("raw", "quarantine")
+    ]
+    # the only write it has is the raw-page rewrite
+    writes = by_actions[frozenset({"s3:PutObject"})]
+    assert writes["Resource"] == {"Fn::Sub": "${MediaBucket.Arn}/raw/*"}
     listing = by_actions[frozenset({"s3:ListBucketVersions", "s3:ListBucket"})]
-    assert listing["Condition"]["StringLike"]["s3:prefix"] == ["media/*", "text/*"]
+    assert listing["Condition"]["StringLike"]["s3:prefix"] == [
+        "media/*",
+        "text/*",
+        "raw/*",
+        "quarantine/*",
+    ]
     query = by_actions[frozenset({"dynamodb:Query"})]
     assert query["Resource"] == {"Fn::Sub": "${TweetsTable.Arn}/index/*"}
 
@@ -740,3 +755,54 @@ def test_compliance_function_has_an_errors_alarm(template: Template) -> None:
         {"Name": "FunctionName", "Value": {"Ref": "ComplianceFunction"}}
     ]
     assert props["MetricName"] == "Errors"
+
+
+def test_fetch_function_writes_only_under_raw(template: Template) -> None:
+    statements = policy_statements(template, "FetchFunction")
+    (put,) = (s for s in statements if "s3:PutObject" in _as_list(s["Action"]))
+
+    assert put["Effect"] == "Allow"
+    assert put["Action"] == "s3:PutObject"
+    assert put["Resource"] == {"Fn::Sub": "${MediaBucket.Arn}/raw/*"}
+    # nothing else of S3: no reads, no listing, no other prefix
+    other = [
+        s
+        for s in statements
+        if s is not put and any(a.startswith("s3:") for a in _as_list(s["Action"]))
+    ]
+    assert other == []
+
+
+def test_fetch_function_gets_the_bucket_name(template: Template) -> None:
+    assert env_of(template, "FetchFunction")["MEDIA_BUCKET"] == {"Ref": "MediaBucket"}
+
+
+def test_no_lifecycle_rule_can_reach_raw_pages(template: Template) -> None:
+    rules = properties(template, "MediaBucket")["LifecycleConfiguration"]["Rules"]
+    # the retention rules sit behind HasRetention: look inside the condition
+    rules = [r["Fn::If"][1] if "Fn::If" in r else r for r in rules]
+    acting = {
+        "ExpirationInDays",
+        "ExpirationDate",
+        "ExpiredObjectDeleteMarker",
+        "NoncurrentVersionExpiration",
+        "NoncurrentVersionTransitions",
+        "Transitions",
+    }
+
+    for rule in rules:
+        if acting & rule.keys():
+            # every expiring or transitioning rule names its (non-raw) prefix
+            assert rule.get("Prefix") in {"media/", "text/"}, rule["Id"]
+    noncurrent = {r["Prefix"] for r in rules if "NoncurrentVersionExpiration" in r}
+    assert noncurrent == {"media/", "text/"}
+
+
+def test_process_function_cannot_write_raw_pages(template: Template) -> None:
+    statements = policy_statements(template, "ProcessFunction")
+    (objects,) = (s for s in statements if "s3:PutObject" in _as_list(s["Action"]))
+
+    assert objects["Resource"] == [
+        {"Fn::Sub": "${MediaBucket.Arn}/media/*"},
+        {"Fn::Sub": "${MediaBucket.Arn}/text/*"},
+    ]

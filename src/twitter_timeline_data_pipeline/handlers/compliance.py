@@ -14,9 +14,14 @@ scheduled run:
    ``tombstone``. A present Tweet whose tombstone is still inside the grace period has
    it cleared (a protected account may come back). An ID the API said nothing certain
    about is left alone: nothing is ever tombstoned on ambiguity.
-3. Purges every tombstone older than ``DELETION_GRACE_HOURS``: all versions of every S3
-   object the item points to, then the item itself (S3 first, so a retry after a
-   failure still finds the keys).
+3. Purges every tombstone older than ``DELETION_GRACE_HOURS``: the Tweet is removed
+   from every raw API page that holds it (the page is rewritten, the ID goes into its
+   ``redactions``, older versions are deleted) and from ``quarantine/``; all versions
+   of every S3 object the item points to are deleted; and the item is replaced by a
+   content-free tombstone (``tweet_id``, ``deleted_at``, ``deletion_reason``,
+   ``purged_at``). S3 goes first, so a retry after a failure still finds the keys. The
+   tombstone stays for good: ``TweetStore.put_tweet`` refuses a Tweet that has one, so
+   a replay or redrive can't bring the Tweet back.
 
 Tombstones are found through the sparse ``tombstone-deleted_at-index`` GSI, which holds
 only tombstoned items, so no run scans the table. Failures are logged and counted, the
@@ -24,9 +29,11 @@ run does as much of the rest as it can, and then raises so the error alarm fires
 """
 
 import functools
+import gzip
 import json
 import logging
-from collections.abc import Callable, Mapping
+import zlib
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, cast
 
@@ -37,6 +44,7 @@ from botocore.exceptions import ClientError
 from twitter_timeline_data_pipeline.config import Settings
 from twitter_timeline_data_pipeline.credentials import clear_cache, get_bearer_token
 from twitter_timeline_data_pipeline.models import utc_now_iso
+from twitter_timeline_data_pipeline.raw import RawPageError, redact_envelope
 from twitter_timeline_data_pipeline.x_api import (
     MAX_LOOKUP_IDS,
     AuthError,
@@ -207,11 +215,16 @@ class ComplianceStore:
         return sorted(keys)
 
     def delete_object_versions(self, key: str) -> int:
-        """Delete every version and delete marker of ``key``; return how many."""
+        """Delete every version and delete marker of an item's object (``media/`` or
+        ``text/`` only); return how many."""
         if not key.startswith(ALLOWED_KEY_PREFIXES):
             raise ComplianceError(
                 f"refusing to delete key outside media/ and text/: {key}"
             )
+        return self._delete_versions(key)
+
+    def _delete_versions(self, key: str, *, keep: str | None = None) -> int:
+        """Delete the versions and delete markers of ``key`` except ``keep``."""
         # List everything first, then delete: removing versions while paging would
         # move the page markers under the listing.
         version_ids: list[str] = []
@@ -221,8 +234,8 @@ class ComplianceStore:
             version_ids += [
                 entry["VersionId"]
                 for entry in (*page.get("Versions", ()), *page.get("DeleteMarkers", ()))
-                if entry["Key"] == key  # the prefix also matches longer keys
-            ]
+                if entry["Key"] == key and entry["VersionId"] != keep
+            ]  # the prefix also matches longer keys, hence the key check
             if not page.get("IsTruncated"):
                 break
             kwargs["KeyMarker"] = page["NextKeyMarker"]
@@ -231,20 +244,150 @@ class ComplianceStore:
             self._s3.delete_object(Bucket=self._bucket, Key=key, VersionId=version_id)
         return len(version_ids)
 
-    def purge(self, tweet_id: str) -> tuple[int, int] | None:
-        """Delete the Tweet's S3 objects (all versions), then its item.
-
-        Returns ``(objects, versions)`` removed, or None if the item was already gone.
-        S3 goes first: if a delete fails, the item still names the keys for the retry.
-        """
+    def load_item(self, tweet_id: str) -> dict[str, Any] | None:
         item = self._tweets.get_item(
             Key={"tweet_id": tweet_id}, ConsistentRead=True
         ).get("Item")
-        if item is None:
-            return None
+        return cast("dict[str, Any] | None", item)
+
+    # --- raw pages and quarantine -----------------------------------------------
+
+    @staticmethod
+    def _dt(key: str) -> str | None:
+        """``YYYY-MM-DD`` of a ``<prefix>/<user_id>/dt=YYYY-MM-DD/...`` key."""
+        parts = key.split("/")
+        if len(parts) > 3 and parts[2].startswith("dt="):
+            return parts[2].removeprefix("dt=")
+        return None
+
+    def _list(
+        self, prefix: str, start_after: str | None, last_dt: str | None
+    ) -> Iterator[str]:
+        """Keys under ``prefix`` after ``start_after``, up to the day ``last_dt``."""
+        options: dict[str, Any] = {"StartAfter": start_after} if start_after else {}
+        paginator = self._s3.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=self._bucket, Prefix=prefix, **options):
+            for entry in page.get("Contents", ()):
+                day = self._dt(entry["Key"])
+                if last_dt is not None and day is not None and day > last_dt:
+                    return
+                yield entry["Key"]
+
+    def _read(self, key: str) -> bytes | None:
+        try:
+            response = self._s3.get_object(Bucket=self._bucket, Key=key)
+            return response["Body"].read()
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") in ("NoSuchKey", "404"):
+                return None
+            raise
+
+    def redact_raw(self, items: Sequence[Mapping[str, Any]]) -> tuple[int, int]:
+        """Remove the items' Tweets from every raw page that holds them.
+
+        Pages are found from each item's ``raw_key`` and by listing
+        ``raw/<author_id>/`` from the Tweet's creation day (a re-fetch lands the same
+        Tweet in more than one page) up to the day of its ``raw_key`` (no limit when
+        there is none). A page is rewritten without the Tweet and with its ID in
+        ``redactions`` (so a replay skips it), put back at the same key, and its older
+        versions are deleted. ``quarantine/`` objects naming one of the Tweets
+        (``tweet_id``) are deleted with all their versions. Returns the number of raw
+        pages rewritten and quarantine objects deleted.
+        """
+        ids = {str(i["tweet_id"]) for i in items}
+        raw_keys = {
+            k
+            for i in items
+            if isinstance(k := i.get("raw_key"), str) and k.startswith("raw/")
+        }
+        quarantined: set[str] = set()
+        spans: dict[str, tuple[str, str | None]] = {}
+        for item in items:
+            user = item.get("author_id")
+            if not user:
+                continue
+            created = str(item.get("created_at") or "")[:10]
+            last = self._dt(str(item.get("raw_key") or "")) or None
+            lo, hi = spans.get(str(user), (created, last))
+            spans[str(user)] = (
+                min(lo, created),
+                None if hi is None or last is None else max(hi, last),
+            )
+        for user, (first, last) in spans.items():
+            start = f"/dt={first}/" if first else None
+            raw_keys.update(
+                self._list(f"raw/{user}/", start and f"raw/{user}{start}", last_dt=last)
+            )
+            quarantined.update(
+                self._list(
+                    f"quarantine/{user}/",
+                    start and f"quarantine/{user}{start}",
+                    last_dt=last,
+                )
+            )
+        pages = sum(self._redact_page(key, ids) for key in sorted(raw_keys))
+        removed = sum(self._drop_quarantined(key, ids) for key in sorted(quarantined))
+        return pages, removed
+
+    def _redact_page(self, key: str, ids: set[str]) -> int:
+        body = self._read(key)
+        if body is None:
+            return 0
+        try:
+            redacted, gone = redact_envelope(body, ids)
+        except RawPageError:
+            logger.warning("raw page %s is unreadable; left as it is", key)
+            return 0
+        if not gone:
+            return 0
+        put = self._s3.put_object(
+            Bucket=self._bucket,
+            Key=key,
+            Body=redacted,
+            ContentType="application/json",
+            ContentEncoding="gzip",
+        )
+        if version := put.get("VersionId"):
+            self._delete_versions(key, keep=version)
+        logger.warning("redacted raw page %s: removed tweets %s", key, sorted(gone))
+        return 1
+
+    def _drop_quarantined(self, key: str, ids: set[str]) -> int:
+        body = self._read(key)
+        if body is None:
+            return 0
+        try:
+            if body[:2] == b"\x1f\x8b":
+                body = gzip.decompress(body)
+            document = json.loads(body)
+        except OSError, EOFError, zlib.error, ValueError:
+            return 0
+        if not isinstance(document, dict) or str(document.get("tweet_id")) not in ids:
+            return 0
+        self._delete_versions(key)
+        logger.warning("deleted quarantined object %s", key)
+        return 1
+
+    def purge(self, item: Mapping[str, Any]) -> tuple[int, int]:
+        """Delete the item's S3 objects (all versions), then replace the item with a
+        content-free tombstone.
+
+        Returns ``(objects, versions)`` removed. S3 goes first: if a delete fails, the
+        item still names the keys for the retry. The tombstone keeps ``tweet_id``,
+        ``deleted_at``, ``deletion_reason`` and ``purged_at`` (and drops the sparse
+        index marker, so it is not purged again). ``put_tweet`` refuses any Tweet that
+        has a ``deleted_at``, so a replay or redrive can't bring the Tweet back.
+        """
         keys = self.s3_keys(item)
         versions = sum(self.delete_object_versions(key) for key in keys)
-        self._tweets.delete_item(Key={"tweet_id": tweet_id})
+        self._tweets.put_item(
+            Item={
+                "tweet_id": item["tweet_id"],
+                "deleted_at": item["deleted_at"],
+                "deletion_reason": item.get("deletion_reason", "deleted"),
+                "purged_at": utc_now_iso(),
+            }
+        )
         return len(keys), versions
 
 
@@ -271,6 +414,7 @@ class Compliance:
         self.tombstoned = 0
         self.cleared = 0
         self.purged = 0
+        self.raw_pages_redacted = 0
         self.unknown = 0
         self.failures: list[str] = []
         self.wrapped = False
@@ -352,32 +496,60 @@ class Compliance:
 
     def _purge_due(self, tombstones: Mapping[str, str]) -> None:
         cutoff = _iso(self._now() - self._grace)
-        for tweet_id, deleted_at in sorted(tombstones.items()):
-            if deleted_at > cutoff:
-                continue
-            if (
-                self._remaining_ms is not None
-                and self._remaining_ms() < SAFETY_MARGIN_MS
-            ):
-                logger.warning("out of time: remaining purges wait for the next run")
+        due = [
+            t for t, deleted_at in sorted(tombstones.items()) if deleted_at <= cutoff
+        ]
+        items: list[dict[str, Any]] = []
+        for tweet_id in due:
+            if self._out_of_time():
                 return
             try:
-                result = self._store.purge(tweet_id)
+                item = self._store.load_item(tweet_id)
+            except Exception as exc:
+                logger.exception("reading tweet %s failed", tweet_id)
+                self.failures.append(f"purge {tweet_id}: {type(exc).__name__}")
+                continue
+            if item is None or "tombstone" not in item:
+                logger.info("tweet %s was already removed", tweet_id)
+                continue
+            items.append(item)
+        if not items:
+            return
+        try:
+            pages, quarantined = self._store.redact_raw(items)
+        except Exception as exc:
+            # Nothing is purged: the item must keep naming what is still to remove.
+            logger.exception("redacting raw pages failed")
+            self.failures.append(f"raw pages: {type(exc).__name__}")
+            return
+        self.raw_pages_redacted += pages
+        for item in items:
+            tweet_id = str(item["tweet_id"])
+            if self._out_of_time():
+                return
+            try:
+                objects, versions = self._store.purge(item)
             except Exception as exc:
                 logger.exception("purging tweet %s failed", tweet_id)
                 self.failures.append(f"purge {tweet_id}: {type(exc).__name__}")
                 continue
-            if result is None:
-                logger.info("tweet %s was already removed", tweet_id)
-                continue
             self.purged += 1
             logger.warning(
-                "purged tweet %s: s3_objects=%d s3_versions=%d deleted_at=%s",
+                "purged tweet %s: s3_objects=%d s3_versions=%d raw_pages=%d "
+                "quarantined=%d deleted_at=%s",
                 tweet_id,
-                result[0],
-                result[1],
-                deleted_at,
+                objects,
+                versions,
+                pages,
+                quarantined,
+                item["deleted_at"],
             )
+
+    def _out_of_time(self) -> bool:
+        if self._remaining_ms is not None and self._remaining_ms() < SAFETY_MARGIN_MS:
+            logger.warning("out of time: remaining purges wait for the next run")
+            return True
+        return False
 
 
 def _short_timeouts() -> Config:
@@ -435,4 +607,5 @@ def handler(event: Any, context: Any) -> dict[str, Any]:
         "purged": job.purged,
         "unknown": job.unknown,
         "wrapped": job.wrapped,
+        "raw_pages_redacted": job.raw_pages_redacted,
     }

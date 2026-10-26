@@ -25,14 +25,21 @@ from twitter_timeline_data_pipeline.models import (
     TweetId,
     TweetMessage,
     normalize_username,
+    utc_now_iso,
 )
+from twitter_timeline_data_pipeline.raw import RawPageStore, s3_client
 from twitter_timeline_data_pipeline.storage import (
     CheckpointState,
     CheckpointStore,
     Gap,
     merge_gaps,
 )
-from twitter_timeline_data_pipeline.x_api import AuthError, RateLimitError, XClient
+from twitter_timeline_data_pipeline.x_api import (
+    AuthError,
+    PageParseError,
+    RateLimitError,
+    XClient,
+)
 
 if TYPE_CHECKING:
     from mypy_boto3_sqs import SQSClient
@@ -122,6 +129,22 @@ def _encode(messages: Sequence[TweetMessage]) -> list[str]:
     return bodies
 
 
+def send_messages(
+    sqs: SQSClient,
+    queue_url: str,
+    messages: Sequence[TweetMessage],
+    sleep: Callable[[float], None],
+) -> int:
+    """Encode (and size-check) every message, then send them in batches; returns the
+    number sent. Nothing is sent if any message is over the limit. Shared by the fetch
+    run and ``replay``."""
+    sent = 0
+    for chunk in _chunk_bodies(_encode(messages)):
+        _send_batch(sqs, queue_url, chunk, sleep)
+        sent += len(chunk)
+    return sent
+
+
 def _chunk_bodies(bodies: Sequence[str]) -> Iterator[list[str]]:
     """Group bodies into SendMessageBatch calls: at most ``SQS_BATCH_SIZE`` entries and
     ``SQS_MAX_MESSAGE_BYTES`` in total (SQS limits the whole call, not just each
@@ -179,6 +202,8 @@ class _Run:
     max_pages: int
     sleep: Callable[[float], None]
     now: Callable[[], datetime]
+    raw_pages: RawPageStore | None = None
+    """Where raw pages are landed before their messages are enqueued; None skips it."""
     pages: int = 0
     requests: int = 0
     tweets: int = 0
@@ -218,6 +243,21 @@ class _Run:
                 self.pages += 1
                 last = page
                 yield page
+        except PageParseError as exc:
+            self.requests += 1
+            # The response is valid JSON the parser rejects: keep it before failing,
+            # so the data can be replayed once the parser is fixed. Nothing is
+            # enqueued and the cursor stays.
+            if self.raw_pages is not None:
+                key = self.raw_pages.put(
+                    username=self.username,
+                    user_id=self.user_id,
+                    fetched_at=utc_now_iso(),
+                    page_no=self.pages + 1,
+                    page=exc.raw,
+                )
+                logger.error("unparseable page kept at %s: %s", key, exc)
+            raise
         except Exception:
             self.requests += 1
             raise
@@ -226,14 +266,27 @@ class _Run:
             self.ended_empty = True
 
     def enqueue(self, page: TimelinePage) -> list[int]:
-        """Send the page's messages; returns its Tweet IDs."""
-        messages = page.messages(self.username)
+        """Land the raw page, then send its messages; returns its Tweet IDs.
+
+        The raw upload comes first: if it fails nothing is enqueued, the run fails and
+        the cursor still covers the page's range, so no Tweet is lost.
+        """
+        stamp = utc_now_iso()
+        key = None
+        if self.raw_pages is not None:
+            assert page.raw is not None  # every page from iter_timeline carries it
+            key = self.raw_pages.put(
+                username=self.username,
+                user_id=self.user_id,
+                fetched_at=stamp,
+                page_no=self.pages,
+                page=page.raw,
+            )
+        messages = page.messages(self.username, fetched_at=stamp, raw_key=key)
         self.tweets += len(messages)
         # Every body is encoded (and size-checked) before anything is sent, so an
         # over-limit Tweet fails the page with nothing enqueued and the cursor unmoved.
-        for chunk in _chunk_bodies(_encode(messages)):
-            _send_batch(self.sqs, self.queue_url, chunk, self.sleep)
-            self.enqueued += len(chunk)
+        self.enqueued += send_messages(self.sqs, self.queue_url, messages, self.sleep)
         return [int(t.id) for t in page.tweets]
 
     def commit(self, seen: Sequence[int], gaps: Iterable[Gap]) -> None:
@@ -459,6 +512,7 @@ def run_fetch(
     max_pages: int,
     since_id: str | None = None,
     backfill: Gap | None = None,
+    raw_pages: RawPageStore | None = None,
     sleep: Callable[[float], None] = time.sleep,
     now: Callable[[], datetime] = lambda: datetime.now(UTC),
 ) -> FetchResult:
@@ -472,7 +526,9 @@ def run_fetch(
     oldest gap). A 429 ends the run cleanly (``stopped_reason="rate_limited"``) after
     saving; other errors propagate, with progress up to the last full page saved. An
     error in one gap is raised only after the remaining gaps have had their turn.
-    ``now`` is the clock used to age out empty gaps.
+    ``now`` is the clock used to age out empty gaps. With ``raw_pages`` every page
+    (empty ones that point onward included) is written to S3 before its messages are
+    enqueued, and each message carries the object's key as ``raw_key``.
     """
     username = normalize_username(username)
     user_id = x_client.get_user_id(username)
@@ -488,6 +544,7 @@ def run_fetch(
         max_pages=max_pages,
         sleep=sleep,
         now=now,
+        raw_pages=raw_pages,
     )
     since_id = since_id or run.state.newest_id
     stopped_reason: str | None = None
@@ -559,8 +616,9 @@ def _parse_backfill(raw: Any) -> Gap | None:
 
 def handler(event: Any, context: Any) -> dict[str, Any]:
     settings = Settings.from_env()
-    settings.require("queue_url", "state_table")
+    settings.require("queue_url", "state_table", "media_bucket")
     assert settings.queue_url and settings.state_table  # narrowed by require()
+    assert settings.media_bucket
 
     username = event.get("username") if isinstance(event, dict) else None
     username = username or settings.username
@@ -591,6 +649,7 @@ def handler(event: Any, context: Any) -> dict[str, Any]:
                 max_results=settings.max_results,
                 max_pages=settings.max_pages,
                 backfill=backfill,
+                raw_pages=RawPageStore(s3_client(), settings.media_bucket),
             )
     except AuthError:
         clear_cache()  # the token may have been rotated; re-read it next time

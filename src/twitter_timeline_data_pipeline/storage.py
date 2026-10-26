@@ -423,6 +423,9 @@ class PutResult:
     written: bool
     stored_fetched_at: str | None = None
     stored_schema_version: int | None = None
+    tombstoned: bool = False
+    """The Tweet was deleted or made unavailable at the source (the compliance job
+    tombstoned it), so nothing is written; the other fields are not set."""
 
 
 # DynamoDB items are limited to 400 KB (names and values together). A text is moved to
@@ -567,6 +570,7 @@ class TweetStore:
             ],
             "media_count": len(media),
             "fetched_at": message.fetched_at,
+            "raw_key": message.raw_key,
             "stored_at": utc_now_iso(),
             "schema_version": message.schema_version,
         }
@@ -586,6 +590,11 @@ class TweetStore:
         never replaces a stored long post, whatever its ``fetched_at``: the preview
         would erase the full text. A skipped write returns ``written=False`` with the
         stored values; any other DynamoDB error propagates.
+
+        A tombstoned Tweet (``deleted_at`` set, by the compliance job, also after its
+        content was purged) is never written, whatever the message says: that is what
+        keeps a replay or redrive from bringing a removed Tweet back. The result has
+        ``tombstoned=True``.
         """
         is_long = bool(message.tweet.note_text)
         keep_long_post = (
@@ -603,7 +612,8 @@ class TweetStore:
             self._table.put_item(
                 Item=self.build_item(message, media),
                 ConditionExpression=(
-                    "attribute_not_exists(tweet_id) OR ("
+                    "attribute_not_exists(tweet_id) OR "
+                    "(attribute_not_exists(deleted_at) AND "
                     "(attribute_not_exists(fetched_at) "
                     "OR fetched_at <= :fetched_at) AND "
                     "(attribute_not_exists(schema_version) "
@@ -617,6 +627,8 @@ class TweetStore:
                 "ConditionalCheckFailedException"
             ):
                 old = cast("dict[str, Any]", exc.response.get("Item") or {})
+                if "deleted_at" in old:
+                    return PutResult(written=False, tombstoned=True)
                 version = old.get("schema_version", {}).get("N")
                 if not is_long and old.get("is_long_post", {}).get("BOOL"):
                     logger.info(
@@ -631,6 +643,15 @@ class TweetStore:
                 )
             raise
         return PutResult(written=True)
+
+    def is_tombstoned(self, tweet_id: TweetId) -> bool:
+        """Whether the item is tombstoned (strongly consistent read)."""
+        item = self._table.get_item(
+            Key={"tweet_id": tweet_id},
+            ConsistentRead=True,
+            ProjectionExpression="deleted_at",
+        ).get("Item")
+        return item is not None and "deleted_at" in item
 
     def get_media(self, tweet_id: TweetId) -> list[dict[str, Any]] | None:
         """The item's ``media`` entries (strongly consistent), None if no such item."""

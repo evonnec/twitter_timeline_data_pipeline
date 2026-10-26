@@ -125,6 +125,17 @@ def process_records(
             continue
         try:
             message = TweetMessage.from_json(record["body"])
+            # Before any download: a Tweet removed at the source must not get its media
+            # back from a replay or a redrive (put_tweet refuses it too, but that is
+            # after the files are already in S3).
+            if tweet_store.is_tombstoned(message.tweet.id):
+                logger.info(
+                    "tweet %s is tombstoned (deleted at the source): message %s "
+                    "dropped, nothing downloaded",
+                    message.tweet.id,
+                    message_id,
+                )
+                continue
             # Media first: a transient failure must leave no metadata that points at
             # media that isn't there.
             stored: list[StoredMedia] = []
@@ -167,6 +178,13 @@ def process_records(
             logger.exception("message %s failed", message_id)
             failed.append(message_id)
         else:
+            if result.tombstoned:
+                logger.info(
+                    "write refused for tombstoned tweet %s (message %s)",
+                    message.tweet.id,
+                    message_id,
+                )
+                continue
             if not result.written:
                 # Not a failure: a newer version is already stored, so a retry or the
                 # DLQ would only repeat this.

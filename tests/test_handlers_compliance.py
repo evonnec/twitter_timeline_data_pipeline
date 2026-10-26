@@ -92,6 +92,8 @@ class Lookup:
 
 
 class Clock:
+    step = timedelta(seconds=1)
+
     def __init__(self) -> None:
         self.now = NOW
 
@@ -122,6 +124,13 @@ def run(aws: Aws, lookup: Lookup, clock: Clock, **kwargs: Any) -> Compliance:
     compliance_job = job(aws, lookup, clock, **kwargs)
     compliance_job.run(HANDLE)
     return compliance_job
+
+
+def assert_purged(aws: Aws, tweet_id: str) -> None:
+    """Only the content-free tombstone is left."""
+    stored = item(aws, tweet_id)
+    assert stored is not None
+    assert set(stored) == {"tweet_id", "deleted_at", "deletion_reason", "purged_at"}
 
 
 def versions(aws: Aws, key: str) -> list[str]:
@@ -211,7 +220,7 @@ def test_purge_after_grace_removes_every_s3_version_and_the_item(
     clock.now += GRACE + timedelta(seconds=1)
     result = run(aws, lookup, clock)
 
-    assert item(aws, gone) is None
+    assert_purged(aws, gone)
     for key in [media_key, *text_keys, f"media/1/{gone}-preview.jpg"]:
         assert versions(aws, key) == []
     assert versions(aws, f"media/1/{gone}-0.jpg.other")  # a different key is untouched
@@ -227,7 +236,7 @@ def test_zero_grace_purges_in_the_same_run(aws: Aws, clock: Clock) -> None:
     result = run(aws, Lookup({gone: "deleted"}), clock, grace=timedelta(0))
 
     assert (result.tombstoned, result.purged) == (1, 1)
-    assert item(aws, gone) is None
+    assert_purged(aws, gone)
 
 
 def test_reappearing_tweet_clears_its_tombstone(aws: Aws, clock: Clock) -> None:
@@ -268,7 +277,7 @@ def test_present_tweet_past_its_grace_period_is_purged_not_cleared(
     result = run(aws, Lookup(), clock)
 
     assert (result.cleared, result.purged) == (0, 1)
-    assert item(aws, tweet) is None
+    assert_purged(aws, tweet)
 
 
 def test_ambiguous_lookup_never_tombstones(
@@ -400,7 +409,7 @@ def test_lookup_failure_keeps_progress_still_purges_and_then_raises(
 
     assert failing_job.checked == 100
     assert store_for(aws).load_cursor(HANDLE) is not None  # progress kept
-    assert item(aws, old) is None  # purged despite the failing lookup
+    assert_purged(aws, old)  # purged despite the failing lookup
     assert failing_job.purged == 1
 
 
@@ -444,7 +453,7 @@ def test_purge_failure_leaves_the_item_for_a_retry_and_continues(
         failing_job.run(HANDLE)
 
     assert item(aws, bad) is not None  # still names its keys
-    assert item(aws, good) is None
+    assert_purged(aws, good)
     assert failing_job.purged == 1
 
 
@@ -590,8 +599,9 @@ def test_handler_runs_the_job_end_to_end(
         "purged": 1,
         "unknown": 0,
         "wrapped": True,
+        "raw_pages_redacted": 0,
     }
-    assert item(aws, gone) is None
+    assert_purged(aws, gone)
     assert item(aws, kept) is not None
     assert constructed[0]["token"] == TOKEN
     assert constructed[0]["max_rate_limit_wait"] == 60.0

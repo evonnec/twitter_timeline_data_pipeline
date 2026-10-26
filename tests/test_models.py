@@ -2,6 +2,7 @@ import json
 import logging
 import re
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -806,3 +807,18 @@ def test_integers_are_clamped_to_what_dynamodb_can_store() -> None:
     )
     assert media.variants[0].bit_rate == MAX_STORED_INT
     assert tweet.public_metrics["likes"] == MAX_STORED_INT
+
+
+def test_raw_key_is_an_additive_optional_field() -> None:
+    """``raw_key`` is omitted when unset (so v1 bodies are byte-identical), round
+    trips when set, and a golden v1 body without it still parses."""
+    golden = TweetMessage.from_json((FIXTURES / "message_v1.json").read_text())
+    assert golden.raw_key is None
+    assert "raw_key" not in golden.to_dict()
+
+    keyed = replace(golden, raw_key="raw/1/dt=2026-10-25/r-0001.json.gz")
+    again = TweetMessage.from_json(keyed.to_json())
+
+    assert again.raw_key == keyed.raw_key
+    assert again.schema_version == SCHEMA_VERSION == 1
+    assert json.loads(keyed.to_json())["raw_key"] == keyed.raw_key
