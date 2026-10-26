@@ -3,8 +3,10 @@
 Every write is idempotent, because SQS delivers at least once and the fetch Lambda may
 re-send a Tweet after a retry:
 
-- Tweets are keyed by ``tweet_id``; a repeat ``put_item`` replaces the item with the
-  same data (plus refreshed metrics).
+- Tweets are keyed by ``tweet_id`` and written conditionally: a delivery replaces the
+  stored item only if it is not older (by ``fetched_at`` and ``schema_version``), so a
+  stale redelivery can't overwrite newer data. A repeat of the same delivery rewrites
+  the same data.
 - Media objects get a deterministic S3 key, and an object that already exists is not
   downloaded again.
 """
@@ -258,8 +260,37 @@ class TweetStore:
         }
         return {k: v for k, v in item.items() if v is not None}
 
-    def put_tweet(self, message: TweetMessage, media: Sequence[StoredMedia]) -> None:
-        self._table.put_item(Item=self.to_item(message, media))
+    def put_tweet(self, message: TweetMessage, media: Sequence[StoredMedia]) -> bool:
+        """Write the item unless a newer one is stored; return whether it was written.
+
+        The write goes through if there is no item, or if the stored ``fetched_at`` is
+        not later than this message's and the stored ``schema_version`` (absent on
+        legacy items) is not higher. ``fetched_at`` is an ISO 8601 UTC string with
+        second precision, so string comparison is chronological. A tie rewrites the
+        item with the same data, which keeps a redelivery idempotent. A skipped stale
+        write returns False; any other DynamoDB error propagates.
+        """
+        try:
+            self._table.put_item(
+                Item=self.to_item(message, media),
+                ConditionExpression=(
+                    "attribute_not_exists(tweet_id) OR ("
+                    "fetched_at <= :fetched_at AND "
+                    "(attribute_not_exists(schema_version) "
+                    "OR schema_version <= :schema_version))"
+                ),
+                ExpressionAttributeValues={
+                    ":fetched_at": message.fetched_at,
+                    ":schema_version": message.schema_version,
+                },
+            )
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") == (
+                "ConditionalCheckFailedException"
+            ):
+                return False
+            raise
+        return True
 
 
 class CheckpointStore:

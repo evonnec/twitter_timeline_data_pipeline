@@ -16,6 +16,7 @@ from helpers import (
     ddb_get,
     ddb_items,
     install_x_api,
+    make_message,
     sqs_record,
     synthetic_timeline,
 )
@@ -250,3 +251,29 @@ def test_media_gone_for_good_is_recorded_not_retried(
     assert result == {"batchItemFailures": []}
     assert PHOTO_KEY not in s3_keys(pipeline)
     assert item(pipeline, PHOTO_TWEET)["media"][0]["status"] == "unavailable"
+
+
+def test_redriving_an_older_message_after_a_newer_one_leaves_the_item_unchanged(
+    pipeline: Aws,
+) -> None:
+    """A DLQ redrive days later must not replace newer metrics (review repro 3)."""
+
+    def message(likes: int, fetched_at: str) -> dict[str, Any]:
+        return sqs_record(
+            f"m{likes}",
+            make_message(
+                "7",
+                tweet={"public_metrics": {"like_count": likes}},
+                fetched_at=fetched_at,
+            ).to_json(),
+        )
+
+    newer = message(5000, "2026-10-25T12:00:00Z")
+    older = message(10, "2026-10-20T12:00:00Z")
+
+    assert process_handler({"Records": [newer]}, None) == {"batchItemFailures": []}
+    assert process_handler({"Records": [older]}, None) == {"batchItemFailures": []}
+
+    stored = item(pipeline, "7")
+    assert stored["public_metrics"] == {"like_count": 5000}
+    assert stored["fetched_at"] == "2026-10-25T12:00:00Z"
