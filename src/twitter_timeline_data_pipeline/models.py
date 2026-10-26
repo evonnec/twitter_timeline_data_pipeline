@@ -421,6 +421,18 @@ class RawPage:
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class QuarantinedItem:
+    """A Tweet or media object of an API page that could not be parsed. ``item`` is
+    the JSON exactly as received; ``tweet_id`` is its ``id`` when it has a usable one,
+    so the cursor can still move past it."""
+
+    kind: str  # "tweet" | "media"
+    item: Any
+    error: str
+    tweet_id: TweetId | None = None
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class TimelinePage:
     """One page of ``GET /2/users/:id/tweets`` with its media expansion resolved."""
 
@@ -431,6 +443,8 @@ class TimelinePage:
     next_token: str | None = None
     raw: RawPage | None = field(default=None, compare=False, repr=False)
     """The response this page was parsed from; None for a page built by hand."""
+    quarantined: tuple[QuarantinedItem, ...] = ()
+    """Items of the page that failed to parse. They are not in ``tweets``/``media``."""
 
     def messages(
         self,

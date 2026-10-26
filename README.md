@@ -44,7 +44,7 @@ A run, step by step:
 1. EventBridge invokes `FetchFunction` on the schedule (`rate(1 hour)` by default). The event may carry `{"username": "..."}`; otherwise the `TWITTER_USERNAME` setting is used. The name is normalized once (leading `@` removed, lower-cased) and used everywhere below.
 2. The function reads the bearer token from Secrets Manager (cached in memory for 15 minutes), resolves the username to a user ID, and reads the account's cursor from the state table: the newest Tweet ID already fetched, plus any *gaps* (ID ranges known to be unfetched; see the [state table](#state-table-statetable)).
 3. New Tweets first. It pages through `GET /2/users/:id/tweets` with `since_id` set to the newest ID, newest first, in pages of `MAX_RESULTS` Tweets. A first run has no `since_id`. `MAX_PAGES` is a budget of API requests, counting empty and failed ones; when gaps exist it is at least 2, one request is kept for the oldest gap, and the rest go to the new Tweets and the newest gaps.
-4. Each page is first written, unchanged, to the media bucket under `raw/` (see [Raw API pages](#raw-api-pages)). Only then does it become one message per Tweet, sent to the queue with `SendMessageBatch` (10 at a time; only entries SQS reports as failed are retried). Each message carries the raw object's key as `raw_key`. If the upload fails, nothing from that page is enqueued and the run fails with its cursor unmoved, so the page is fetched again by the next run.
+4. Each page is first written, unchanged, to the media bucket under `raw/` (see [Raw API pages](#raw-api-pages)). Only then does it become one message per Tweet, sent to the queue with `SendMessageBatch` (10 at a time; only entries SQS reports as failed are retried, and not those failed with `SenderFault`: see [Quarantine](#quarantine)). A Tweet that fails to parse is quarantined and the rest of the page goes on. Each message carries the raw object's key as `raw_key`. If the upload fails, nothing from that page is enqueued and the run fails with its cursor unmoved, so the page is fetched again by the next run.
 5. After each page is fully enqueued, the cursor is saved. While the page still has a `next_token`, the not-yet-fetched rest is recorded as a gap just below the lowest ID seen; a page without `next_token` closes it. So a run that hits the cap, a rate limit or an error leaves a gap, never a hole.
 6. Then the gaps. Whatever remains of the shared `MAX_PAGES` budget goes to the gaps, newest gap first, with `since_id` and `until_id` set to the gap's bounds. Each saved page lowers the gap's `until_id`, and the gap is removed when a page has no `next_token`.
 7. A 429 that resets later than the function will wait ends the run cleanly after saving: the invocation succeeds and the summary has `stopped_reason: "rate_limited"` (alerting on that comes with issue #19). Any other error fails the invocation, with progress up to the last full page saved; an error in one gap is raised only after the other gaps have had their turn. The next run resumes from the cursor and re-sends at most the page that was in flight.
@@ -241,6 +241,24 @@ The `FetchFunction` role may only `s3:PutObject` under `raw/*`. A lifecycle rule
 
 **Retention and deletion.** A raw page holds up to 100 Tweets, so it cannot be deleted for one Tweet. It is kept indefinitely. A job that honours deletion requests (issue #21) must treat `raw/` separately: removing a Tweet from the table does not remove it from the raw pages that contain it, and `replay` would restore it. Decide that policy (for example, rewriting or deleting the affected pages) before relying on `replay` after such deletions.
 
+### Quarantine
+
+Nothing is dropped, and one bad item doesn't block an account. Parsing is per item: a Tweet (or an `includes.media` object) that fails to parse, for example a `null` metric, is *quarantined* and the rest of the page is enqueued. A bad media object is treated as missing for its Tweet, which is still stored. The cursor may move past a quarantined Tweet because it is kept twice: in the raw page and in a quarantine object.
+
+```text
+quarantine/<user_id>/dt=YYYY-MM-DD/<run_id>-<page_no>-<index>.json
+```
+
+Each object is plain JSON (`application/json`): `{"kind": "tweet" | "media" | "message", "raw_key": "<the raw page>", "error": "...", "item": <the JSON as received>}`. `run_id` and `page_no` match the raw page's key (`index` counts the page's quarantined items from 000). A `message` is an SQS message body that SQS rejected with `SenderFault` (for example an oversized one): such an entry would fail the same way again, so it isn't retried, it is quarantined and the run goes on. Entries that failed for other reasons are still retried, and `EnqueueError` is raised if they keep failing.
+
+If a quarantine write fails (or there is no media bucket to write to), the page fails like a failed raw upload: nothing is enqueued, the cursor stays and the next run fetches it again. The `FetchFunction` role may `s3:PutObject` under `quarantine/*` only.
+
+Every quarantined item logs a stable line: `unparseable <kind> quarantined: id=... error=...` (ERROR, when parsed) and `quarantined <kind>: key=... raw_key=... error=...` (WARNING, when written). Errors alongside data log `timeline page N has K partial error(s); first: ...` (WARNING). Alarms on these come with issue #19.
+
+**Inspect and recover.** List and read the objects with `aws s3 ls "s3://$BUCKET/quarantine/$USER_ID/" --recursive` and `aws s3 cp <key> -`. To recover Tweets and media, fix the parser, then replay the raw prefix: `twitter-pipeline replay --raw s3://$BUCKET/raw/<user_id>/dt=.../` (see [Replay raw pages](#replay-raw-pages)). Replay re-parses the raw pages with the fixed code, so the formerly quarantined items are parsed this time; anything that still fails is quarantined again, with the replay's own run ID. For a `message` object, `item` is the message body: fix the cause (a size limit, say) and send it with `aws sqs send-message`.
+
+**Errors-only responses.** A 200 with `errors` and no `data` is never read as an empty timeline. It raises a typed error and the run fails: `AccessError` for the problem type `not-authorized-for-resource` (e.g. the account went protected), `NotFoundError` for `resource-not-found`, a plain `XApiError` for any other.
+
 ## Repository layout
 
 ```text
@@ -266,6 +284,7 @@ The `FetchFunction` role may only `s3:PutObject` under `raw/*`. A lifecycle rule
 │   ├── x_api.py                       X API v2 client (retries, rate limits, pagination)
 │   ├── models.py                      Tweet, Media, SQS messages (schema_version 1)
 │   ├── raw.py                         raw API pages: envelope, S3 keys, writer, reader
+│   ├── quarantine.py                  quarantine objects: key layout and writer
 │   ├── replay.py                      rebuild messages from raw pages (no API calls)
 │   ├── storage.py                     DynamoDB and S3 persistence, checkpoint store
 │   ├── cli.py                         `twitter-pipeline` command
@@ -348,7 +367,7 @@ uv run twitter-pipeline replay --raw "s3://$(out MediaBucketName)/raw/1000000001
 uv run twitter-pipeline replay --raw "s3://$(out MediaBucketName)/raw/1000000001/"
 ```
 
-`replay` lists every object under the prefix (it must start with `raw/`; any prefix of a key works, from a whole user down to one run), reads the envelopes, re-parses each response with the same code the fetch uses and enqueues the messages to `QUEUE_URL`, in key order. It calls no API and never reads or changes the fetch cursor. Messages are rebuilt with the envelope's `username`, its original `fetched_at` and the object's key as `raw_key`: for an unchanged parser the bodies are identical to what the fetch sent. Because `fetched_at` is the original one, the processor's conditional write keeps a replay from overwriting an item fetched later; it rewrites items of the same fetch. `--dry-run` prints the bodies to stdout and makes no queue calls. An object that can't be read stops the replay with its key in the error (exit 1); a bad URI or a missing `QUEUE_URL` exits 2. Replay is safe to repeat. It is the way to reprocess after a parser change or to restore a wiped table; use the DLQ redrive below for messages that merely failed.
+`replay` lists every object under the prefix (it must start with `raw/`; any prefix of a key works, from a whole user down to one run), reads the envelopes, re-parses each response with the same code the fetch uses and enqueues the messages to `QUEUE_URL`, in key order. It calls no API and never reads or changes the fetch cursor. Messages are rebuilt with the envelope's `username`, its original `fetched_at` and the object's key as `raw_key`: for an unchanged parser the bodies are identical to what the fetch sent. Because `fetched_at` is the original one, the processor's conditional write keeps a replay from overwriting an item fetched later; it rewrites items of the same fetch. Items that fail to parse, and messages SQS rejects with `SenderFault`, are quarantined in the same bucket as in a fetch (see [Quarantine](#quarantine)); a dry run only logs them. `--dry-run` prints the bodies to stdout and makes no queue calls. An object that can't be read stops the replay with its key in the error (exit 1); a bad URI or a missing `QUEUE_URL` exits 2. Replay is safe to repeat. It is the way to reprocess after a parser change or to restore a wiped table; use the DLQ redrive below for messages that merely failed.
 
 ### Environment variables
 

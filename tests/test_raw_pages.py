@@ -379,7 +379,7 @@ def test_replay_of_a_response_that_cannot_be_parsed_names_the_key(aws: Aws) -> N
         user_id="1",
         fetched_at=STAMP,
         request={},
-        response={"data": [{"no": "id"}]},
+        response={"data": "oops"},
     )
     aws.s3.put_object(Bucket=BUCKET, Key="raw/1/x.json.gz", Body=envelope.to_bytes())
 

@@ -317,7 +317,7 @@ def test_malformed_upstream_data_exits_one(
         response = stub(request)
         if request.url.path.endswith("/tweets"):
             body = response.json()
-            body["data"][0]["public_metrics"]["like_count"] = "n/a"
+            body["data"] = "n/a"
             return httpx.Response(200, json=body)
         return response
 
@@ -326,7 +326,7 @@ def test_malformed_upstream_data_exits_one(
     code = main([*FETCH, "--dry-run"])
 
     assert code == EXIT_FAILURE
-    assert "n/a" in capsys.readouterr().err
+    assert "non-list data" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize(
