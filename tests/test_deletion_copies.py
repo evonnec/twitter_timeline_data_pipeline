@@ -118,7 +118,9 @@ def test_first_sight_marks_the_copy_and_keeps_its_content(
     done = run(aws, Lookup(gone={B: "deleted"}), clock)
 
     stored = entry(aws, quoting)
-    assert stored["source_gone_since"] == "2026-10-26T12:00:00Z"
+    assert stored["status"] == "unavailable"
+    assert stored["unavailable_reason"] == "not_found"
+    assert stored["unavailable_since"] == "2026-10-26T12:00:00Z"
     assert stored["text"] == "what the original said"
     assert stored["author_username"] == "someone"
     assert int(item(aws, quoting)["revision"]) == before + 1  # type: ignore[index]
@@ -149,6 +151,7 @@ def test_the_copy_is_scrubbed_once_the_grace_period_has_passed(
         "id": B,
         "type": "quoted",
         "status": "unavailable",
+        "unavailable_reason": "not_found",
         "unavailable_since": "2026-10-26T12:00:00Z",
     }
     assert versions(aws, key_b) == []  # every version and delete marker
@@ -178,11 +181,11 @@ def test_zero_grace_scrubs_at_first_sight(aws: Aws, clock: Clock) -> None:
 def test_a_post_that_comes_back_clears_the_mark(aws: Aws, clock: Clock) -> None:
     quoting = put_quote(aws, 1, B)
     run(aws, Lookup(gone={B: "protected"}), clock)
-    assert "source_gone_since" in entry(aws, quoting)
+    assert entry(aws, quoting).get("status") == "unavailable"
 
     done = run(aws, Lookup(), clock)
 
-    assert "source_gone_since" not in entry(aws, quoting)
+    assert entry(aws, quoting).get("status") is None
     assert entry(aws, quoting)["text"] == "what the original said"
     assert done.copies_unmarked == 1
 
@@ -262,15 +265,15 @@ def test_the_references_walk_stops_where_an_item_no_longer_fits_and_resumes(
 
     run(aws, first, clock, max_lookups=6)  # budget 3: item one fits (2), two doesn't
 
-    assert "source_gone_since" in entry(aws, a, ids[0])
-    assert "source_gone_since" not in entry(aws, b, ids[2])
+    assert entry(aws, a, ids[0]).get("status") == "unavailable"
+    assert entry(aws, b, ids[2]).get("status") is None
     store = store_for(aws)
     assert store.load_cursor(REFERENCES_CURSOR) is not None
 
     run(aws, first, clock, max_lookups=6)
 
-    assert "source_gone_since" in entry(aws, b, ids[2])
-    assert "source_gone_since" in entry(aws, b, ids[3])
+    assert entry(aws, b, ids[2]).get("status") == "unavailable"
+    assert entry(aws, b, ids[3]).get("status") == "unavailable"
 
 
 def test_the_walk_wraps_and_the_cursor_is_kept(aws: Aws, clock: Clock) -> None:
@@ -327,7 +330,10 @@ def test_the_item_changing_after_the_scan_is_read_again(aws: Aws, clock: Clock) 
     )
 
     result = store.update_copies(
-        snapshot, {B: False}, now="2026-10-26T12:00:00Z", cutoff="2026-10-26T12:00:00Z"
+        snapshot,
+        {B: "deleted"},
+        now="2026-10-26T12:00:00Z",
+        cutoff="2026-10-26T12:00:00Z",
     )
 
     assert result == (0, 0, 1)
@@ -356,9 +362,9 @@ def test_copy_updates_give_up_after_three_lost_races(aws: Aws, clock: Clock) -> 
     busy = ComplianceStore(Busy(), aws.state_table, aws.s3, aws.bucket)  # type: ignore[arg-type]
 
     with pytest.raises(ComplianceError, match="copy updates"):
-        busy.update_copies(snapshot, {B: False}, now="n", cutoff="z")
+        busy.update_copies(snapshot, {B: "deleted"}, now="n", cutoff="z")
 
-    assert "source_gone_since" not in entry(aws, quoting)
+    assert entry(aws, quoting).get("status") is None
 
 
 def test_a_copy_update_leaves_a_tombstoned_or_vanished_item_alone(
@@ -369,10 +375,16 @@ def test_a_copy_update_leaves_a_tombstoned_or_vanished_item_alone(
     (snapshot,) = store.page_references(None, 10)[0]
     store.tombstone(quoting, "deleted", "2026-10-26T12:00:00Z")
 
-    assert store.update_copies(snapshot, {B: False}, now="n", cutoff="z") == (0, 0, 0)
-    assert "source_gone_since" not in entry(aws, quoting)
+    assert store.update_copies(snapshot, {B: "deleted"}, now="n", cutoff="z") == (
+        0,
+        0,
+        0,
+    )
+    assert entry(aws, quoting).get("status") is None
     aws.tweets_table.delete_item(Key={"tweet_id": quoting})
-    store.update_copies(snapshot, {B: False}, now="n", cutoff="z")  # lost race, gone
+    store.update_copies(
+        snapshot, {B: "deleted"}, now="n", cutoff="z"
+    )  # lost race, gone
 
 
 def test_a_failing_update_is_reported_and_the_rest_goes_on(
@@ -392,7 +404,7 @@ def test_a_failing_update_is_reported_and_the_rest_goes_on(
     with pytest.raises(ComplianceError, match="copies"):
         job(aws, Lookup(gone={B: "deleted", C: "deleted"}), clock).run(HANDLE)
 
-    assert "source_gone_since" in entry(aws, second, C)
+    assert entry(aws, second, C).get("status") == "unavailable"
 
 
 def test_a_failing_scrub_is_reported_and_leaves_the_copy(
@@ -688,7 +700,7 @@ def test_copy_updates_propagate_other_errors(aws: Aws) -> None:
     broken = ComplianceStore(Throttled(), aws.state_table, aws.s3, aws.bucket)  # type: ignore[arg-type]
 
     with pytest.raises(ClientError):
-        broken.update_copies(snapshot, {B: False}, now="n", cutoff="z")
+        broken.update_copies(snapshot, {B: "deleted"}, now="n", cutoff="z")
 
 
 def test_an_entry_without_a_lookup_result_is_left_alone(aws: Aws) -> None:
@@ -782,5 +794,65 @@ def test_a_legacy_item_without_a_revision_takes_copy_updates(
 
     run(aws, Lookup(gone={B: "deleted"}), clock)
 
-    assert "source_gone_since" in entry(aws, quoting)
+    assert entry(aws, quoting).get("status") == "unavailable"
     assert int(item(aws, quoting)["revision"]) == 1  # type: ignore[index]
+
+
+def test_the_scrub_removes_the_copys_entities_objects_and_pointers(
+    versioned: Aws, clock: Clock
+) -> None:
+    aws = versioned
+    quoting = put_quote(aws, 1, B)
+    base = f"text/{USER_ID}/{quoting}.ref.{B}."
+    hashed = [
+        base + "entities.0123456789abcdef.json",
+        base + "entities.fedcba9876543210.json",  # an older version of the entities
+        base + "display_entities.0123456789abcdef.json",
+    ]
+    other = f"text/{USER_ID}/{quoting}.ref.{C}.entities.0123456789abcdef.json"
+    for key in (*hashed, other):
+        aws.s3.put_object(Bucket=aws.bucket, Key=key, Body=b"{}")
+    aws.tweets_table.update_item(
+        Key={"tweet_id": quoting},
+        UpdateExpression=(
+            "SET referenced_tweets[0].entities_s3_key = :k "
+            "REMOVE referenced_tweets[0].entities"
+        ),
+        ExpressionAttributeValues={":k": hashed[0]},
+    )
+
+    run(aws, Lookup(gone={B: "protected"}), clock, grace=clock.step * 0)
+
+    assert entry(aws, quoting) == {
+        "id": B,
+        "type": "quoted",
+        "status": "unavailable",
+        "unavailable_reason": "not_authorized",
+        "unavailable_since": "2026-10-26T12:00:00Z",
+    }
+    for key in hashed:
+        assert versions(aws, key) == []
+    assert len(versions(aws, other)) == 1
+
+
+def test_the_purge_covers_the_entities_objects_of_the_tweet(
+    versioned: Aws, clock: Clock
+) -> None:
+    aws = versioned
+    gone = put(aws, 1)
+    keys = [
+        f"text/{USER_ID}/{gone}.entities.0123456789abcdef.json",
+        f"text/{USER_ID}/{gone}.entities.fedcba9876543210.json",
+        f"text/{USER_ID}/{gone}.display_entities.0123456789abcdef.json",
+        f"text/{USER_ID}/{gone}.ref.7.entities.0123456789abcdef.json",
+    ]
+    longer = f"text/{USER_ID}/{gone}0.entities.0123456789abcdef.json"
+    for key in (*keys, longer):
+        aws.s3.put_object(Bucket=aws.bucket, Key=key, Body=b"{}")
+
+    run(aws, Lookup(gone={gone: "deleted"}), clock, grace=clock.step * 0)
+
+    assert_purged(aws, gone)
+    for key in keys:
+        assert versions(aws, key) == []
+    assert len(versions(aws, longer)) == 1

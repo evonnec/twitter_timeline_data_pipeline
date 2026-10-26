@@ -166,29 +166,53 @@ def _send_batch(
     raise EnqueueError(f"{len(pending)} messages still failing after retries")
 
 
-def _encode(messages: Sequence[TweetMessage]) -> list[str]:
-    """The JSON bodies, or ``MessageTooLargeError`` if any exceeds the SQS limit."""
+def _encode(messages: Sequence[TweetMessage], *, allow_slim: bool = True) -> list[str]:
+    """The JSON bodies, or ``MessageTooLargeError`` if any exceeds the SQS limit.
+
+    A body over the limit is slimmed in stages while it has the raw page to read the
+    content back from: the referenced posts' ``note_text``, then their ``entities``,
+    then the Tweet's own ``entities`` (each marked omitted; the processor refills them
+    from the raw page, so nothing is lost). With ``allow_slim`` false (a replay whose
+    raw pages are not in the processor's bucket) that is refused instead."""
     bodies = []
     for message in messages:
         body = message.to_json()
         size = len(body.encode())
-        if size > SQS_MAX_MESSAGE_BYTES and message.raw_key and message.referenced:
-            # Referenced long posts can push a body over the limit. Their full text
-            # is in the raw page, so leave it out and let the processor read it back:
-            # lossless, and the run does not stall on the Tweet.
-            slim = message.without_referenced_notes()
+        tweet = message.tweet
+        if (
+            size > SQS_MAX_MESSAGE_BYTES
+            and message.raw_key
+            and (message.referenced or tweet.entities or tweet.display_entities)
+        ):
+            if not allow_slim:
+                raise MessageTooLargeError(
+                    f"tweet {tweet.id}: message body is {size} bytes, over the "
+                    f"{SQS_MAX_MESSAGE_BYTES} byte SQS limit, and slimming it needs "
+                    f"the processor to read {message.raw_key} back, which it does "
+                    "only from its own MEDIA_BUCKET; replay from the configured "
+                    "media bucket instead"
+                )
+            slim = message
+            for stage in (
+                TweetMessage.without_referenced_notes,
+                TweetMessage.without_referenced_entities,
+                TweetMessage.without_entities,
+            ):
+                slim = stage(slim)
+                body = slim.to_json()
+                size = len(body.encode())
+                if size <= SQS_MAX_MESSAGE_BYTES:
+                    break
             logger.warning(
-                "tweet %s: message body is %d bytes, over the limit; referenced note "
-                "texts left out, to be read from %s",
-                message.tweet.id,
+                "tweet %s: message body is over the limit; notes and entities left "
+                "out (now %d bytes), to be read from %s",
+                tweet.id,
                 size,
                 message.raw_key,
             )
-            body = slim.to_json()
-            size = len(body.encode())
         if size > SQS_MAX_MESSAGE_BYTES:
             raise MessageTooLargeError(
-                f"tweet {message.tweet.id}: message body is {size} bytes, over the "
+                f"tweet {tweet.id}: message body is {size} bytes, over the "
                 f"{SQS_MAX_MESSAGE_BYTES} byte SQS limit"
             )
         bodies.append(body)
@@ -201,12 +225,14 @@ def send_messages(
     messages: Sequence[TweetMessage],
     sleep: Callable[[float], None],
     reject: Callable[[str, str], None] | None = None,
+    *,
+    allow_slim: bool = True,
 ) -> int:
     """Encode (and size-check) every message, then send them in batches; returns the
     number sent (``reject``ed ones, see ``_send_batch``, are not counted). Nothing is
     sent if any message is over the limit. Shared by the fetch run and ``replay``."""
     sent = 0
-    for chunk in _chunk_bodies(_encode(messages)):
+    for chunk in _chunk_bodies(_encode(messages, allow_slim=allow_slim)):
         sent += _send_batch(sqs, queue_url, chunk, sleep, reject)
     return sent
 

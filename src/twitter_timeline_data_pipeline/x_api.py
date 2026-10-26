@@ -234,7 +234,34 @@ def parse_timeline_page(
         quarantined=tuple(quarantined),
         included=included,
         requested=requested,
+        unavailable=_unavailable_posts(body.get("errors")),
     )
+
+
+# The ``errors`` problem types that say a referenced post is gone, with the reason
+# stored for it. No other error (and no absence of one) marks a post unavailable.
+_UNAVAILABLE_PROBLEMS = {
+    "resource-not-found": "not_found",
+    "not-authorized-for-resource": "not_authorized",
+}
+
+
+def _unavailable_posts(errors: Any) -> dict[str, str]:
+    """Post ID -> ``not_found`` / ``not_authorized`` for the entries of a response's
+    ``errors`` that name a post by ``resource_id`` with one of those two problem types
+    (a deleted, or a protected, original). Anything else is ignored."""
+    out: dict[str, str] = {}
+    for entry in errors if isinstance(errors, list) else ():
+        if not isinstance(entry, Mapping) or entry.get("resource_type") == "user":
+            continue
+        kind, post_id = entry.get("type"), entry.get("resource_id")
+        if not isinstance(kind, str) or not isinstance(post_id, str):
+            continue
+        if not valid_tweet_id(post_id):
+            continue
+        if reason := _UNAVAILABLE_PROBLEMS.get(kind.rstrip("/").rsplit("/", 1)[-1]):
+            out.setdefault(post_id, reason)
+    return out
 
 
 def _requested(raw: RawPage | None) -> dict[str, bool]:
@@ -252,9 +279,8 @@ def _parse_includes(
 ) -> dict[str, ReferencedPost]:
     """The referenced posts of ``includes`` by ID, authors resolved from
     ``includes.users``. An entry that fails to parse is quarantined (as
-    ``included_tweet`` / ``included_user``, never counted by the cursor) and, for a
-    post whose ID is readable, stands in as a reference with nothing known (no
-    status): a post that could not be read is not one the API said is gone, so a
+    ``included_tweet`` / ``included_user``, never counted by the cursor). A post that
+    could not be read is not one the API said is gone: its reference stays bare, so a
     stored copy of it is kept."""
 
     def entries(*names: str) -> list[Any]:
@@ -277,8 +303,6 @@ def _parse_includes(
             post = ReferencedPost.from_api(entry, usernames)
         except Exception as exc:
             quarantined.append(_quarantine("included_tweet", entry, exc))
-            if isinstance(entry, Mapping) and valid_tweet_id(entry.get("id")):
-                posts[entry["id"]] = ReferencedPost(id=entry["id"])
         else:
             posts[post.id] = post
     return posts

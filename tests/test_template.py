@@ -746,15 +746,6 @@ def test_only_the_compliance_function_can_delete(template: Template) -> None:
             for p in properties(template, name)["Policies"]
             if isinstance(p, dict) and "Statement" not in p
         ]
-        if name == "ProcessFunction":
-            # the one exception: the text of a referenced original that became
-            # unavailable (#18), under text/* and nothing else
-            (delete,) = (
-                s for s in statements if "s3:DeleteObject" in _as_list(s["Action"])
-            )
-            assert delete["Action"] == "s3:DeleteObject"
-            assert delete["Resource"] == {"Fn::Sub": "${MediaBucket.Arn}/text/*"}
-            actions -= {"s3:DeleteObject"}
         has_delete = any(a.startswith(deleting_prefixes) for a in actions)
         assert has_delete == (name == "ComplianceFunction"), name
         assert not actions & deleting or name == "ComplianceFunction"
@@ -832,6 +823,38 @@ def test_process_function_cannot_write_raw_pages(template: Template) -> None:
         {"Fn::Sub": "${MediaBucket.Arn}/media/*"},
         {"Fn::Sub": "${MediaBucket.Arn}/text/*"},
     ]
+
+
+def test_process_function_s3_access_is_exactly_this_and_never_deletes(
+    template: Template,
+) -> None:
+    statements = [
+        s
+        for s in policy_statements(template, "ProcessFunction")
+        if any(a.startswith("s3:") for a in _as_list(s["Action"]))
+    ]
+
+    assert [
+        (
+            s["Effect"],
+            sorted(_as_list(s["Action"])),
+            s["Resource"] if isinstance(s["Resource"], list) else [s["Resource"]],
+        )
+        for s in statements
+    ] == [
+        (
+            "Allow",
+            ["s3:AbortMultipartUpload", "s3:GetObject", "s3:PutObject"],
+            [
+                {"Fn::Sub": "${MediaBucket.Arn}/media/*"},
+                {"Fn::Sub": "${MediaBucket.Arn}/text/*"},
+            ],
+        ),
+        ("Allow", ["s3:GetObject"], [{"Fn::Sub": "${MediaBucket.Arn}/raw/*"}]),
+        ("Allow", ["s3:ListBucket"], [{"Fn::GetAtt": ["MediaBucket", "Arn"]}]),
+    ]
+    # (ComplianceFunction is the only one with a delete action; see
+    # test_only_the_compliance_function_can_delete)
 
 
 def test_no_function_sets_the_test_only_media_host_override(template: Template) -> None:

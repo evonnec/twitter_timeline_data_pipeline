@@ -29,8 +29,10 @@ scheduled run:
    The IDs are looked up like the account's own (deduplicated, in the same
    ``COMPLIANCE_MAX_LOOKUPS`` budget: at most half of it, resuming from its own
    cursor ``compliance#`` + ``#references`` over a bounded, resumable table scan). The
-   first run that finds an original unavailable records ``source_gone_since`` on the
-   copy; one that finds it available again removes the mark; a copy marked for more
+   first run that finds an original unavailable marks the copy the way a fetch does
+   (``status: "unavailable"``, ``unavailable_reason``, ``unavailable_since``, the copy
+   kept whole; a fetch that saw the error first has already started the clock); one
+   that finds it available again removes the mark; a copy marked for more
    than ``DELETION_GRACE_HOURS`` is scrubbed (the entry becomes ``{id, type, status:
    "unavailable", unavailable_since}`` (plus ``unavailable_reason`` if set), its S3
    objects under ``text/<owner>/<id>.ref.<ref_id>.`` are deleted in every version,
@@ -103,6 +105,9 @@ COPY_FIELDS = (
     "author_username",
     "created_at",
     "entities",
+    "display_entities",
+    "entities_s3_key",
+    "display_entities_s3_key",
 )
 # What survives the purge on the tombstone.
 TOMBSTONE_KEEPS = frozenset({"tweet_id", "deleted_at", "deletion_reason", "revision"})
@@ -122,6 +127,12 @@ def _is_conditional_failure(exc: ClientError) -> bool:
     return (
         exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException"
     )
+
+
+def _entry_reason(reason: str | None) -> str:
+    """The ``unavailable_reason`` a fetch writes for a lookup's reason: ``not_found``
+    for a deleted post, ``not_authorized`` for protected, suspended and withheld."""
+    return "not_found" if reason == "deleted" else "not_authorized"
 
 
 def _iso(moment: datetime) -> str:
@@ -552,12 +563,10 @@ class ComplianceStore:
 
     @staticmethod
     def gone_since(entry: Mapping[str, Any]) -> str | None:
-        """When the copy's original was first seen unavailable: this job's mark, or the
-        fetch's own (``status`` ``unavailable`` with ``unavailable_since``), whichever
-        is set. Either only starts the grace clock; a scrub needs this job's own
-        lookup to confirm that the original is still gone."""
-        if (mark := entry.get("source_gone_since")) is not None:
-            return str(mark)
+        """When the copy's original was first seen unavailable (``unavailable_since``
+        of an entry with ``status`` ``unavailable``, set by a fetch or by this job).
+        It only starts the grace clock; a scrub needs this job's own lookup to confirm
+        that the original is still gone."""
         if entry.get("status") == "unavailable" and "unavailable_since" in entry:
             return str(entry["unavailable_since"])
         return None
@@ -581,7 +590,7 @@ class ComplianceStore:
         cls, item: Mapping[str, Any], gone: Collection[str], now: str, cutoff: str
     ) -> list[str]:
         """The IDs among ``gone`` whose copy in ``item`` is past the grace period
-        (``source_gone_since``, ``now`` for a first sighting, is at or before
+        (``unavailable_since``, ``now`` for a first sighting, is at or before
         ``cutoff``)."""
         return [
             str(e["id"])
@@ -595,21 +604,25 @@ class ComplianceStore:
     def update_copies(
         self,
         item: Mapping[str, Any],
-        outcome: Mapping[str, bool],
+        outcome: Mapping[str, str | None],
         *,
         now: str,
         cutoff: str,
     ) -> tuple[int, int, int]:
         """Apply what the X API said about the posts ``item`` holds copies of.
 
-        ``outcome`` maps an ID to whether it is still available at the source (True) or
-        gone (False). For a copy of a gone post: the first time, ``source_gone_since``
-        is set to ``now``; once it is at or before ``cutoff`` (the grace period has
-        passed) the copy is scrubbed: the entry becomes ``{id, type, status:
-        "unavailable", unavailable_since}``, so its text, author and entities are gone,
-        and its S3 objects (``text/<owner>/<tweet_id>.ref.<ref_id>.``, every version)
-        are deleted before the write. For a copy of a post that is available again, the
-        mark is removed. A copy whose post is not in ``outcome`` is left alone.
+        ``outcome`` maps an ID to None when it is still available at the source, or to
+        the lookup's reason when it is gone. For a copy of a gone post: the first time,
+        the entry gets ``status: "unavailable"``, ``unavailable_reason`` (``not_found``
+        for a deleted post, ``not_authorized`` for a protected, suspended or withheld
+        one) and ``unavailable_since`` = ``now``, as a fetch marks it; once
+        ``unavailable_since`` is at or before ``cutoff`` (the grace period has passed)
+        the copy is scrubbed: the entry becomes ``{id, type, status, unavailable_reason,
+        unavailable_since}``, so its text, author and entities are gone, and its S3
+        objects (everything under ``text/<owner>/<tweet_id>.ref.<ref_id>.``, with the
+        entities objects, every version, and any key the entry names) are deleted
+        before the write. For a copy of a post that is available again, the mark (the
+        three fields) is removed. A copy whose post is not in ``outcome`` is left alone.
 
         One conditional ``UpdateItem`` that does ``ADD revision 1``; if the item
         changed since it was read it is read again and the decision is made again
@@ -634,18 +647,16 @@ class ComplianceStore:
                     continue
                 position = f"referenced_tweets[{n}]"
                 since = self.gone_since(entry)
-                if outcome[ref_id]:
-                    # Available again: clear every mark (this job's and the fetch's).
+                if outcome[ref_id] is None:
+                    # Available again: clear the mark (the fetch's and this job's).
                     cleared = [
                         name
                         for name in (
-                            "source_gone_since",
                             "status",
                             "unavailable_reason",
                             "unavailable_since",
                         )
-                        if name in entry
-                        and (name == "source_gone_since" or since is not None)
+                        if name in entry and since is not None
                     ]
                     for name in cleared:
                         names[f"#{name}"] = name
@@ -654,7 +665,12 @@ class ComplianceStore:
                 elif str(since or now) <= cutoff:
                     for prefix in self._ref_prefixes(current, tweet_id, ref_id):
                         self.delete_prefix_versions(prefix)
-                    for name in ("text_s3_key", "display_text_s3_key"):
+                    for name in (
+                        "text_s3_key",
+                        "display_text_s3_key",
+                        "entities_s3_key",
+                        "display_entities_s3_key",
+                    ):
                         if isinstance(key := entry.get(name), str) and key:
                             self.delete_object_versions(key)
                     sets.append(f"{position} = :scrub{n}")
@@ -664,12 +680,21 @@ class ComplianceStore:
                         "status": "unavailable",
                         "unavailable_since": str(since or now),
                     }
-                    if reason := entry.get("unavailable_reason"):
-                        values[f":scrub{n}"]["unavailable_reason"] = reason
+                    reason = entry.get("unavailable_reason") or _entry_reason(
+                        outcome[ref_id]
+                    )
+                    values[f":scrub{n}"]["unavailable_reason"] = reason
                     scrubbed += 1
                 elif since is None:
-                    sets.append(f"{position}.source_gone_since = :mark{n}")
-                    values[f":mark{n}"] = now
+                    names["#status"] = "status"
+                    sets.append(
+                        f"{position}.#status = :unavailable, "
+                        f"{position}.unavailable_reason = :reason{n}, "
+                        f"{position}.unavailable_since = :since"
+                    )
+                    values[":unavailable"] = "unavailable"
+                    values[f":reason{n}"] = _entry_reason(outcome[ref_id])
+                    values[":since"] = now
                     marked += 1
             if not (sets or removes):
                 return 0, 0, 0
@@ -823,7 +848,7 @@ class Compliance:
             )
             return
         cursor = self._store.load_cursor(REFERENCES_CURSOR)
-        outcome: dict[str, bool] = {}  # ID -> still available at the source
+        outcome: dict[str, str | None] = {}  # ID -> None if available, else its reason
         asked: set[str] = set()
         pending: list[dict[str, Any]] = []  # items with a copy to scrub, once raw is
         now = _iso(self._now())
@@ -856,8 +881,8 @@ class Compliance:
                     result = self._lookup(chunk)
                     asked.update(chunk)
                     self._apply(result, tombstones, cutoff)
-                    outcome.update(dict.fromkeys(result.present, True))
-                    outcome.update(dict.fromkeys(result.unavailable, False))
+                    outcome.update(dict.fromkeys(result.present))
+                    outcome.update(result.unavailable)
                     self.ref_checked += len(chunk)
                 budget -= len(ids)
                 for item in taken:
@@ -876,12 +901,12 @@ class Compliance:
     def _handle_copies(
         self,
         item: dict[str, Any],
-        outcome: Mapping[str, bool],
+        outcome: Mapping[str, str | None],
         now: str,
         cutoff: str,
         pending: list[dict[str, Any]],
     ) -> None:
-        gone = {i for i, available in outcome.items() if not available}
+        gone = {i for i, reason in outcome.items() if reason is not None}
         if self._store.scrub_due(item, gone, now, cutoff):
             pending.append(item)  # after the raw pages are redacted
             return
@@ -899,7 +924,7 @@ class Compliance:
     def _scrub_copies(
         self,
         pending: list[dict[str, Any]],
-        outcome: Mapping[str, bool],
+        outcome: Mapping[str, str | None],
         now: str,
         cutoff: str,
     ) -> None:
@@ -907,7 +932,7 @@ class Compliance:
         scrubbed from an item if that fails, so the item still names what is left)."""
         if not pending:
             return
-        gone = {i for i, available in outcome.items() if not available}
+        gone = {i for i, reason in outcome.items() if reason is not None}
         due = {
             i
             for item in pending

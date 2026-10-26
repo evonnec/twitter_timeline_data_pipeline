@@ -144,6 +144,7 @@ def test_full_pipeline_stores_tweets_and_media(pipeline: Aws, cdn: CdnStub) -> N
             "type": "quoted",
             "id": "1600000000000000009",
             "status": "unavailable",
+            "unavailable_reason": "not_found",
             "unavailable_since": quote["fetched_at"],
         }
     ]

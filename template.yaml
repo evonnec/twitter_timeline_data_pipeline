@@ -437,15 +437,13 @@ Resources:
               Resource:
                 - !Sub "${MediaBucket.Arn}/media/*"
                 - !Sub "${MediaBucket.Arn}/text/*"
-            # raw/ is read-only: a referenced long post left out of an oversized
-            # message is read back from its raw page.
+            # raw/ is read-only: what was left out of an oversized message (referenced
+            # posts' notes and entities, the Tweet's entities) is read back from its raw
+            # page. Nothing is ever deleted: scrubbing deleted originals is the
+            # compliance job's.
             - Effect: Allow
               Action: s3:GetObject
               Resource: !Sub "${MediaBucket.Arn}/raw/*"
-            # The S3 text of a referenced original that is now unavailable is deleted.
-            - Effect: Allow
-              Action: s3:DeleteObject
-              Resource: !Sub "${MediaBucket.Arn}/text/*"
             # ListBucket makes HeadObject return 404 instead of 403 for missing keys.
             - Effect: Allow
               Action: s3:ListBucket
