@@ -13,7 +13,7 @@ import io
 import logging
 import mimetypes
 import posixpath
-from collections.abc import Buffer, Iterator, Sequence
+from collections.abc import Buffer, Iterable, Iterator, Sequence
 from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, Any, Literal, cast, override
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -267,29 +267,58 @@ def _check_id(value: str | None) -> None:
         raise ValueError(f"Tweet ID must be numeric, got {value!r}")
 
 
+MAX_GAPS = 100
+"""Upper bound on the gap list, far below DynamoDB's 400 KB item limit."""
+
+
 @dataclass(frozen=True, slots=True)
 class Gap:
     """An exclusive range of Tweet IDs, ``since_id < id < until_id``, not fetched yet.
 
     A missing ``since_id`` means "down to the end of what the API serves"; a missing
-    ``until_id`` means "up from the newest Tweet".
+    ``until_id`` means "up from the newest Tweet". ``empty_runs`` counts consecutive
+    runs whose first request for this gap came back cleanly empty; the gap is only
+    dropped after several (see ``handlers.fetch``). IDs are normalized to plain
+    decimal strings.
     """
 
     until_id: TweetId | None = None
     since_id: TweetId | None = None
+    empty_runs: int = 0
 
     def __post_init__(self) -> None:
-        _check_id(self.until_id)
-        _check_id(self.since_id)
+        for name in ("until_id", "since_id"):
+            value = getattr(self, name)
+            _check_id(value)
+            if value is not None:
+                object.__setattr__(self, name, str(int(value)))
+        if (
+            self.until_id is not None
+            and self.since_id is not None
+            and int(self.since_id) >= int(self.until_id)
+        ):
+            raise ValueError(
+                f"since_id {self.since_id} must be below until_id {self.until_id}"
+            )
 
     @property
     def sort_key(self) -> float:
         """Upper bound as a number; an open top sorts above every ID."""
         return float("inf") if self.until_id is None else int(self.until_id)
 
+    @property
+    def first(self) -> int:
+        """Lowest ID in the range."""
+        return 1 if self.since_id is None else int(self.since_id) + 1
+
+    @property
+    def last(self) -> float:
+        """Highest ID in the range (infinite when open at the top)."""
+        return float("inf") if self.until_id is None else int(self.until_id) - 1
+
     def to_item(self) -> dict[str, int]:
         # Numbers, not strings: IDs compare as integers.
-        return {
+        item = {
             name: int(value)
             for name, value in (
                 ("until_id", self.until_id),
@@ -297,6 +326,9 @@ class Gap:
             )
             if value is not None
         }
+        if self.empty_runs:
+            item["empty_runs"] = self.empty_runs
+        return item
 
     @classmethod
     def from_item(cls, item: Any) -> Gap:
@@ -304,7 +336,46 @@ class Gap:
             value = item.get(name)
             return None if value is None else str(int(value))
 
-        return cls(until_id=tweet_id("until_id"), since_id=tweet_id("since_id"))
+        return cls(
+            until_id=tweet_id("until_id"),
+            since_id=tweet_id("since_id"),
+            empty_runs=int(item.get("empty_runs", 0)),
+        )
+
+
+def _union(a: Gap, b: Gap) -> Gap:
+    """The smallest gap covering both; only ever adds IDs to re-fetch."""
+    same = (a.since_id, a.until_id) == (b.since_id, b.until_id)
+    return Gap(
+        until_id=None
+        if a.until_id is None or b.until_id is None
+        else str(max(int(a.until_id), int(b.until_id))),
+        since_id=None
+        if a.since_id is None or b.since_id is None
+        else str(min(int(a.since_id), int(b.since_id))),
+        # Empty responses for part of a range say nothing about the whole.
+        empty_runs=min(a.empty_runs, b.empty_runs) if same else 0,
+    )
+
+
+def merge_gaps(gaps: Iterable[Gap], limit: int = MAX_GAPS) -> tuple[Gap, ...]:
+    """Normalize a gap list: drop ranges with no IDs in them, merge overlapping or
+    adjacent ones, and, past ``limit``, merge the closest neighbours. A union only
+    adds IDs to fetch, so none of this can lose data; at worst it causes duplicates.
+    Newest gap first.
+    """
+    merged: list[Gap] = []
+    for gap in sorted((g for g in gaps if g.last >= g.first), key=lambda g: g.first):
+        if merged and gap.first <= merged[-1].last + 1:
+            merged[-1] = _union(merged[-1], gap)
+        else:
+            merged.append(gap)
+    while len(merged) > limit:
+        i = min(
+            range(len(merged) - 1), key=lambda i: merged[i + 1].first - merged[i].last
+        )
+        merged[i : i + 2] = [_union(merged[i], merged[i + 1])]
+    return tuple(sorted(merged, key=lambda g: g.sort_key, reverse=True))
 
 
 @dataclass(frozen=True, slots=True)

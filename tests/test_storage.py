@@ -22,6 +22,7 @@ from mypy_boto3_s3 import S3Client
 from twitter_timeline_data_pipeline.models import Media, TweetMessage
 from twitter_timeline_data_pipeline.storage import (
     ALLOWED_MEDIA_HOSTS,
+    MAX_GAPS,
     CheckpointState,
     CheckpointStore,
     Gap,
@@ -32,6 +33,7 @@ from twitter_timeline_data_pipeline.storage import (
     _extension,
     _IterReader,
     _original_size_url,
+    merge_gaps,
 )
 
 TWEET_ID = "1700000000000000005"
@@ -662,3 +664,66 @@ def test_gaps_sort_by_upper_bound_with_an_open_top_first() -> None:
     ordered = sorted(gaps, key=lambda g: g.sort_key, reverse=True)
 
     assert [g.until_id for g in ordered] == [None, "100", "20", "9"]
+
+
+def test_gap_normalizes_ids_and_rejects_inverted_ranges() -> None:
+    assert Gap(until_id="0012", since_id="007") == Gap(until_id="12", since_id="7")
+    for since, until in [("20", "10"), ("5", "5"), ("010", "10")]:
+        with pytest.raises(ValueError, match="below until_id"):
+            Gap(until_id=until, since_id=since)
+
+
+def test_empty_runs_round_trip_through_the_item(aws: Aws) -> None:
+    store = CheckpointStore(aws.state_table)
+    gap = Gap(until_id="9", since_id="3", empty_runs=2)
+
+    store.save("example_user", CheckpointState(gaps=(gap,)), expected_version=0)
+
+    assert ddb_get(aws.state_table, username="example_user")["gaps"] == [
+        {"until_id": 9, "since_id": 3, "empty_runs": 2}
+    ]
+    assert store.load("example_user").gaps == (gap,)
+
+
+@pytest.mark.parametrize(
+    ("gaps", "expected"),
+    [
+        ([], ()),
+        ([Gap("10", "5"), Gap("20", "15")], (Gap("20", "15"), Gap("10", "5"))),
+        ([Gap("10", "5"), Gap("12", "8")], (Gap("12", "5"),)),  # overlap
+        (
+            [Gap("10", "5"), Gap("15", "9")],
+            (Gap("15", "5"),),
+        ),  # adjacent (6..9, 10..14)
+        ([Gap("10", "5"), Gap("10", "5")], (Gap("10", "5"),)),  # duplicate
+        ([Gap("10", "5"), Gap(None, "8")], (Gap(None, "5"),)),
+        ([Gap("10", None), Gap("4", "2")], (Gap("10", None),)),
+        ([Gap("6", "5"), Gap("3", "2")], ()),  # no IDs inside
+        ([Gap("10", "5", 2), Gap("10", "5", 1)], (Gap("10", "5", 1),)),
+        ([Gap("10", "5", 2), Gap("12", "8", 2)], (Gap("12", "5", 0),)),
+    ],
+)
+def test_merge_gaps(gaps: list[Gap], expected: tuple[Gap, ...]) -> None:
+    assert merge_gaps(gaps) == expected
+
+
+def test_merge_gaps_past_the_limit_joins_the_closest_neighbours() -> None:
+    gaps = [Gap("15", "10"), Gap("25", "20"), Gap("32", "28"), Gap("55", "50")]
+
+    # Distances between neighbours: 7, 5, 18. The closest pair is joined.
+    assert merge_gaps(gaps, limit=3) == (
+        Gap("55", "50"),
+        Gap("32", "20"),
+        Gap("15", "10"),
+    )
+
+
+def test_a_hundred_and_fifty_gaps_are_capped_without_losing_coverage() -> None:
+    gaps = [Gap(str(i * 10 + 5), str(i * 10)) for i in range(150)]
+
+    merged = merge_gaps(gaps)
+
+    assert len(merged) == MAX_GAPS == 100
+    assert all(
+        any(m.first <= g.first and g.last <= m.last for m in merged) for g in gaps
+    )

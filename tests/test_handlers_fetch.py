@@ -334,7 +334,9 @@ def test_no_gap_when_the_last_page_has_no_next_token(aws: Aws) -> None:
     assert (result.gaps_open, result.stopped_reason) == (0, None)
 
 
-def test_next_token_followed_by_an_empty_page_closes_the_gap(aws: Aws) -> None:
+def test_next_token_followed_by_an_empty_page_keeps_the_gap_for_the_gap_phase(
+    aws: Aws,
+) -> None:
     stub = XApiStub()
     first = load_fixture("timeline_page1.json")
 
@@ -349,8 +351,10 @@ def test_next_token_followed_by_an_empty_page_closes_the_gap(aws: Aws) -> None:
     result = run(aws, api, since_id="1", max_pages=2)
 
     assert result.pages == 1
-    assert (result.gaps_open, result.stopped_reason) == (0, None)
-    assert CheckpointStore(aws.state_table).load(USERNAME).gaps == ()
+    assert (result.gaps_open, result.stopped_reason) == (1, "page_cap")
+    assert CheckpointStore(aws.state_table).load(USERNAME).gaps == (
+        Gap(until_id="1700000000000000001", since_id="1"),
+    )
 
 
 def test_empty_string_next_token_leaves_no_gap(aws: Aws) -> None:

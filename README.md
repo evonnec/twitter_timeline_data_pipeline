@@ -36,11 +36,11 @@ A run, step by step:
 
 1. EventBridge invokes `FetchFunction` on the schedule (`rate(1 hour)` by default). The event may carry `{"username": "..."}`; otherwise the `TWITTER_USERNAME` setting is used. The name is normalized once (leading `@` removed, lower-cased) and used everywhere below.
 2. The function reads the bearer token from Secrets Manager (cached in memory for 15 minutes), resolves the username to a user ID, and reads the account's cursor from the state table: the newest Tweet ID already fetched, plus any *gaps* (ID ranges known to be unfetched; see the [state table](#state-table-statetable)).
-3. New Tweets first. It pages through `GET /2/users/:id/tweets` with `since_id` set to the newest ID, newest first, in pages of `MAX_RESULTS` Tweets. A first run has no `since_id`.
+3. New Tweets first. It pages through `GET /2/users/:id/tweets` with `since_id` set to the newest ID, newest first, in pages of `MAX_RESULTS` Tweets. A first run has no `since_id`. `MAX_PAGES` is a budget of API requests, counting empty and failed ones; when gaps exist it is at least 2, one request is kept for the oldest gap, and the rest go to the new Tweets and the newest gaps.
 4. Each page becomes one message per Tweet, sent to the queue with `SendMessageBatch` (10 at a time; only entries SQS reports as failed are retried).
 5. After each page is fully enqueued, the cursor is saved. While the page still has a `next_token`, the not-yet-fetched rest is recorded as a gap just below the lowest ID seen; a page without `next_token` closes it. So a run that hits the cap, a rate limit or an error leaves a gap, never a hole.
-6. Then the gaps. Whatever remains of the shared `MAX_PAGES` budget goes to the gaps, newest gap first, with `since_id` and `until_id` set to the gap's bounds. Each saved page lowers the gap's `until_id`, and the gap is removed when a page has no `next_token`. If the API returns no Tweets for a gap, the range has aged out of its 3,200-post window; the gap is dropped with a warning.
-7. A 429 that resets later than the function will wait ends the run cleanly (`stopped_reason` is `rate_limited`) after saving; any other error fails the invocation, with progress up to the last full page saved. The next run resumes from the cursor and re-sends at most the page that was in flight.
+6. Then the gaps. Whatever remains of the shared `MAX_PAGES` budget goes to the gaps, newest gap first, with `since_id` and `until_id` set to the gap's bounds. Each saved page lowers the gap's `until_id`, and the gap is removed when a page has no `next_token`.
+7. A 429 that resets later than the function will wait ends the run cleanly after saving: the invocation succeeds and the summary has `stopped_reason: "rate_limited"` (alerting on that comes with issue #19). Any other error fails the invocation, with progress up to the last full page saved; an error in one gap is raised only after the other gaps have had their turn. The next run resumes from the cursor and re-sends at most the page that was in flight.
 8. SQS invokes `ProcessFunction` with batches of up to 10 messages (up to 10 seconds of batching, at most 5 concurrent invocations).
 9. For each message it downloads the media and uploads it to S3, then writes the Tweet item to DynamoDB. Media goes first so a stored Tweet never points at missing media.
 10. Messages that fail are reported back individually. SQS redelivers them and, after 5 receives, moves them to the dead-letter queue, which has an alarm.
@@ -128,9 +128,13 @@ One item per account: partition key `username` (S, lower case) and
 | Attribute | Type | Meaning |
 | --- | --- | --- |
 | `newest_id` | N | Highest Tweet ID enqueued. Never decreases. Absent until a Tweet has been enqueued. |
-| `gaps` | L of M | Exclusive ID ranges known to be unfetched, each `{until_id, since_id}` (N). A missing `since_id` means "down to the end of what the API serves" (about the 3,200 most recent posts); a missing `until_id` means "up from the newest Tweet". |
+| `gaps` | L of M | Exclusive ID ranges known to be unfetched, each `{until_id, since_id, empty_runs}` (N; `empty_runs` only when above 0). A missing `since_id` means "down to the end of what the API serves" (about the 3,200 most recent posts); a missing `until_id` means "up from the newest Tweet". |
 | `version` | N | Optimistic lock, incremented on every write. |
 | `updated_at` | S | UTC timestamp of the last write. |
+
+The list is kept normalized on every save: overlapping or adjacent gaps are merged, and at most 100 are kept (past that, the two closest neighbours are joined). A merge only adds IDs to re-fetch, so it can cause duplicates but never loss.
+
+**Empty responses never end a range by themselves.** A `200` with `errors` and no data (for example an account that turned protected) raises an error instead of reading as "no more Tweets"; an empty page that still has a `next_token` is followed. A gap is dropped only when the first request for it comes back cleanly empty (no data, no errors, no `next_token`) in 3 consecutive runs, counted in `empty_runs` and reset whenever data comes back; the drop is logged at WARNING with the range. That is how a range that has aged out of the API's window finally goes away.
 
 Every write is conditional on the `version` that run read (a missing `version` counts as 0, so items written before gaps existed are read as they are and upgraded on the first write). If another run got there first, the write fails, the run stops fetching, logs a warning and returns `stopped_reason: "state_conflict"`. Anything it already enqueued is a harmless duplicate, `newest_id` never moves backwards, and no gap is dropped.
 
@@ -418,14 +422,14 @@ aws sqs start-message-move-task --source-arn "$DLQ_ARN"   # defaults to the orig
 aws sqs list-message-move-tasks --source-arn "$DLQ_ARN"   # progress
 ```
 
-**Backfill or re-fetch.** Nothing needs to be done for the normal cases. A first run, a run capped by `MAX_PAGES`, and a run cut short by a rate limit or an error all leave gaps in the state item, and each scheduled run spends its page budget on them after the new Tweets, so the account is backfilled over several runs (the 3,200-post window takes `ceil(32 / MAX_PAGES)` runs at `MAX_RESULTS=100`). Check progress in the run summary: `gaps_open` above 0 with `stopped_reason: "page_cap"` means more to fetch; `null` means done. To look at the cursor:
+**Backfill or re-fetch.** Nothing needs to be done for the normal cases. A first run, a run capped by `MAX_PAGES`, and a run cut short by a rate limit or an error all leave gaps in the state item, and each scheduled run spends its page budget on them after the new Tweets, so the account is backfilled over several runs (the 3,200-post window is 32 pages at `MAX_RESULTS=100`; the first run uses its whole budget on pages and each later run spends one request checking for new Tweets). Check progress in the run summary: `gaps_open` above 0 with `stopped_reason` `page_cap` (budget used up) or `gaps_pending` (for example waiting out empty responses) means more to fetch; `null` means done. To look at the cursor:
 
 ```bash
 aws dynamodb get-item --table-name "$(out StateTableName)" --consistent-read \
   --key '{"username": {"S": "nasa"}}'
 ```
 
-To fetch a specific range, add a gap with a manual event (either bound may be left out, IDs must be numeric; the bounds are exclusive). The run records it, then fetches it after the new Tweets:
+To fetch a specific range, add a gap with a manual event (either bound may be left out; IDs must be numeric, the bounds are exclusive, and `since_id` must be below `until_id`, otherwise the invocation fails before anything is saved). An open top is anchored at the newest known Tweet. The run records it, then fetches it after the new Tweets:
 
 ```bash
 aws lambda invoke --function-name "$FETCH" --cli-binary-format raw-in-base64-out \
@@ -441,7 +445,7 @@ export BEARER_TOKEN_SECRET_ARN=$(out BearerTokenSecretArn)
 uv run twitter-pipeline fetch --username NASA --since-id 1850000000000000000 --max-pages 32
 ```
 
-Re-sent Tweets are written again over the same items, so a backfill is safe to repeat. Add `--dry-run` to preview without sending. The API exposes only an account's 3,200 most recent Tweets (800 with `exclude=replies`), so nothing older can be backfilled; a gap that has aged out of that window is dropped with a warning. A `state_conflict` stop only means two runs overlapped: the next scheduled run carries on.
+Re-sent Tweets are written again over the same items, so a backfill is safe to repeat. Add `--dry-run` to preview without sending. The API exposes only an account's 3,200 most recent Tweets (800 with `exclude=replies`), so nothing older can be backfilled; a gap that has aged out of that window is dropped with a warning after 3 empty runs. A `state_conflict` stop only means two runs overlapped: the next scheduled run carries on.
 
 **Rotate the token.** Run `scripts/put_secret.sh` with the new token. Running fetch containers keep the old token for up to 15 minutes (the cache TTL) and drop it earlier on a 401/403, so no redeploy is needed. To switch immediately, invoke the fetch function after the 15 minutes or update its configuration to recycle the containers.
 
@@ -458,7 +462,7 @@ The script reads the table and bucket names from the stack outputs, runs `sam de
 ## Assumptions and limitations
 
 - X API access now requires a paid plan. Billing is currently pay-per-use, charged per post read, and rate limits depend on the plan; check current pricing before deploying. Cost scales with Tweets read per run, which is bounded by `MaxPages x MaxResults` and multiplied by the schedule frequency, so lower `MaxPages` or run less often to spend less.
-- Each run fetches at most `MAX_PAGES x MAX_RESULTS` Tweets (500 by default), but nothing is skipped when that is not enough: the remainder is kept as a gap and fetched by later runs, so a first run backfills over several runs. The API itself only exposes an account's 3,200 most recent Tweets (800 with `exclude=replies`); Tweets that age out of that window before they are fetched are unreachable, and the gap covering them is dropped with a warning. If `MAX_PAGES x MAX_RESULTS` per run is lower than the account's posting rate, gaps accumulate; raise `MaxPages` or run more often.
+- Each run fetches at most `MAX_PAGES x MAX_RESULTS` Tweets (500 by default), but nothing is skipped when that is not enough: the remainder is kept as a gap and fetched by later runs, so a first run backfills over several runs. The API itself only exposes an account's 3,200 most recent Tweets (800 with `exclude=replies`); Tweets that age out of that window before they are fetched are unreachable, and the gap covering them is dropped with a warning after 3 consecutive empty runs. If `MAX_PAGES x MAX_RESULTS` per run is lower than the account's posting rate, gaps accumulate; raise `MaxPages` or run more often.
 - Large videos have no size or time budget yet. A batch that times out is retried and can end up in the DLQ, and the Tweets in it have no metadata stored until it is redriven. DLQ messages expire after 14 days, after which they are gone.
 - A media key that is missing from the response's `includes` (deleted or withheld media) is dropped with a warning, so the Tweet is stored without that media entry.
 - Writes are last-write-wins: a stale redelivery or DLQ redrive overwrites a newer item.

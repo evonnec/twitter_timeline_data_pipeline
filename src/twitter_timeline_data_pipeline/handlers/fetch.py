@@ -12,8 +12,8 @@ import functools
 import itertools
 import logging
 import time
-from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Iterable, Iterator, Sequence
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 import boto3
@@ -25,7 +25,12 @@ from twitter_timeline_data_pipeline.models import (
     TweetId,
     normalize_username,
 )
-from twitter_timeline_data_pipeline.storage import CheckpointState, CheckpointStore, Gap
+from twitter_timeline_data_pipeline.storage import (
+    CheckpointState,
+    CheckpointStore,
+    Gap,
+    merge_gaps,
+)
 from twitter_timeline_data_pipeline.x_api import AuthError, RateLimitError, XClient
 
 if TYPE_CHECKING:
@@ -55,7 +60,8 @@ class FetchResult:
     gaps_open: int
     """Ranges still to fetch when the run ended."""
     stopped_reason: str | None
-    """None when nothing is left to fetch; otherwise ``page_cap`` (budget used up),
+    """None when nothing is left to fetch; otherwise ``page_cap`` (request budget used
+    up), ``gaps_pending`` (gaps remain, e.g. waiting out empty responses),
     ``rate_limited`` or ``state_conflict`` (another run moved the state)."""
 
 
@@ -91,9 +97,15 @@ class _StateConflict(Exception):
     """Another run changed the state item since this run read it."""
 
 
+EMPTY_RUNS_TO_DROP = 3
+"""Consecutive runs whose first request for a gap came back cleanly empty before the
+gap is dropped. One empty response can be a hiccup; three in a row mean the range has
+aged out of the API's window."""
+
+
 @dataclass(slots=True)
 class _Run:
-    """Mutable bookkeeping of one run: counters, the page budget and the cursor."""
+    """Mutable bookkeeping of one run: counters, the request budget and the cursor."""
 
     username: str
     user_id: str
@@ -106,16 +118,47 @@ class _Run:
     max_pages: int
     sleep: Callable[[float], None]
     pages: int = 0
+    requests: int = 0
     tweets: int = 0
     enqueued: int = 0
+    deferred_error: Exception | None = None
 
     @property
     def budget(self) -> int:
-        return self.max_pages - self.pages
+        """Timeline requests left. Every request counts, empty ones included."""
+        return self.max_pages - self.requests
+
+    def walk(
+        self, *, since_id: TweetId | None, until_id: TweetId | None, budget: int
+    ) -> Iterator[TimelinePage]:
+        """``iter_timeline`` that charges every request it makes to the run's budget.
+
+        That includes the final request that came back empty (which yields nothing)
+        and a request that failed.
+        """
+        walked = 0
+        last: TimelinePage | None = None
+        try:
+            for page in self.x_client.iter_timeline(
+                self.user_id,
+                since_id=since_id,
+                until_id=until_id,
+                max_results=self.max_results,
+                max_pages=budget,
+            ):
+                walked += 1
+                self.requests += 1
+                self.pages += 1
+                last = page
+                yield page
+        except Exception:
+            self.requests += 1
+            raise
+        if walked < budget and (last is None or last.next_token):
+            self.requests += 1  # ended on a clean empty response
 
     def enqueue(self, page: TimelinePage) -> list[int]:
         """Send the page's messages; returns its Tweet IDs."""
-        self.pages += 1
         messages = page.messages(self.username)
         self.tweets += len(messages)
         for chunk in itertools.batched(messages, SQS_BATCH_SIZE, strict=False):
@@ -125,12 +168,13 @@ class _Run:
             self.enqueued += len(chunk)
         return [int(t.id) for t in page.tweets]
 
-    def commit(self, seen: Sequence[int], gaps: Sequence[Gap]) -> None:
-        """Persist the cursor: ``newest_id`` never drops, ``gaps`` replace the list."""
+    def commit(self, seen: Sequence[int], gaps: Iterable[Gap]) -> None:
+        """Persist the cursor: ``newest_id`` never drops, ``gaps`` replace the list
+        (merged, so overlapping ranges collapse)."""
         newest = max([int(self.state.newest_id or 0), *seen])
         new = CheckpointState(
             newest_id=str(newest) if newest else None,
-            gaps=tuple(gaps),
+            gaps=merge_gaps(gaps),
             version=self.state.version + 1,
         )
         if not self.checkpoints.save(
@@ -139,72 +183,121 @@ class _Run:
             raise _StateConflict
         self.state = new
 
-    def fetch_new(self, since_id: TweetId | None) -> None:
+    def fetch_new(self, since_id: TweetId | None, budget: int) -> None:
         """Phase 1: Tweets newer than ``since_id``, newest first.
 
         While a page still has a ``next_token``, the unfetched rest of the phase is
         recorded as a gap just below the lowest ID seen, so a cap or failure here never
-        leaves a hole.
+        leaves a hole. A walk that ends on an empty response keeps that gap; the gap
+        phase decides whether it is really exhausted.
         """
         others = list(self.state.gaps)
         lowest: int | None = None
-        open_gap: Gap | None = None
-        for page in self.x_client.iter_timeline(
-            self.user_id,
-            since_id=since_id,
-            max_results=self.max_results,
-            max_pages=self.budget,
-        ):
+        for page in self.walk(since_id=since_id, until_id=None, budget=budget):
             ids = self.enqueue(page)
-            lowest = min(ids) if lowest is None else min(lowest, *ids)
+            if ids:
+                lowest = min(ids) if lowest is None else min(lowest, *ids)
             open_gap = (
-                Gap(until_id=str(lowest), since_id=since_id)
+                Gap(
+                    until_id=None if lowest is None else str(lowest),
+                    since_id=since_id,
+                )
                 if page.next_token
                 else None
             )
             self.commit(ids, [*others, *([open_gap] if open_gap else [])])
-        if open_gap and self.pages < self.max_pages:  # an empty page ended the walk
-            self.commit([], others)
 
     def fill_gaps(self) -> None:
         """Phase 2: spend what is left of the budget on the recorded gaps.
 
         Newest gap first: its Tweets are the ones adjacent to the live stream, and the
         API serves only the most recent ~3,200 posts, so the oldest gaps are the ones
-        that age out of reach anyway. Each page lowers the gap's ``until_id``.
+        that age out of reach anyway. But the oldest gap is always left one request, so
+        it keeps being advanced or pruned however busy the newer ones are. A failure in
+        one gap is remembered and re-raised at the end of the run, so the older gaps
+        still get their turn.
         """
-        for gap in sorted(self.state.gaps, key=lambda g: g.sort_key, reverse=True):
+        ordered = sorted(self.state.gaps, key=lambda g: g.sort_key, reverse=True)
+        for gap in ordered:
             if self.budget <= 0:
                 return
-            budget = self.budget
-            others = list(self.state.gaps)
-            others.remove(gap)
-            current: Gap | None = gap
-            used = 0
-            for page in self.x_client.iter_timeline(
-                self.user_id,
-                since_id=gap.since_id,
-                until_id=gap.until_id,
-                max_results=self.max_results,
-                max_pages=budget,
-            ):
-                used += 1
-                ids = self.enqueue(page)
-                current = (
-                    Gap(until_id=str(min(ids)), since_id=gap.since_id)
-                    if page.next_token
-                    else None
-                )
-                self.commit(ids, [*others, *([current] if current else [])])
-            if current is not None and used < budget:
+            if gap not in self.state.gaps:  # merged into another by an earlier save
+                continue
+            oldest = all(g.sort_key >= gap.sort_key for g in self.state.gaps)
+            budget = self.budget - (0 if oldest else 1)
+            if budget <= 0:
+                continue
+            try:
+                self.fill_gap(gap, budget)
+            except RateLimitError, AuthError, _StateConflict:
+                raise  # every other gap would fail the same way
+            except Exception as exc:
                 logger.warning(
-                    "gap for %s (since_id=%s, until_id=%s) is out of the API's reach "
-                    "(no Tweets returned); dropping it",
+                    "gap for %s (since_id=%s, until_id=%s) failed: %s",
                     self.username,
                     gap.since_id,
-                    current.until_id,
+                    gap.until_id,
+                    exc,
                 )
-                self.commit([], others)
+                self.deferred_error = self.deferred_error or exc
+
+    def fill_gap(self, gap: Gap, budget: int) -> None:
+        others = list(self.state.gaps)
+        others.remove(gap)
+        pages = 0
+        for page in self.walk(
+            since_id=gap.since_id, until_id=gap.until_id, budget=budget
+        ):
+            pages += 1
+            ids = self.enqueue(page)
+            if not ids:  # an empty page pointing onward: nothing learned
+                continue
+            # Data came back, so the range is alive: reset the empty-response count.
+            remaining = (
+                [Gap(until_id=str(min(ids)), since_id=gap.since_id)]
+                if page.next_token
+                else []
+            )
+            self.commit(ids, [*others, *remaining])
+        if pages:
+            return
+        # The first request came back cleanly empty (no data, no token, no errors).
+        runs = gap.empty_runs + 1
+        if runs < EMPTY_RUNS_TO_DROP:
+            logger.info(
+                "gap for %s (since_id=%s, until_id=%s) came back empty (%d of %d "
+                "runs before it is dropped)",
+                self.username,
+                gap.since_id,
+                gap.until_id,
+                runs,
+                EMPTY_RUNS_TO_DROP,
+            )
+            self.commit([], [*others, replace(gap, empty_runs=runs)])
+            return
+        logger.warning(
+            "gap for %s (since_id=%s, until_id=%s) came back empty %d runs in a row; "
+            "the range is out of the API's reach, dropping it",
+            self.username,
+            gap.since_id,
+            gap.until_id,
+            runs,
+        )
+        self.commit([], others)
+
+
+def _anchored(backfill: Gap | None, newest_id: TweetId | None) -> Gap | None:
+    """Give an open-topped backfill the newest known Tweet as its top.
+
+    Everything above ``newest_id`` is the new-Tweets phase's job, so the backfill
+    only needs to cover what is at or below it; that also keeps it from overlapping
+    the open-ended gap a first run leaves.
+    """
+    if backfill is None or backfill.until_id is not None or newest_id is None:
+        return backfill
+    if backfill.since_id is not None and int(backfill.since_id) >= int(newest_id):
+        return None  # entirely above newest_id
+    return replace(backfill, until_id=str(int(newest_id) + 1))
 
 
 def run_fetch(
@@ -225,9 +318,11 @@ def run_fetch(
     ``username`` is normalized (no ``@``, lower case; X handles are case-insensitive)
     and used for the lookup, the messages and the state item. ``since_id`` overrides
     the stored ``newest_id`` as the lower bound of the new-Tweets phase; ``backfill``
-    adds a gap to fetch. ``max_pages`` is shared by both phases. A 429 ends the run
-    cleanly (``stopped_reason="rate_limited"``); other errors propagate, with progress
-    up to the last full page already saved.
+    adds a gap to fetch. ``max_pages`` is a budget of timeline requests shared by both
+    phases (when there are gaps it is at least 2, and one request is held back for the
+    oldest gap). A 429 ends the run cleanly (``stopped_reason="rate_limited"``) after
+    saving; other errors propagate, with progress up to the last full page saved. An
+    error in one gap is raised only after the remaining gaps have had their turn.
     """
     username = normalize_username(username)
     user_id = x_client.get_user_id(username)
@@ -246,9 +341,14 @@ def run_fetch(
     since_id = since_id or run.state.newest_id
     stopped_reason: str | None = None
     try:
+        backfill = _anchored(backfill, run.state.newest_id)
         if backfill and backfill not in run.state.gaps:
             run.commit([], [*run.state.gaps, backfill])
-        run.fetch_new(since_id)
+        if run.state.gaps:
+            # One request checks for new Tweets and one goes to the oldest gap, so
+            # neither can starve the other even with MAX_PAGES=1.
+            run.max_pages = max(max_pages, 2)
+        run.fetch_new(since_id, run.max_pages - (1 if run.state.gaps else 0))
         run.fill_gaps()
     except RateLimitError as exc:
         logger.warning("rate limited, stopping early; progress is saved: %s", exc)
@@ -260,9 +360,12 @@ def run_fetch(
             username,
         )
         stopped_reason = "state_conflict"
+        run.state = checkpoints.load(username)  # report what is stored now
+    if run.deferred_error:
+        raise run.deferred_error
     gaps_open = len(run.state.gaps)
     if stopped_reason is None and gaps_open:
-        stopped_reason = "page_cap"
+        stopped_reason = "page_cap" if run.budget <= 0 else "gaps_pending"
     if gaps_open:
         logger.info("open gaps for %s: %s", username, run.state.gaps)
     return FetchResult(

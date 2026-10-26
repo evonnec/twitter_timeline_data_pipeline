@@ -577,11 +577,28 @@ def test_iter_timeline_empty_page_yields_nothing() -> None:
     assert len(stub.timeline_requests) == 1
 
 
-def test_iter_timeline_page_without_data_stops_even_with_next_token() -> None:
+def test_iter_timeline_dataless_page_with_next_token_is_yielded_and_followed() -> None:
+    empty = {"meta": {"result_count": 0, "next_token": "x"}}
+    data = {"data": [{"id": "5", "text": "t"}], "meta": {"result_count": 1}}
+    stub = script(ok(empty), ok(data))
+
+    with x_client(stub) as client:
+        first, second = client.iter_timeline(USER_ID)
+
+    assert (first.tweets, first.next_token) == ((), "x")
+    assert [t.id for t in second.tweets] == ["5"]
+    assert stub.calls[1].url.params["pagination_token"] == "x"
+
+
+def test_iter_timeline_dataless_page_with_result_count_but_token_is_not_the_end() -> (
+    None
+):
     body = {"meta": {"result_count": 1, "next_token": "x"}}
 
-    with x_client(script(ok(body))) as client:
-        assert list(client.iter_timeline(USER_ID)) == []
+    with x_client(script(ok(body), ok({"meta": {"result_count": 0}}))) as client:
+        pages = list(client.iter_timeline(USER_ID))
+
+    assert [(p.tweets, p.next_token) for p in pages] == [((), "x")]
 
 
 def test_iter_timeline_is_lazy() -> None:
@@ -629,26 +646,45 @@ def test_iter_timeline_logs_partial_errors_and_still_yields_data(
     assert "Authorization Error" in message
 
 
-def test_iter_timeline_errors_only_page_warns_and_stops(
-    caplog: pytest.LogCaptureFixture,
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"errors": [{"title": "Forbidden"}], "meta": {"result_count": 0}},
+        {"errors": [{"title": "Forbidden"}]},
+        {"errors": [{"title": "Forbidden"}], "meta": {"next_token": "x"}},
+    ],
+)
+def test_iter_timeline_errors_only_page_raises_instead_of_ending_the_walk(
+    body: dict[str, Any],
 ) -> None:
-    body = {"errors": [{"title": "Forbidden"}], "meta": {"result_count": 0}}
-
-    with x_client(script(ok(body))) as client, caplog.at_level(logging.WARNING):
-        assert list(client.iter_timeline(USER_ID)) == []
-
-    assert any("Forbidden" in m for m in caplog.messages)
-
-
-def test_iter_timeline_errors_without_detail_log_no_detail(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    body = {"errors": [{}], "meta": {"result_count": 0}}
-
-    with x_client(script(ok(body))) as client, caplog.at_level(logging.WARNING):
+    with (
+        x_client(script(ok(body))) as client,
+        pytest.raises(XApiError, match="page 1 has errors and no data: Forbidden") as e,
+    ):
         list(client.iter_timeline(USER_ID))
 
-    assert any("first: no detail" in m for m in caplog.messages)
+    assert e.value.status_code == 200
+
+
+def test_iter_timeline_errors_without_detail_say_so() -> None:
+    body = {"errors": [{}], "meta": {"result_count": 0}}
+
+    with (
+        x_client(script(ok(body))) as client,
+        pytest.raises(XApiError, match="errors and no data: no detail"),
+    ):
+        list(client.iter_timeline(USER_ID))
+
+
+def test_iter_timeline_errors_on_a_later_page_raise_after_earlier_pages() -> None:
+    data = {"data": [{"id": "5", "text": "t"}], "meta": {"next_token": "x"}}
+    stub = script(ok(data), ok({"errors": [{"title": "Forbidden"}]}))
+
+    with x_client(stub) as client:
+        pages = client.iter_timeline(USER_ID)
+        assert len(next(pages).tweets) == 1
+        with pytest.raises(XApiError, match="page 2"):
+            next(pages)
 
 
 def test_timeline_retries_a_transient_failure_mid_pagination() -> None:

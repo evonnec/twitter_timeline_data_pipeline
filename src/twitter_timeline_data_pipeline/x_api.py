@@ -168,8 +168,10 @@ class XClient:
 
         Stops when there is no ``next_token`` or after ``max_pages`` pages. With
         ``since_id`` only Tweets newer than it are returned, with ``until_id`` only
-        Tweets older than it (both bounds are exclusive). A page with
-        ``meta.result_count == 0`` yields nothing.
+        Tweets older than it (both bounds are exclusive). A clean empty response (no
+        data, no ``next_token``) ends the walk without yielding; an empty one that has a
+        ``next_token`` is yielded as an empty page; one with ``errors`` and no data
+        raises ``XApiError``.
         """
         if not 5 <= max_results <= 100:
             raise ValueError(f"max_results must be 5..100, got {max_results}")
@@ -198,22 +200,37 @@ class XClient:
         for page_number in range(1, max_pages + 1):
             body = self._request(f"/users/{user_id}/tweets", params)
             meta: Mapping[str, Any] = body.get("meta") or {}
+            data = body.get("data")
             if errors := body.get("errors"):
+                if not data:
+                    # e.g. a protected account: 200 with only an Authorization Error.
+                    # Treating that as "no more Tweets" would drop unfetched ranges.
+                    raise XApiError(
+                        f"timeline page {page_number} has errors and no data: "
+                        f"{_first_error_text(body) or 'no detail'}",
+                        status_code=200,
+                    )
                 logger.warning(
                     "timeline page %d has %d partial error(s); first: %s",
                     page_number,
                     len(errors),
                     _first_error_text(body) or "no detail",
                 )
-            if meta.get("result_count") == 0 or not body.get("data"):
-                return
+            next_token = meta.get("next_token")
+            if not data:
+                if not next_token:
+                    return
+                # An empty page that still points onward is not the end: yield it
+                # (it cost a request) and keep following the token.
+                yield TimelinePage(tweets=(), media={}, next_token=next_token)
+                params["pagination_token"] = next_token
+                continue
             media = (
                 Media.from_dict(m)
                 for m in (body.get("includes") or {}).get("media", ())
             )
-            next_token = meta.get("next_token")
             yield TimelinePage(
-                tweets=tuple(Tweet.from_api(t) for t in body["data"]),
+                tweets=tuple(Tweet.from_api(t) for t in data),
                 media={m.media_key: m for m in media},
                 newest_id=meta.get("newest_id"),
                 oldest_id=meta.get("oldest_id"),
