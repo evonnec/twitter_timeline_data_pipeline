@@ -1,0 +1,312 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >-
+  Serverless pipeline: a scheduled Lambda pulls an X (Twitter) user's timeline and
+  queues one SQS message per Tweet; a second Lambda stores Tweet metadata in DynamoDB
+  and media in S3.
+
+Parameters:
+  TwitterUsername:
+    Type: String
+    Default: NASA
+    Description: X account whose timeline is fetched.
+  ScheduleExpression:
+    Type: String
+    Default: rate(1 hour)
+    Description: EventBridge schedule expression for the fetch run.
+  ScheduleEnabled:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Set to false to pause the schedule.
+  MaxPages:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    Description: Maximum timeline pages per fetch run.
+  MaxResults:
+    Type: Number
+    Default: 100
+    MinValue: 5
+    MaxValue: 100
+    Description: Tweets per API page.
+  LogLevel:
+    Type: String
+    Default: INFO
+    AllowedValues: [DEBUG, INFO, WARNING, ERROR]
+  AlarmTopicArn:
+    Type: String
+    Default: ""
+    Description: Optional SNS topic ARN notified by the alarms. Leave empty for none.
+
+Conditions:
+  HasAlarmTopic: !Not [!Equals [!Ref AlarmTopicArn, ""]]
+
+Globals:
+  Function:
+    Runtime: python3.14
+    Architectures: [arm64]
+    Tracing: Active
+    CodeUri: build/lambda/  # pre-built by scripts/build_lambda.sh; no `sam build` step
+    LoggingConfig:
+      LogFormat: JSON
+      ApplicationLogLevel: !Ref LogLevel
+      SystemLogLevel: WARN
+
+Resources:
+  # --- Storage ---------------------------------------------------------------
+  # Empty on creation. Fill it with scripts/put_secret.sh so the token never
+  # appears in the template, parameters or environment variables.
+  BearerTokenSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: X API v2 bearer token. Value is set out of band by scripts/put_secret.sh.
+
+  TweetsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain  # collected data outlives the stack
+    UpdateReplacePolicy: Retain
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: tweet_id, AttributeType: S}
+        - {AttributeName: username, AttributeType: S}
+        - {AttributeName: created_at, AttributeType: S}
+      KeySchema:
+        - {AttributeName: tweet_id, KeyType: HASH}
+      GlobalSecondaryIndexes:
+        - IndexName: username-created_at-index
+          KeySchema:
+            - {AttributeName: username, KeyType: HASH}
+            - {AttributeName: created_at, KeyType: RANGE}
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+
+  # Per-user checkpoint: the newest Tweet ID already fetched.
+  StateTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: username, AttributeType: S}
+      KeySchema:
+        - {AttributeName: username, KeyType: HASH}
+      SSESpecification:
+        SSEEnabled: true
+
+  MediaBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain  # collected media outlives the stack
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      LifecycleConfiguration:
+        Rules:
+          - Id: abort-incomplete-multipart-uploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+
+  MediaBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref MediaBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt MediaBucket.Arn
+              - !Sub "${MediaBucket.Arn}/*"
+            Condition:
+              Bool:
+                "aws:SecureTransport": "false"
+
+  # --- Queues ----------------------------------------------------------------
+  TweetsDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600  # 14 days
+      SqsManagedSseEnabled: true
+
+  TweetsQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      SqsManagedSseEnabled: true
+      # 6 x ProcessFunction timeout (120 s), per AWS guidance for SQS event sources.
+      VisibilityTimeout: 720
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt TweetsDeadLetterQueue.Arn
+        maxReceiveCount: 5
+
+  # --- Log groups ------------------------------------------------------------
+  FetchFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 30
+
+  ProcessFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 30
+
+  # --- Functions -------------------------------------------------------------
+  FetchFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: Pulls a user's timeline from the X API and queues one message per Tweet.
+      Handler: twitter_timeline_data_pipeline.handlers.fetch.handler
+      Timeout: 300
+      MemorySize: 256
+      # Runs never overlap, so the per-user checkpoint can't race.
+      ReservedConcurrentExecutions: 1
+      LoggingConfig:
+        LogGroup: !Ref FetchFunctionLogGroup
+      Environment:
+        Variables:
+          TWITTER_USERNAME: !Ref TwitterUsername
+          BEARER_TOKEN_SECRET_ARN: !Ref BearerTokenSecret
+          QUEUE_URL: !Ref TweetsQueue
+          STATE_TABLE: !Ref StateTable
+          MAX_PAGES: !Ref MaxPages
+          MAX_RESULTS: !Ref MaxResults
+      Policies:
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt TweetsQueue.QueueName
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: !Ref BearerTokenSecret
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:PutItem]
+              Resource: !GetAtt StateTable.Arn
+      EventInvokeConfig:
+        # The next scheduled run retries; a retry would only burn API rate limit.
+        MaximumRetryAttempts: 0
+      Events:
+        Schedule:
+          Type: Schedule
+          Properties:
+            Schedule: !Ref ScheduleExpression
+            Enabled: !Ref ScheduleEnabled
+
+  ProcessFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: Stores Tweet metadata in DynamoDB and media in S3.
+      Handler: twitter_timeline_data_pipeline.handlers.process.handler
+      Timeout: 120
+      MemorySize: 512
+      LoggingConfig:
+        LogGroup: !Ref ProcessFunctionLogGroup
+      Environment:
+        Variables:
+          TWEETS_TABLE: !Ref TweetsTable
+          MEDIA_BUCKET: !Ref MediaBucket
+      Policies:
+        - DynamoDBWritePolicy:
+            TableName: !Ref TweetsTable
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action: [s3:PutObject, s3:GetObject]
+              Resource: !Sub "${MediaBucket.Arn}/*"
+            # ListBucket makes HeadObject return 404 instead of 403 for missing keys.
+            - Effect: Allow
+              Action: s3:ListBucket
+              Resource: !GetAtt MediaBucket.Arn
+      Events:
+        TweetsQueueEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt TweetsQueue.Arn
+            BatchSize: 10
+            MaximumBatchingWindowInSeconds: 10
+            FunctionResponseTypes: [ReportBatchItemFailures]
+            ScalingConfig:
+              MaximumConcurrency: 5
+
+  # --- Alarms ----------------------------------------------------------------
+  DeadLetterQueueNotEmptyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Messages are sitting in the dead-letter queue.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - {Name: QueueName, Value: !GetAtt TweetsDeadLetterQueue.QueueName}
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref AWS::NoValue]
+
+  FetchFunctionErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: The fetch function failed in the last hour.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - {Name: FunctionName, Value: !Ref FetchFunction}
+      Statistic: Sum
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref AWS::NoValue]
+
+  ProcessFunctionErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: The process function reported errors.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - {Name: FunctionName, Value: !Ref ProcessFunction}
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref AWS::NoValue]
+
+Outputs:
+  QueueUrl:
+    Value: !Ref TweetsQueue
+  DeadLetterQueueUrl:
+    Value: !Ref TweetsDeadLetterQueue
+  TweetsTableName:
+    Value: !Ref TweetsTable
+  StateTableName:
+    Value: !Ref StateTable
+  MediaBucketName:
+    Value: !Ref MediaBucket
+  BearerTokenSecretArn:
+    Value: !Ref BearerTokenSecret
+  FetchFunctionName:
+    Value: !Ref FetchFunction
+  ProcessFunctionName:
+    Value: !Ref ProcessFunction

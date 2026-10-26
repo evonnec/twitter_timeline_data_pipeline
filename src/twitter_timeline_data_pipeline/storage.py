@@ -9,21 +9,37 @@ re-send a Tweet after a retry:
   downloaded again.
 """
 
-from collections.abc import Sequence
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Literal
+import io
+import logging
+import mimetypes
+import posixpath
+from collections.abc import Buffer, Iterator, Sequence
+from dataclasses import asdict, dataclass
+from typing import TYPE_CHECKING, Any, Literal, cast, override
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
+from botocore.exceptions import ClientError
 
-from twitter_timeline_data_pipeline.models import Media, TweetId, TweetMessage
+from twitter_timeline_data_pipeline.models import (
+    Media,
+    TweetId,
+    TweetMessage,
+    utc_now_iso,
+)
 
 if TYPE_CHECKING:
     from mypy_boto3_dynamodb.service_resource import Table
     from mypy_boto3_s3 import S3Client
 
+logger = logging.getLogger(__name__)
+
 type MediaStatus = Literal["stored", "exists", "unavailable", "skipped"]
 """stored: uploaded now. exists: already in S3. unavailable: the source returned
 403/404/410. skipped: nothing downloadable (e.g. a video with only an HLS variant)."""
+
+_KNOWN_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".gif", ".webp", ".mp4"})
+_MISSING_OBJECT_CODES = frozenset({"404", "NoSuchKey", "NotFound"})
 
 
 class TransientMediaError(RuntimeError):
@@ -41,13 +57,61 @@ class StoredMedia:
     size_bytes: int | None = None
 
 
+class _IterReader(io.RawIOBase):
+    """File-like view of a byte iterator, so S3 can stream it without buffering.
+
+    Counts the bytes handed out in ``size``.
+    """
+
+    def __init__(self, chunks: Iterator[bytes]) -> None:
+        self._chunks = chunks
+        self._pending = memoryview(b"")
+        self.size = 0
+
+    @override
+    def readable(self) -> bool:
+        return True
+
+    @override
+    def readinto(self, buffer: Buffer) -> int:
+        view = memoryview(buffer).cast("B")
+        while not self._pending:
+            chunk = next(self._chunks, None)
+            if chunk is None:
+                return 0
+            self._pending = memoryview(chunk)
+        n = min(len(view), len(self._pending))
+        view[:n] = self._pending[:n]
+        self._pending = self._pending[n:]
+        self.size += n
+        return n
+
+
+def _original_size_url(url: str) -> str:
+    """Photos on the media CDN default to a reduced size; ``name=orig`` is full size."""
+    parts = urlsplit(url)
+    if parts.hostname == "pbs.twimg.com" and parts.path.startswith("/media/"):
+        return urlunsplit(parts._replace(query="name=orig"))
+    return url
+
+
+def _extension(content_type: str | None, url: str) -> str:
+    """File extension (with dot) knowable before downloading, or ``""``."""
+    if content_type and (ext := mimetypes.guess_extension(content_type)):
+        return ext
+    suffix = posixpath.splitext(urlsplit(url).path)[1].lower()
+    return suffix if suffix in _KNOWN_EXTENSIONS else ""
+
+
 class MediaStore:
     """Streams media files from the X CDN into S3."""
 
     def __init__(
         self, s3_client: S3Client, bucket: str, http_client: httpx.Client
     ) -> None:
-        raise NotImplementedError
+        self._s3 = s3_client
+        self._bucket = bucket
+        self._http = http_client
 
     @staticmethod
     def object_key(message: TweetMessage, media: Media, extension: str) -> str:
@@ -56,7 +120,8 @@ class MediaStore:
         Uses ``author_id`` (stable) and falls back to the lower-cased username when the
         Tweet has none. ``extension`` includes the dot, e.g. ``.jpg``.
         """
-        raise NotImplementedError
+        owner = message.tweet.author_id or message.username.lower()
+        return f"media/{owner}/{message.tweet.id}/{media.media_key}{extension}"
 
     def store(self, message: TweetMessage, media: Media) -> StoredMedia:
         """Upload one media item unless it's already stored.
@@ -64,14 +129,78 @@ class MediaStore:
         Raises ``TransientMediaError`` for failures worth retrying; returns status
         ``unavailable`` for permanent ones so the Tweet is still recorded.
         """
-        raise NotImplementedError
+        source = media.download_source()
+        if source is None:
+            return StoredMedia(
+                media_key=media.media_key, type=media.type, status="skipped"
+            )
+        raw_url, known_type = source
+        url = _original_size_url(raw_url)
+        key = self.object_key(message, media, _extension(known_type, url))
+
+        def result(status: MediaStatus, **extra: Any) -> StoredMedia:
+            return StoredMedia(
+                media_key=media.media_key,
+                type=media.type,
+                status=status,
+                source_url=url,
+                **extra,
+            )
+
+        try:
+            head = self._s3.head_object(Bucket=self._bucket, Key=key)
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") not in _MISSING_OBJECT_CODES:
+                raise
+        else:
+            return result(
+                "exists",
+                s3_key=key,
+                content_type=head.get("ContentType"),
+                size_bytes=head.get("ContentLength"),
+            )
+
+        try:
+            with self._http.stream("GET", url, follow_redirects=True) as response:
+                status = response.status_code
+                if status == 429 or status >= 500:
+                    raise TransientMediaError(f"HTTP {status} fetching {url}")
+                if status >= 400:
+                    logger.warning(
+                        "media %s unavailable: HTTP %s", media.media_key, status
+                    )
+                    return result("unavailable")
+                content_type = (
+                    known_type
+                    or response.headers.get("content-type", "").split(";")[0].strip()
+                    or "application/octet-stream"
+                )
+                reader = _IterReader(response.iter_bytes())
+                self._s3.upload_fileobj(
+                    io.BufferedReader(reader),
+                    self._bucket,
+                    key,
+                    ExtraArgs={
+                        "ContentType": content_type,
+                        "Metadata": {
+                            "tweet-id": message.tweet.id,
+                            "media-key": media.media_key,
+                            "source-url": url,
+                        },
+                    },
+                )
+        except httpx.TransportError as exc:  # includes timeouts
+            raise TransientMediaError(f"{type(exc).__name__} fetching {url}") from exc
+        return result(
+            "stored", s3_key=key, content_type=content_type, size_bytes=reader.size
+        )
 
 
 class TweetStore:
     """Writes Tweet metadata to the tweets table (partition key ``tweet_id``)."""
 
     def __init__(self, table: Table) -> None:
-        raise NotImplementedError
+        self._table = table
 
     @staticmethod
     def to_item(message: TweetMessage, media: Sequence[StoredMedia]) -> dict[str, Any]:
@@ -80,20 +209,46 @@ class TweetStore:
         None values are left out. Includes ``username`` and ``created_at`` for the
         ``username-created_at-index`` GSI.
         """
-        raise NotImplementedError
+        tweet = message.tweet
+        item: dict[str, Any] = {
+            "tweet_id": tweet.id,
+            "username": message.username,
+            "author_id": tweet.author_id,
+            "text": tweet.text,
+            "created_at": tweet.created_at,
+            "conversation_id": tweet.conversation_id,
+            "lang": tweet.lang,
+            "referenced_tweets": [
+                {"type": r.type, "id": r.id} for r in tweet.referenced_tweets
+            ],
+            "public_metrics": dict(tweet.public_metrics),
+            "edit_history_tweet_ids": list(tweet.edit_history_tweet_ids),
+            "media": [
+                {k: v for k, v in asdict(m).items() if v is not None} for m in media
+            ],
+            "media_count": len(media),
+            "fetched_at": message.fetched_at,
+            "stored_at": utc_now_iso(),
+            "schema_version": message.schema_version,
+        }
+        return {k: v for k, v in item.items() if v is not None}
 
     def put_tweet(self, message: TweetMessage, media: Sequence[StoredMedia]) -> None:
-        raise NotImplementedError
+        self._table.put_item(Item=self.to_item(message, media))
 
 
 class CheckpointStore:
     """Per-username high-water mark (newest Tweet ID enqueued) in the state table."""
 
     def __init__(self, table: Table) -> None:
-        raise NotImplementedError
+        self._table = table
 
     def get(self, username: str) -> TweetId | None:
-        raise NotImplementedError
+        response = self._table.get_item(
+            Key={"username": username.lower()}, ConsistentRead=True
+        )
+        item = response.get("Item")
+        return None if item is None else str(int(cast(Any, item["newest_id"])))
 
     def advance(self, username: str, newest_id: TweetId) -> bool:
         """Store ``newest_id`` only if it's newer than what's stored.
@@ -101,4 +256,23 @@ class CheckpointStore:
         Uses a conditional write so a slower, older run can't move the mark backwards.
         Returns whether the item changed.
         """
-        raise NotImplementedError
+        try:
+            self._table.put_item(
+                # A Number, not a string: IDs compare as integers.
+                Item={
+                    "username": username.lower(),
+                    "newest_id": int(newest_id),
+                    "updated_at": utc_now_iso(),
+                },
+                ConditionExpression=(
+                    "attribute_not_exists(username) OR newest_id < :new"
+                ),
+                ExpressionAttributeValues={":new": int(newest_id)},
+            )
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") == (
+                "ConditionalCheckFailedException"
+            ):
+                return False
+            raise
+        return True

@@ -1,0 +1,8 @@
+version = 0.1
+
+[default.deploy.parameters]
+stack_name = "twitter-timeline-pipeline"
+resolve_s3 = true
+capabilities = "CAPABILITY_IAM CAPABILITY_AUTO_EXPAND"
+confirm_changeset = true
+region = "us-east-1"
