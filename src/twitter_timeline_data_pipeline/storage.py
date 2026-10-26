@@ -598,6 +598,7 @@ class TweetStore:
             ],
             "media_count": len(media),
             "fetched_at": message.fetched_at,
+            "raw_key": message.raw_key,
             "stored_at": utc_now_iso(),
             "schema_version": message.schema_version,
         }

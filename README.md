@@ -44,7 +44,7 @@ A run, step by step:
 1. EventBridge invokes `FetchFunction` on the schedule (`rate(1 hour)` by default). The event may carry `{"username": "..."}`; otherwise the `TWITTER_USERNAME` setting is used. The name is normalized once (leading `@` removed, lower-cased) and used everywhere below.
 2. The function reads the bearer token from Secrets Manager (cached in memory for 15 minutes), reads the account's cursor from the state table, and takes the user ID from it (the handle is looked up only when the stored ID is missing or older than `USER_ID_TTL_HOURS`; see [identity changes](#identity-changes)): the newest Tweet ID already fetched, plus any *gaps* (ID ranges known to be unfetched; see the [state table](#state-table-statetable)).
 3. New Tweets first. It pages through `GET /2/users/:id/tweets` with `since_id` set to the newest ID, newest first, in pages of `MAX_RESULTS` Tweets. A first run has no `since_id`. `MAX_PAGES` is a budget of API requests, counting empty and failed ones; when gaps exist it is at least 2, one request is kept for the oldest gap, and the rest go to the new Tweets and the newest gaps.
-4. Each page becomes one message per Tweet, sent to the queue with `SendMessageBatch` (10 at a time; only entries SQS reports as failed are retried).
+4. Each page is first written, unchanged, to the media bucket under `raw/` (see [Raw API pages](#raw-api-pages)). Only then does it become one message per Tweet, sent to the queue with `SendMessageBatch` (10 at a time; only entries SQS reports as failed are retried). Each message carries the raw object's key as `raw_key`. If the upload fails, nothing from that page is enqueued and the run fails with its cursor unmoved, so the page is fetched again by the next run.
 5. After each page is fully enqueued, the cursor is saved. While the page still has a `next_token`, the not-yet-fetched rest is recorded as a gap just below the lowest ID seen; a page without `next_token` closes it. So a run that hits the cap, a rate limit or an error leaves a gap, never a hole.
 6. Then the gaps. Whatever remains of the shared `MAX_PAGES` budget goes to the gaps, newest gap first, with `since_id` and `until_id` set to the gap's bounds. Each saved page lowers the gap's `until_id`, and the gap is removed when a page has no `next_token`.
 7. A 429 that resets later than the function will wait ends the run cleanly after saving: the invocation succeeds and the summary has `stopped_reason: "rate_limited"` (alerting on that comes with issue #19). Any other error fails the invocation, with progress up to the last full page saved; an error in one gap is raised only after the other gaps have had their turn. The next run resumes from the cursor and re-sends at most the page that was in flight.
@@ -225,7 +225,7 @@ If a Tweet has no `author_id`, the lower-cased username is used instead. The key
 
 The same bucket also holds the full text of oversized long posts at `text/<author_id>/<tweet_id>.json` (a JSON string, `application/json`, user metadata `tweet-id`); see the Tweets table. These objects are not tiered.
 
-Each object has the `Content-Type` of the source and user metadata `tweet-id`, `media-key` and `source-url`. The bucket is encrypted (SSE-S3), blocks all public access, refuses non-TLS requests, and aborts incomplete multipart uploads after 7 days. Versioning is on, so a deleted or overwritten object can be recovered for 30 days (noncurrent versions then expire). Objects under `media/` move to S3 Intelligent-Tiering on day 0, so cold video stops costing Standard rates; the trade-off is a small per-object monitoring fee, and objects under 128 KB are never tiered.
+Each object has the `Content-Type` of the source and user metadata `tweet-id`, `media-key` and `source-url`. The bucket is encrypted (SSE-S3), blocks all public access, refuses non-TLS requests, and aborts incomplete multipart uploads after 7 days. Versioning is on, so a deleted or overwritten object can be recovered for 30 days (noncurrent versions under `media/` and `text/` then expire; `raw/` versions never do). Objects under `media/` move to S3 Intelligent-Tiering on day 0, so cold video stops costing Standard rates; the trade-off is a small per-object monitoring fee, and objects under 128 KB are never tiered.
 
 ## Design decisions
 
@@ -241,6 +241,35 @@ Each object has the `Content-Type` of the source and user metadata `tweet-id`, `
 - **Retained data stores.** The tweets table and the media bucket have `DeletionPolicy: Retain`, so deleting the stack does not delete collected data.
 - **No automatic fetch retries.** The function has `MaximumRetryAttempts: 0`, because the next scheduled run is the retry and a retry would only use up API rate limit.
 - **Runtime.** Python 3.14 on arm64 (Graviton). The dependency bundle is built for `aarch64-manylinux_2_28` wheels so it can be built on any machine.
+
+### Raw API pages
+
+Every timeline page the fetch receives is kept as it came from the API, so a field the processor doesn't store today (`note_tweet`, `entities`, referenced posts) can be recovered later without calling the API again; the API serves only an account's 3,200 most recent posts, so for older posts this is the only chance. The fetch writes the page to the media bucket before enqueuing its messages. An empty page that still points to a next page is landed too; a clean empty response (no data, no next page) is not.
+
+```text
+raw/<user_id>/dt=YYYY-MM-DD/<run_id>-<page_no>.json.gz
+```
+
+`dt` is the UTC date of the fetch, `run_id` a random ID per fetch run and `page_no` the page's number within that run, from 0001. Keys are unique, so nothing is overwritten. The object is gzipped JSON (`Content-Type: application/json`, `Content-Encoding: gzip`), an envelope:
+
+```json
+{
+  "schema_version": 1,
+  "username": "nasa",
+  "user_id": "1000000001",
+  "fetched_at": "2026-10-25T08:30:00Z",
+  "request": {"endpoint": "/users/1000000001/tweets", "params": {"max_results": 100, "...": "..."}},
+  "response": {"data": ["..."], "includes": {"media": ["..."]}, "meta": {"next_token": "..."}}
+}
+```
+
+`request.params` holds the query parameters (the bearer token is a header and is never stored); `response` is the body as received. `fetched_at` is the same value the page's messages carry. Each message has an optional `raw_key` (additive, `schema_version` stays 1) and the Tweet item stores it as `raw_key`, so any item can be traced to the page it came from.
+
+Pages are written once (`If-None-Match: *`; an existing key is the same page from an earlier attempt and is left alone). The `FetchFunction` role may only `s3:PutObject` under `raw/*`, and `ProcessFunction` is limited to `media/*` and `text/*`, so no function can overwrite or delete a raw page. No lifecycle rule touches `raw/`: nothing is expired, and noncurrent versions are expired only under `media/` and `text/`. There is no storage-class transition either: gzipped pages are far below the 128 KB minimum S3 applies to lifecycle transitions, so one would do nothing. The pages are encrypted, private and versioned like the media.
+
+A page the parser rejects (valid JSON of an unexpected shape) is landed first and then fails the run with the cursor unmoved, so the data is kept and can be replayed once the parser is fixed.
+
+**Retention and deletion.** A raw page holds up to 100 Tweets, so it cannot be deleted for one Tweet. It is kept indefinitely. Deletions in `raw/` belong to the compliance job of issue #21: it rewrites the affected pages to remove deleted Tweets and records their IDs in an optional envelope field `redactions` (a list of Tweet IDs). `replay` never replays a Tweet listed in `redactions`, nor media used only by it.
 
 ## Repository layout
 
@@ -269,6 +298,8 @@ Each object has the `Content-Type` of the source and user metadata `tweet-id`, `
 │   ├── credentials.py                 bearer token lookup and TTL cache
 │   ├── x_api.py                       X API v2 client (retries, rate limits, pagination)
 │   ├── models.py                      Tweet, Media, SQS messages (schema_version 1)
+│   ├── raw.py                         raw API pages: envelope, S3 keys, writer, reader
+│   ├── replay.py                      rebuild messages from raw pages (no API calls)
 │   ├── storage.py                     DynamoDB and S3 persistence, checkpoint store
 │   ├── cli.py                         `twitter-pipeline` command
 │   └── handlers/
@@ -401,9 +432,19 @@ export TWITTER_BEARER_TOKEN='<your bearer token>'
 uv run twitter-pipeline fetch --username NASA --dry-run
 ```
 
-It resolves the username, pages through the timeline, and prints one SQS message body per Tweet to stdout, as compact JSON on one line each. Logs go to stderr. Nothing is sent to SQS and no checkpoint is read or written. Without `--dry-run` it does the real fetch (needs `QUEUE_URL`, `STATE_TABLE` and AWS credentials) and prints a JSON summary of the run.
+It resolves the username, pages through the timeline, and prints one SQS message body per Tweet to stdout, as compact JSON on one line each. Logs go to stderr. Nothing is sent to SQS and no checkpoint is read or written. Without `--dry-run` it does the real fetch (needs `QUEUE_URL`, `STATE_TABLE` and AWS credentials) and prints a JSON summary of the run. A real CLI fetch lands raw pages in S3 like the Lambda and so needs `MEDIA_BUCKET` (exit 2 without it) unless you pass `--no-raw`; a dry run never writes anything.
 
 Other options: `--max-pages`, `--max-results` (5 to 100), `--since-id` and `--log-level`; see `uv run twitter-pipeline fetch --help`. Exit codes: 0 success; 1 an upstream or runtime failure (X API, malformed API data, an unreadable secret, enqueue, or an AWS SDK error such as SQS or DynamoDB access denied; the one-line message goes to stderr and the traceback shows with `--log-level DEBUG`); 2 bad arguments or configuration (invalid username, out-of-range option, missing `QUEUE_URL` or `STATE_TABLE`, or no bearer token configured).
+
+### Replay raw pages
+
+```bash
+export QUEUE_URL=$QUEUE   # not needed with --dry-run
+uv run twitter-pipeline replay --raw "s3://$(out MediaBucketName)/raw/1000000001/dt=2026-10-25/" --dry-run
+uv run twitter-pipeline replay --raw "s3://$(out MediaBucketName)/raw/1000000001/"
+```
+
+`replay` lists every object under the prefix (it must start with `raw/`; a trailing `/` is added, so the prefix matches whole path segments: `raw/1` selects `raw/1/...`, not `raw/10/...`; from a whole user down to one `dt=` day), reads the envelopes, re-parses each response with the same code the fetch uses and enqueues the messages to `QUEUE_URL`, in key order. It calls no API and never reads or changes the fetch cursor. Messages are rebuilt with the envelope's `username`, its original `fetched_at` and the object's key as `raw_key`: for an unchanged parser the bodies are identical to what the fetch sent. Because `fetched_at` is the original one, the processor's conditional write keeps a replay from overwriting an item fetched later; it rewrites items of the same fetch. `--dry-run` prints the bodies to stdout and makes no queue calls. Zero-byte keys ending in `/` (console folders) are skipped and listed in the summary. An object that can't be read (not gzip, wrong envelope, an invalid `fetched_at`) stops the replay with its key in the error (exit 1), and so does a prefix with no pages (zero objects); the log has a `replayed <key>` line per object, and `--start-after <key>` resumes after the last one. Needed permissions: `s3:ListBucket` on the bucket (prefix `raw/`), `s3:GetObject` on `raw/*` and, unless `--dry-run`, `sqs:SendMessage` on the queue. a bad URI or a missing `QUEUE_URL` exits 2. Replay is safe to repeat. It is the way to reprocess after a parser change or to restore a wiped table; use the DLQ redrive below for messages that merely failed.
 
 ### Environment variables
 
@@ -415,7 +456,7 @@ Other options: `--max-pages`, `--max-results` (5 to 100), `--since-id` and `--lo
 | `QUEUE_URL` | fetch | none | URL of the tweets queue |
 | `STATE_TABLE` | fetch | none | Name of the checkpoint table |
 | `TWEETS_TABLE` | process, media-retry | none | Name of the tweets table |
-| `MEDIA_BUCKET` | process, media-retry | none | Name of the media bucket |
+| `MEDIA_BUCKET` | fetch, process, media-retry, CLI fetch | none | Name of the media bucket. The fetch needs it to land raw pages and fails without it. A non-dry CLI fetch also requires it (exit 2) unless `--no-raw` is given: the fetch moves the shared cursor, so skipping raw pages loses them for good |
 | `MAX_RESULTS` | fetch | `100` | Tweets per API page, 5 to 100 |
 | `MAX_PAGES` | fetch | `5` | Maximum pages per run, at least 1 |
 | `USER_ID_TTL_HOURS` | fetch | `24` | Hours a stored user ID is reused before the handle is looked up again; 0 looks it up on every run, at most 8760. Set from the `UserIdTtlHours` parameter |
@@ -565,6 +606,8 @@ sam local invoke ProcessFunction --event events/sqs.json
 ## Operations
 
 Use the stack outputs from [Testing a deployment](#testing-a-deployment) (`$QUEUE`, `$DLQ`, `$FETCH`) in these runbooks.
+
+**Replay from raw pages.** To rebuild Tweet items without calling the API (a parser fix, a lost table, a new field), run `twitter-pipeline replay` on the affected `raw/` prefix; see [Replay raw pages](#replay-raw-pages). Unlike `--since-id`, it costs no API reads.
 
 **Redrive the DLQ.** An alarm on the DLQ means records failed `MaxReceiveCount` times. Read the process function's logs first (a malformed message will fail again; a stale message is skipped with a `stale write skipped ...` log line and can't overwrite newer data), fix the cause, then move the messages back before the 14-day retention expires them:
 

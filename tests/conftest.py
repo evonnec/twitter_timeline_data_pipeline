@@ -10,7 +10,7 @@ from mypy_boto3_dynamodb.service_resource import DynamoDBServiceResource, Table
 from mypy_boto3_s3 import S3Client
 from mypy_boto3_sqs import SQSClient
 
-from twitter_timeline_data_pipeline import credentials
+from twitter_timeline_data_pipeline import credentials, raw
 from twitter_timeline_data_pipeline.config import ENV_VARS
 from twitter_timeline_data_pipeline.handlers import fetch, process
 
@@ -46,6 +46,7 @@ def clear_caches() -> Iterator[None]:
 
     def clear() -> None:
         fetch.sqs_client.cache_clear()
+        raw.s3_client.cache_clear()
         fetch.checkpoint_store.cache_clear()
         process._s3_client.cache_clear()
         process._sqs_client.cache_clear()

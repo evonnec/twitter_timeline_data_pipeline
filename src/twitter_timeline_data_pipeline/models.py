@@ -269,9 +269,16 @@ class TweetMessage:
     media: tuple[Media, ...] = ()
     fetched_at: str = field(default_factory=utc_now_iso)
     schema_version: int = SCHEMA_VERSION
+    raw_key: str | None = None
+    """S3 key of the raw API page this Tweet came from (lineage). Additive and
+    optional: omitted from the body when None, so an old reader never sees it and a
+    message from an older fetcher parses with None."""
 
     def to_dict(self) -> JSONObject:
-        return asdict(self)
+        data = asdict(self)
+        if data["raw_key"] is None:
+            del data["raw_key"]
+        return data
 
     def to_json(self) -> str:
         # UTF-8, escaping only what SQS rejects or UTF-8 can't encode. Escaping every
@@ -292,6 +299,7 @@ class TweetMessage:
             media=tuple(Media.from_dict(m) for m in data.get("media") or ()),
             fetched_at=normalize_fetched_at(data["fetched_at"]),
             schema_version=version,
+            raw_key=_opt_str(data.get("raw_key")),
         )
 
     @classmethod
@@ -403,6 +411,16 @@ class MediaRetry:
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class RawPage:
+    """The request and the unparsed response body of one timeline page, as landed in
+    S3. ``params`` never holds credentials (the token is a header, not a parameter)."""
+
+    endpoint: str
+    params: Mapping[str, str | int]
+    body: JSONObject
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class TimelinePage:
     """One page of ``GET /2/users/:id/tweets`` with its media expansion resolved."""
 
@@ -411,9 +429,15 @@ class TimelinePage:
     newest_id: TweetId | None = None
     oldest_id: TweetId | None = None
     next_token: str | None = None
+    raw: RawPage | None = field(default=None, compare=False, repr=False)
+    """The response this page was parsed from; None for a page built by hand."""
 
     def messages(
-        self, username: str, *, fetched_at: str | None = None
+        self,
+        username: str,
+        *,
+        fetched_at: str | None = None,
+        raw_key: str | None = None,
     ) -> list[TweetMessage]:
         """One message per Tweet, each carrying the media its ``media_keys`` name.
 
@@ -437,6 +461,7 @@ class TimelinePage:
                     tweet=tweet,
                     media=tuple(media),
                     fetched_at=stamp,
+                    raw_key=raw_key,
                 )
             )
         return messages

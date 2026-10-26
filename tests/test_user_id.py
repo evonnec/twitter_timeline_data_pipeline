@@ -421,6 +421,7 @@ def test_cli_reports_an_identity_change_as_a_failure(
     monkeypatch.setenv("TWITTER_BEARER_TOKEN", "t")
     monkeypatch.setenv("STATE_TABLE", aws.state_table.name)
     monkeypatch.setenv("QUEUE_URL", aws.queue_url)
+    monkeypatch.setenv("MEDIA_BUCKET", aws.bucket)  # a real CLI fetch lands raw pages
     monkeypatch.setenv("USER_ID_TTL_HOURS", "0")
     assert main(["fetch", "--username", USERNAME]) == 0
     api.owner = NEW_ID
