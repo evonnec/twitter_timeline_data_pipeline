@@ -139,13 +139,13 @@ One item per account: partition key `username` (S, lower case) and
 | Attribute | Type | Meaning |
 | --- | --- | --- |
 | `newest_id` | N | Highest Tweet ID enqueued. Never decreases. Absent until a Tweet has been enqueued. |
-| `gaps` | L of M | Exclusive ID ranges known to be unfetched, each `{until_id, since_id, empty_runs}` (N; `empty_runs` only when above 0). A missing `since_id` means "down to the end of what the API serves" (about the 3,200 most recent posts); a missing `until_id` means "up from the newest Tweet". |
+| `gaps` | L of M | Exclusive ID ranges known to be unfetched, each `{until_id, since_id, empty_runs, first_empty_at}` (N; `empty_runs` and the ISO-8601 UTC `first_empty_at` only when `empty_runs` is above 0). A missing `since_id` means "down to the end of what the API serves" (about the 3,200 most recent posts); a missing `until_id` means "up from the newest Tweet". |
 | `version` | N | Optimistic lock, incremented on every write. |
 | `updated_at` | S | UTC timestamp of the last write. |
 
 The list is kept normalized on every save: overlapping or adjacent gaps are merged, and at most 100 are kept (past that, the two closest neighbours are joined). A merge only adds IDs to re-fetch, so it can cause duplicates but never loss.
 
-**Empty responses never end a range by themselves.** A `200` with `errors` and no data (for example an account that turned protected) raises an error instead of reading as "no more Tweets"; an empty page that still has a `next_token` is followed. A gap is dropped only when the first request for it comes back cleanly empty (no data, no errors, no `next_token`) in 3 consecutive runs, counted in `empty_runs` and reset whenever data comes back; the drop is logged at WARNING with the range. That is how a range that has aged out of the API's window finally goes away.
+**Empty responses never end a range by themselves.** A `200` with `errors` and no data (for example an account that turned protected) raises an error instead of reading as "no more Tweets"; an empty page that still has a `next_token` is followed. A gap is dropped only when the first request for it comes back cleanly empty (no data, no errors, no `next_token`) in at least 3 consecutive runs (`empty_runs`) **and** at least 24 hours after the first of them (`first_empty_at`), so a short API incident cannot erase a range that still holds data. Both reset whenever data comes back. The drop is logged at WARNING as `dropping gap for <user> (since_id=..., until_id=...): out of the API's reach`, stable text for a metric filter to match. That is how a range that has aged out of the API's window finally goes away.
 
 Every write is conditional on the `version` that run read (a missing `version` counts as 0, so items written before gaps existed are read as they are and upgraded on the first write). If another run got there first, the write fails, the run stops fetching, logs a warning and returns `stopped_reason: "state_conflict"`. Anything it already enqueued is a harmless duplicate, `newest_id` never moves backwards, and no gap is dropped.
 

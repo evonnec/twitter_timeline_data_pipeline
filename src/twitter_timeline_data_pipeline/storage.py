@@ -433,14 +433,17 @@ class Gap:
 
     A missing ``since_id`` means "down to the end of what the API serves"; a missing
     ``until_id`` means "up from the newest Tweet". ``empty_runs`` counts consecutive
-    runs whose first request for this gap came back cleanly empty; the gap is only
-    dropped after several (see ``handlers.fetch``). IDs are normalized to plain
-    decimal strings.
+    runs whose first request for this gap came back cleanly empty and
+    ``first_empty_at`` (ISO-8601 UTC, ``...Z``) is when the first of them happened;
+    the gap is only dropped after several runs *and* a minimum age (see
+    ``handlers.fetch``). Both are unset while ``empty_runs`` is 0. IDs are
+    normalized to plain decimal strings.
     """
 
     until_id: TweetId | None = None
     since_id: TweetId | None = None
     empty_runs: int = 0
+    first_empty_at: str | None = None
 
     def __post_init__(self) -> None:
         for name in ("until_id", "since_id"):
@@ -472,9 +475,9 @@ class Gap:
         """Highest ID in the range (infinite when open at the top)."""
         return float("inf") if self.until_id is None else int(self.until_id) - 1
 
-    def to_item(self) -> dict[str, int]:
+    def to_item(self) -> dict[str, int | str]:
         # Numbers, not strings: IDs compare as integers.
-        item = {
+        item: dict[str, int | str] = {
             name: int(value)
             for name, value in (
                 ("until_id", self.until_id),
@@ -484,6 +487,8 @@ class Gap:
         }
         if self.empty_runs:
             item["empty_runs"] = self.empty_runs
+            if self.first_empty_at:
+                item["first_empty_at"] = self.first_empty_at
         return item
 
     @classmethod
@@ -496,12 +501,17 @@ class Gap:
             until_id=tweet_id("until_id"),
             since_id=tweet_id("since_id"),
             empty_runs=int(item.get("empty_runs", 0)),
+            first_empty_at=item.get("first_empty_at"),  # absent on legacy items
         )
 
 
 def _union(a: Gap, b: Gap) -> Gap:
     """The smallest gap covering both; only ever adds IDs to re-fetch."""
     same = (a.since_id, a.until_id) == (b.since_id, b.until_id)
+    # Merging must never make a drop happen sooner: keep the smaller run count and
+    # the later first-empty time (a missing time is unknown, so the known one wins).
+    runs = min(a.empty_runs, b.empty_runs) if same else 0
+    stamps = [t for t in (a.first_empty_at, b.first_empty_at) if t]
     return Gap(
         until_id=None
         if a.until_id is None or b.until_id is None
@@ -510,7 +520,8 @@ def _union(a: Gap, b: Gap) -> Gap:
         if a.since_id is None or b.since_id is None
         else str(min(int(a.since_id), int(b.since_id))),
         # Empty responses for part of a range say nothing about the whole.
-        empty_runs=min(a.empty_runs, b.empty_runs) if same else 0,
+        empty_runs=runs,
+        first_empty_at=max(stamps) if runs and stamps else None,
     )
 
 

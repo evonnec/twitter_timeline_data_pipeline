@@ -13,6 +13,7 @@ import logging
 import time
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 import boto3
@@ -147,6 +148,19 @@ EMPTY_RUNS_TO_DROP = 3
 gap is dropped. One empty response can be a hiccup; three in a row mean the range has
 aged out of the API's window."""
 
+GAP_DROP_MIN_AGE = timedelta(hours=24)
+"""Minimum time between a gap's first clean-empty response and its drop. Counting runs
+alone is not enough: a short API incident can answer a few runs in a row with empty
+200s while the range still holds data."""
+
+DROP_MESSAGE = "dropping gap for %s (since_id=%s, until_id=%s): out of the API's reach"
+"""Stable, greppable text of the WARNING logged when a gap is dropped (a CloudWatch
+metric filter can match on it)."""
+
+
+def _iso(moment: datetime) -> str:
+    return moment.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
 
 @dataclass(slots=True)
 class _Run:
@@ -162,6 +176,7 @@ class _Run:
     max_results: int
     max_pages: int
     sleep: Callable[[float], None]
+    now: Callable[[], datetime]
     pages: int = 0
     requests: int = 0
     tweets: int = 0
@@ -307,28 +322,33 @@ class _Run:
         if pages:
             return
         # The first request came back cleanly empty (no data, no token, no errors).
+        now = self.now()
         runs = gap.empty_runs + 1
-        if runs < EMPTY_RUNS_TO_DROP:
-            logger.info(
-                "gap for %s (since_id=%s, until_id=%s) came back empty (%d of %d "
-                "runs before it is dropped)",
+        first = gap.first_empty_at or _iso(now)
+        age = now - datetime.fromisoformat(first)
+        if runs >= EMPTY_RUNS_TO_DROP and age >= GAP_DROP_MIN_AGE:
+            logger.warning(
+                DROP_MESSAGE + " (empty %d runs since %s)",
                 self.username,
                 gap.since_id,
                 gap.until_id,
                 runs,
-                EMPTY_RUNS_TO_DROP,
+                first,
             )
-            self.commit([], [*others, replace(gap, empty_runs=runs)])
+            self.commit([], others)
             return
-        logger.warning(
-            "gap for %s (since_id=%s, until_id=%s) came back empty %d runs in a row; "
-            "the range is out of the API's reach, dropping it",
+        logger.info(
+            "gap for %s (since_id=%s, until_id=%s) came back empty (run %d, first "
+            "at %s; dropped after %d runs spanning %s)",
             self.username,
             gap.since_id,
             gap.until_id,
             runs,
+            first,
+            EMPTY_RUNS_TO_DROP,
+            GAP_DROP_MIN_AGE,
         )
-        self.commit([], others)
+        self.commit([], [*others, replace(gap, empty_runs=runs, first_empty_at=first)])
 
 
 def _anchored(backfill: Gap | None, newest_id: TweetId | None) -> Gap | None:
@@ -357,6 +377,7 @@ def run_fetch(
     since_id: str | None = None,
     backfill: Gap | None = None,
     sleep: Callable[[float], None] = time.sleep,
+    now: Callable[[], datetime] = lambda: datetime.now(UTC),
 ) -> FetchResult:
     """Enqueue the new Tweets of ``username``, then work through any recorded gaps.
 
@@ -368,6 +389,7 @@ def run_fetch(
     oldest gap). A 429 ends the run cleanly (``stopped_reason="rate_limited"``) after
     saving; other errors propagate, with progress up to the last full page saved. An
     error in one gap is raised only after the remaining gaps have had their turn.
+    ``now`` is the clock used to age out empty gaps.
     """
     username = normalize_username(username)
     user_id = x_client.get_user_id(username)
@@ -382,6 +404,7 @@ def run_fetch(
         max_results=max_results,
         max_pages=max_pages,
         sleep=sleep,
+        now=now,
     )
     since_id = since_id or run.state.newest_id
     stopped_reason: str | None = None

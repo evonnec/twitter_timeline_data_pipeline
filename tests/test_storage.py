@@ -844,14 +844,34 @@ def test_gap_normalizes_ids_and_rejects_inverted_ranges() -> None:
 
 def test_empty_runs_round_trip_through_the_item(aws: Aws) -> None:
     store = CheckpointStore(aws.state_table)
-    gap = Gap(until_id="9", since_id="3", empty_runs=2)
+    gap = Gap(
+        until_id="9", since_id="3", empty_runs=2, first_empty_at="2026-01-01T00:00:00Z"
+    )
 
     store.save("example_user", CheckpointState(gaps=(gap,)), expected_version=0)
 
     assert ddb_get(aws.state_table, username="example_user")["gaps"] == [
-        {"until_id": 9, "since_id": 3, "empty_runs": 2}
+        {
+            "until_id": 9,
+            "since_id": 3,
+            "empty_runs": 2,
+            "first_empty_at": "2026-01-01T00:00:00Z",
+        }
     ]
     assert store.load("example_user").gaps == (gap,)
+
+
+def test_a_legacy_gap_item_without_first_empty_at_loads_as_none(aws: Aws) -> None:
+    aws.state_table.put_item(
+        Item={
+            "username": "example_user",
+            "gaps": [{"until_id": 9, "since_id": 3, "empty_runs": 2}],
+        }
+    )
+
+    gap = CheckpointStore(aws.state_table).load("example_user").gaps[0]
+
+    assert (gap.empty_runs, gap.first_empty_at) == (2, None)
 
 
 @pytest.mark.parametrize(
@@ -870,6 +890,37 @@ def test_empty_runs_round_trip_through_the_item(aws: Aws) -> None:
         ([Gap("6", "5"), Gap("3", "2")], ()),  # no IDs inside
         ([Gap("10", "5", 2), Gap("10", "5", 1)], (Gap("10", "5", 1),)),
         ([Gap("10", "5", 2), Gap("12", "8", 2)], (Gap("12", "5", 0),)),
+        # Same range: fewer runs and the later first-empty time, so a drop is never
+        # sooner than either input's.
+        (
+            [
+                Gap("10", "5", 3, "2026-01-01T00:00:00Z"),
+                Gap("10", "5", 2, "2026-01-02T00:00:00Z"),
+            ],
+            (Gap("10", "5", 2, "2026-01-02T00:00:00Z"),),
+        ),
+        (
+            [
+                Gap("10", "5", 3, "2026-01-02T00:00:00Z"),
+                Gap("10", "5", 4, "2026-01-01T00:00:00Z"),
+            ],
+            (Gap("10", "5", 3, "2026-01-02T00:00:00Z"),),
+        ),
+        (
+            [Gap("10", "5", 3, "2026-01-01T00:00:00Z"), Gap("10", "5")],
+            (Gap("10", "5"),),
+        ),
+        (
+            [Gap("10", "5", 3), Gap("10", "5", 3, "2026-01-01T00:00:00Z")],
+            (Gap("10", "5", 3, "2026-01-01T00:00:00Z"),),
+        ),
+        (
+            [
+                Gap("10", "5", 3, "2026-01-01T00:00:00Z"),
+                Gap("12", "8", 3, "2026-01-01T00:00:00Z"),
+            ],
+            (Gap("12", "5"),),
+        ),
     ],
 )
 def test_merge_gaps(gaps: list[Gap], expected: tuple[Gap, ...]) -> None:
@@ -1166,3 +1217,29 @@ def test_store_with_no_time_left_makes_no_request(aws: Aws) -> None:
         media_store(aws, cdn).store(make_message(media=(PHOTO,)), PHOTO, budget_s=0)
 
     assert cdn.requests == []
+
+
+@given(
+    data=st.lists(
+        st.tuples(
+            st.integers(0, 6),
+            st.integers(0, 6),  # runs
+            st.integers(0, 5),  # hours since the epoch of the first empty response
+        ),
+        min_size=2,
+        max_size=2,
+    )
+)
+def test_merging_never_makes_a_drop_sooner(data: list[tuple[int, int, int]]) -> None:
+    def gap(runs: int, hour: int) -> Gap:
+        stamp = f"2026-01-01T{hour:02d}:00:00Z" if runs else None
+        return Gap("10", "5", runs, stamp)
+
+    gaps = [gap(r, h) for _, r, h in data]
+    (merged,) = merge_gaps(gaps)
+
+    assert merged.empty_runs <= min(g.empty_runs for g in gaps)
+    assert (merged.first_empty_at is None) == (merged.empty_runs == 0)
+    stamps = [g.first_empty_at for g in gaps if g.first_empty_at]
+    if merged.first_empty_at:
+        assert merged.first_empty_at == max(stamps)

@@ -18,6 +18,8 @@ RATE_LIMITED = httpx.Response(429, headers={"x-rate-limit-reset": str(10**12)})
 ERRORS_ONLY = httpx.Response(
     200, json={"errors": [{"title": "Authorization Error", "detail": "not allowed"}]}
 )
+EMPTY_OK = httpx.Response(200, json={"meta": {"result_count": 0}})
+"""A clean empty page: no data, no ``next_token``, no errors."""
 
 
 def sent_ids(sqs: FakeSqs) -> list[int]:

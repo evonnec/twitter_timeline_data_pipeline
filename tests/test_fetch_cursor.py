@@ -1,13 +1,17 @@
 """The backfill cursor: capped, failed and overlapping runs skip no Tweets."""
 
+import itertools
 import logging
 import math
+from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import httpx
 import pytest
 from conftest import Aws
 from fake_timeline import (
+    EMPTY_OK,
     ERRORS_ONLY,
     RATE_LIMITED,
     FakeTimeline,
@@ -32,6 +36,15 @@ from twitter_timeline_data_pipeline.storage import (
 )
 from twitter_timeline_data_pipeline.x_api import XApiError
 
+EPOCH = datetime(2026, 1, 1, tzinfo=UTC)
+_ticks = itertools.count()
+
+
+def _daily_clock() -> datetime:
+    """Default test clock: every call is a day after the last, so empty gaps can age
+    out however few runs a test makes."""
+    return EPOCH + timedelta(days=next(_ticks))
+
 
 def run(
     aws: Aws,
@@ -53,7 +66,7 @@ def run(
             max_results=max_results,
             max_pages=max_pages,
             sleep=lambda _s: None,
-            **kwargs,
+            **{"now": _daily_clock, **kwargs},
         )
 
 
@@ -155,22 +168,92 @@ def test_requests_count_against_the_budget_even_when_they_come_back_empty(
     assert len(timeline.timeline_calls) == 2
 
 
-def test_a_gap_beyond_the_apis_window_is_dropped_after_three_empty_runs(
+def at(hours: float) -> Callable[[], datetime]:
+    return lambda: EPOCH + timedelta(hours=hours)
+
+
+def iso(hours: float) -> str:
+    return (EPOCH + timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def test_a_gap_beyond_the_apis_window_is_dropped_after_three_runs_over_a_day(
     aws: Aws, caplog: pytest.LogCaptureFixture
 ) -> None:
     timeline = FakeTimeline(100, window=50)
     seed(aws, 100, Gap(until_id="30", since_id="5"))
 
     with caplog.at_level(logging.INFO, logger=fetch.logger.name):
-        results = [run(aws, timeline, FakeSqs()) for _ in range(3)]
+        results = [run(aws, timeline, FakeSqs(), now=at(h)) for h in (0, 1, 2)]
+        assert state(aws).gaps == (Gap("30", "5", 3, iso(0)),)  # too young to drop
+        results.append(run(aws, timeline, FakeSqs(), now=at(24)))
 
-    assert [r.gaps_open for r in results] == [1, 1, 0]
-    assert [r.stopped_reason for r in results] == ["gaps_pending", "gaps_pending", None]
+    assert [r.gaps_open for r in results] == [1, 1, 1, 0]
     warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert [r.getMessage() for r in warnings] == [
-        f"gap for {USERNAME} (since_id=5, until_id=30) came back empty 3 runs in a "
-        "row; the range is out of the API's reach, dropping it"
+        f"dropping gap for {USERNAME} (since_id=5, until_id=30): out of the API's "
+        f"reach (empty 4 runs since {iso(0)})"
     ]
+    assert state(aws).gaps == ()
+
+
+def test_many_empty_runs_in_less_than_a_day_never_drop_the_gap(aws: Aws) -> None:
+    timeline = FakeTimeline(100, window=50)
+    seed(aws, 100, Gap(until_id="30", since_id="5"))
+
+    for i in range(30):
+        run(aws, timeline, FakeSqs(), now=at(i * 0.75))  # 0 .. 21.75 hours
+
+    assert state(aws).gaps == (Gap("30", "5", 30, iso(0)),)
+
+
+def test_a_short_api_incident_does_not_drop_a_gap_that_still_has_data(
+    aws: Aws,
+) -> None:
+    timeline = FakeTimeline(100)
+    seed(aws, 100, Gap(until_id="60", since_id="40"))
+    timeline.inject = lambda n, _r: EMPTY_OK if n >= 1 else None
+    for h in (0, 1, 2, 3):
+        run(aws, timeline, FakeSqs(), now=at(h))
+    assert state(aws).gaps == (Gap("60", "40", 4, iso(0)),)
+
+    timeline.inject = None
+    sqs = FakeSqs()
+    run_until_done(aws, timeline, sqs, now=at(4))
+    assert sorted(sent_ids(sqs)) == list(range(41, 60))
+
+
+def test_data_returning_resets_both_empty_fields(aws: Aws) -> None:
+    timeline = FakeTimeline(100)
+    seed(aws, 100, Gap(until_id="60", since_id="40"))
+    timeline.inject = lambda n, _r: EMPTY_OK if n >= 1 else None
+    run(aws, timeline, FakeSqs(), now=at(0))
+    run(aws, timeline, FakeSqs(), now=at(1))
+    assert state(aws).gaps == (Gap("60", "40", 2, iso(0)),)
+
+    timeline.inject = None
+    run(aws, timeline, FakeSqs(), max_results=5, max_pages=2, now=at(2))
+
+    assert state(aws).gaps == (Gap("55", "40"),)
+    assert state(aws).gaps[0].first_empty_at is None
+
+
+def test_a_legacy_gap_without_a_timestamp_gets_one_and_is_dropped_a_day_later(
+    aws: Aws,
+) -> None:
+    timeline = FakeTimeline(100, window=50)
+    aws.state_table.put_item(
+        Item={
+            "username": USERNAME,
+            "newest_id": 100,
+            "version": 1,
+            "gaps": [{"until_id": 30, "since_id": 5, "empty_runs": 5}],
+        }
+    )
+    assert state(aws).gaps == (Gap("30", "5", 5),)
+
+    run(aws, timeline, FakeSqs(), now=at(0))
+    assert state(aws).gaps == (Gap("30", "5", 6, iso(0)),)  # stamped, not dropped
+    run(aws, timeline, FakeSqs(), now=at(24))
     assert state(aws).gaps == ()
 
 
