@@ -17,13 +17,14 @@ fi
 
 overrides=()
 if [[ -n "${TWITTER_USERNAME:-}" ]]; then
-  overrides+=("TwitterUsername=${TWITTER_USERNAME}")
+  # Inner quotes keep SAM from splitting values that contain spaces.
+  overrides+=("TwitterUsername=\"${TWITTER_USERNAME}\"")
 fi
 if [[ -n "${SCHEDULE_EXPRESSION:-}" ]]; then
-  overrides+=("ScheduleExpression=${SCHEDULE_EXPRESSION}")
+  overrides+=("ScheduleExpression=\"${SCHEDULE_EXPRESSION}\"")
 fi
 
-args=(--resolve-s3)
+args=()
 if ((${#overrides[@]})); then
   args+=(--parameter-overrides "${overrides[@]}")
 fi

@@ -4,15 +4,16 @@ import argparse
 import json
 import logging
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import asdict
-from importlib.metadata import PackageNotFoundError, version
 
+from twitter_timeline_data_pipeline import __version__
 from twitter_timeline_data_pipeline.config import ConfigError, Settings
 from twitter_timeline_data_pipeline.credentials import (
     CredentialsError,
     get_bearer_token,
 )
+from twitter_timeline_data_pipeline.handlers import quiet_library_loggers
 from twitter_timeline_data_pipeline.handlers.fetch import (
     EnqueueError,
     checkpoint_store,
@@ -28,11 +29,20 @@ EXIT_FAILURE = 1  # the pipeline ran and something upstream failed
 EXIT_USAGE = 2
 
 
-def _package_version() -> str:
-    try:
-        return version("twitter_timeline_data_pipeline")
-    except PackageNotFoundError:
-        return "unknown"
+def _int_in_range(name: str, low: int, high: int | None = None) -> Callable[[str], int]:
+    """An argparse ``type`` accepting integers in ``low`` to ``high``."""
+
+    def parse(text: str) -> int:
+        try:
+            value = int(text)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"{name} must be an integer") from None
+        if value < low or (high is not None and value > high):
+            bound = f">= {low}" if high is None else f"{low}..{high}"
+            raise argparse.ArgumentTypeError(f"{name} must be {bound}, got {value}")
+        return value
+
+    return parse
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -40,7 +50,7 @@ def _build_parser() -> argparse.ArgumentParser:
         prog="twitter-pipeline", description="X (Twitter) timeline data pipeline."
     )
     parser.add_argument(
-        "--version", action="version", version=f"%(prog)s {_package_version()}"
+        "--version", action="version", version=f"%(prog)s {__version__}"
     )
     commands = parser.add_subparsers(dest="command", required=True)
 
@@ -49,11 +59,13 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     fetch.add_argument("--username", required=True, help="account to fetch")
     fetch.add_argument(
-        "--max-pages", type=int, help="page cap (default MAX_PAGES or 5)"
+        "--max-pages",
+        type=_int_in_range("--max-pages", 1),
+        help="page cap, >= 1 (default MAX_PAGES or 5)",
     )
     fetch.add_argument(
         "--max-results",
-        type=int,
+        type=_int_in_range("--max-results", 5, 100),
         help="Tweets per page, 5..100 (default MAX_RESULTS or 100)",
     )
     fetch.add_argument("--since-id", help="only Tweets newer than this ID")
@@ -76,10 +88,6 @@ def _fetch(args: argparse.Namespace) -> int:
     settings = Settings.from_env()
     max_pages = args.max_pages or settings.max_pages
     max_results = args.max_results or settings.max_results
-    if max_pages < 1:
-        raise ValueError("--max-pages must be >= 1")
-    if not 5 <= max_results <= 100:
-        raise ValueError("--max-results must be 5..100")
     if not args.dry_run:
         settings.require("queue_url", "state_table")
 
@@ -121,6 +129,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         stream=sys.stderr,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    quiet_library_loggers()  # --log-level DEBUG must not leak secrets either
     try:
         return _fetch(args)
     except (ConfigError, ValueError) as exc:

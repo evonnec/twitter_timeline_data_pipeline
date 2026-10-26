@@ -62,7 +62,7 @@ docstring-code-format = true
 [tool.mypy]
 python_version = "3.14"
 strict = true
-# `mypy .` checks both trees; src/ is the import root for the package.
+# Only src/ is type-checked (it is also the import root for the package).
 mypy_path = "src"
 files = ["src"]
 

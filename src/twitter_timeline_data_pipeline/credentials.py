@@ -77,11 +77,11 @@ def _parse_secret(secret: str | None) -> str:
     token: object = text
     if text.startswith("{"):
         try:
-            data = json.loads(text)
+            data: dict[str, object] = json.loads(
+                text
+            )  # "{..." parses to a dict or fails
         except ValueError:
             raise CredentialsError("secret looks like JSON but is invalid") from None
-        if not isinstance(data, dict):
-            raise CredentialsError("secret JSON is not an object")
         token = data.get("bearer_token") or data.get("twitter_access_token")
     if not isinstance(token, str) or not token.strip():
         raise CredentialsError("secret holds no bearer token")

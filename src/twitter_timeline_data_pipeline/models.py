@@ -10,7 +10,7 @@ import logging
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
-from typing import Any, Literal, Self
+from typing import Any, Self
 
 logger = logging.getLogger(__name__)
 
@@ -19,10 +19,6 @@ SCHEMA_VERSION = 1
 type TweetId = str
 type MediaKey = str
 type JSONObject = dict[str, Any]
-
-# Media types the X API documents; `Media.type` stays a plain str so an unknown
-# future type is carried through instead of failing the whole page.
-type MediaType = Literal["photo", "video", "animated_gif"]
 
 
 class MessageError(ValueError):
@@ -76,6 +72,7 @@ class Media:
     """
 
     media_key: MediaKey
+    # A plain str so an unknown future media type is carried through, not rejected.
     type: str
     url: str | None = None
     preview_image_url: str | None = None
@@ -192,7 +189,9 @@ class TweetMessage:
         return asdict(self)
 
     def to_json(self) -> str:
-        return json.dumps(self.to_dict(), separators=(",", ":"), ensure_ascii=False)
+        # ASCII-escaped on purpose: lone surrogates and U+FFFE/U+FFFF in a Tweet's text
+        # would otherwise fail to encode or be rejected by SQS.
+        return json.dumps(self.to_dict(), separators=(",", ":"))
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> Self:
@@ -219,7 +218,7 @@ class TweetMessage:
             return cls.from_dict(data)
         except MessageError:
             raise
-        except (ValueError, KeyError, TypeError) as exc:
+        except (ValueError, KeyError, TypeError, AttributeError) as exc:
             raise MessageError(f"malformed message: {exc!r}") from exc
 
 

@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any
 import boto3
 import httpx
 
-from twitter_timeline_data_pipeline import __version__
+from twitter_timeline_data_pipeline import USER_AGENT
 from twitter_timeline_data_pipeline.config import Settings
 from twitter_timeline_data_pipeline.models import MessageError, TweetMessage
 from twitter_timeline_data_pipeline.storage import (
@@ -26,8 +26,6 @@ if TYPE_CHECKING:
     from mypy_boto3_s3 import S3Client
 
 logger = logging.getLogger(__name__)
-
-USER_AGENT = f"twitter-timeline-data-pipeline/{__version__}"
 
 
 def process_records(
@@ -75,7 +73,6 @@ def _s3_client() -> S3Client:
 def _http_client(timeout: float) -> httpx.Client:
     return httpx.Client(
         timeout=timeout,
-        follow_redirects=True,
         headers={"User-Agent": USER_AGENT},
     )
 

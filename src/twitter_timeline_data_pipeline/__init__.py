@@ -7,4 +7,6 @@ try:
 except PackageNotFoundError:  # running from a source tree without an install
     __version__ = "0.0.0"
 
-__all__ = ["__version__"]
+USER_AGENT = f"twitter-timeline-data-pipeline/{__version__}"
+
+__all__ = ["USER_AGENT", "__version__"]
