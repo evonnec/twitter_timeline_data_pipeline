@@ -18,6 +18,7 @@ from helpers import (
 )
 
 from twitter_timeline_data_pipeline.models import (
+    MAX_STORED_INT,
     SCHEMA_VERSION,
     Media,
     MediaRetry,
@@ -782,3 +783,26 @@ def test_media_retry_rejects_a_media_without_a_key() -> None:
 
     with pytest.raises(MessageError, match="malformed message"):
         MediaRetry.from_json(json.dumps(data))
+
+
+def test_integers_are_clamped_to_what_dynamodb_can_store() -> None:
+    huge = 10**45
+    media = Media.from_dict(
+        {
+            "media_key": "m",
+            "type": "photo",
+            "width": huge,
+            "height": -huge,
+            "duration_ms": huge,
+            "variants": [{"content_type": "video/mp4", "url": "u", "bit_rate": huge}],
+        }
+    )
+    tweet = Tweet.from_dict({"id": "1", "text": "t", "public_metrics": {"likes": huge}})
+
+    assert (media.width, media.height, media.duration_ms) == (
+        MAX_STORED_INT,
+        -MAX_STORED_INT,
+        MAX_STORED_INT,
+    )
+    assert media.variants[0].bit_rate == MAX_STORED_INT
+    assert tweet.public_metrics["likes"] == MAX_STORED_INT

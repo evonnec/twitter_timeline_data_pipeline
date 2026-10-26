@@ -30,7 +30,12 @@ from twitter_timeline_data_pipeline.handlers.process import (
     handler,
     process_records,
 )
-from twitter_timeline_data_pipeline.models import Media, MediaRetry, TweetMessage
+from twitter_timeline_data_pipeline.models import (
+    MAX_STORED_INT,
+    Media,
+    MediaRetry,
+    TweetMessage,
+)
 from twitter_timeline_data_pipeline.storage import (
     MAX_SIZE_ESTIMATE,
     MEDIA_RETRY_DELAY_SECONDS,
@@ -1184,6 +1189,38 @@ def test_s3_client_has_bounded_timeouts_and_retries(aws: Aws) -> None:
     assert (config.connect_timeout, config.read_timeout) == (5, 10)
     assert config.retries["mode"] == "standard"
     assert config.retries["total_max_attempts"] == 4  # max_attempts=3 retries
+
+
+def test_sqs_and_dynamodb_clients_have_short_bounded_timeouts(aws: Aws) -> None:
+    sqs: Any = process._sqs_client().meta.config
+    ddb: Any = process._tweet_store("t", "b")._table.meta.client.meta.config
+
+    for config in (sqs, ddb):
+        assert (config.connect_timeout, config.read_timeout) == (3, 5)
+        assert config.retries["mode"] == "standard"
+        assert config.retries["total_max_attempts"] == 4
+
+
+def test_enormous_numbers_in_a_message_are_capped_and_the_tweet_is_stored(
+    aws: Aws, cdn: CdnStub
+) -> None:
+    huge = "9" * 45
+    data = photo_message(GOOD).to_dict()
+    data["tweet"]["public_metrics"] = {"like_count": "__H__"}
+    data["media"][0]["width"] = "__H__"
+    data["media"][0]["duration_ms"] = "__H__"
+    raw = json.dumps(data).replace('"__H__"', huge)
+
+    failed = process_records(
+        [sqs_record("m1", raw)],
+        media_store=MediaStore(aws.s3, aws.bucket, cdn.client()),
+        tweet_store=TweetStore(aws.tweets_table, aws.s3, aws.bucket),
+    )
+
+    assert failed == []
+    item = ddb_get(aws.tweets_table, tweet_id=GOOD)
+    assert item["public_metrics"]["like_count"] == MAX_STORED_INT
+    assert item["media"][0]["status"] == "stored"
 
 
 def test_aws_client_factories_are_cached(aws: Aws) -> None:

@@ -223,6 +223,16 @@ def _enqueue_retries(
     return ok
 
 
+def _short_timeouts() -> Config:
+    """For the quick calls (DynamoDB, SQS): a hang must not eat the few seconds a
+    last-receive record has to write its Tweet and queue its retries."""
+    return Config(
+        connect_timeout=3,
+        read_timeout=5,
+        retries={"mode": "standard", "max_attempts": 3},
+    )
+
+
 @functools.cache
 def _s3_client() -> S3Client:
     # Bounded so a hung HeadObject or UploadPart can't eat the invocation.
@@ -238,7 +248,7 @@ def _s3_client() -> S3Client:
 
 @functools.cache
 def _sqs_client() -> SQSClient:
-    return boto3.client("sqs")
+    return boto3.client("sqs", config=_short_timeouts())
 
 
 @functools.cache
@@ -251,9 +261,8 @@ def _http_client(timeout: float) -> httpx.Client:
 
 @functools.cache
 def _tweet_store(table_name: str, bucket: str) -> TweetStore:
-    return TweetStore(
-        boto3.resource("dynamodb").Table(table_name), _s3_client(), bucket
-    )
+    dynamodb = boto3.resource("dynamodb", config=_short_timeouts())
+    return TweetStore(dynamodb.Table(table_name), _s3_client(), bucket)
 
 
 def handler(event: Any, context: Any) -> dict[str, list[dict[str, str]]]:
