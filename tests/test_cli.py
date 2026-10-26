@@ -4,6 +4,7 @@ from typing import Any
 
 import httpx
 import pytest
+from botocore.exceptions import ClientError, EndpointConnectionError
 from conftest import Aws
 from helpers import (
     USER_ID,
@@ -20,6 +21,7 @@ from twitter_timeline_data_pipeline.cli import (
     EXIT_USAGE,
     main,
 )
+from twitter_timeline_data_pipeline.credentials import CredentialsError
 from twitter_timeline_data_pipeline.handlers import fetch
 from twitter_timeline_data_pipeline.models import TweetMessage
 from twitter_timeline_data_pipeline.storage import CheckpointStore
@@ -281,11 +283,80 @@ def test_rejected_token_exits_one(
     assert "test-bearer-token-not-real" not in err
 
 
-def test_no_token_configured_exits_one(capsys: pytest.CaptureFixture[str]) -> None:
+def test_no_token_configured_exits_two(capsys: pytest.CaptureFixture[str]) -> None:
+    code = main([*FETCH, "--dry-run"])
+
+    assert code == EXIT_USAGE
+    assert "BEARER_TOKEN_SECRET_ARN or TWITTER_BEARER_TOKEN" in capsys.readouterr().err
+
+
+def test_unreadable_secret_exits_one(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("BEARER_TOKEN_SECRET_ARN", "arn:aws:secretsmanager:x")
+    monkeypatch.setattr(
+        cli,
+        "get_bearer_token",
+        lambda _s: (_ for _ in ()).throw(CredentialsError("could not read secret")),
+    )
+
     code = main([*FETCH, "--dry-run"])
 
     assert code == EXIT_FAILURE
-    assert "BEARER_TOKEN_SECRET_ARN or TWITTER_BEARER_TOKEN" in capsys.readouterr().err
+    assert "could not read secret" in capsys.readouterr().err
+
+
+def test_malformed_upstream_data_exits_one(
+    monkeypatch: pytest.MonkeyPatch,
+    token: None,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    stub = XApiStub()
+
+    def bad_counts(request: httpx.Request) -> httpx.Response:
+        response = stub(request)
+        if request.url.path.endswith("/tweets"):
+            body = response.json()
+            body["data"][0]["public_metrics"]["like_count"] = "n/a"
+            return httpx.Response(200, json=body)
+        return response
+
+    install_x_api(monkeypatch, cli, bad_counts)
+
+    code = main([*FETCH, "--dry-run"])
+
+    assert code == EXIT_FAILURE
+    assert "n/a" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        ClientError(
+            {"Error": {"Code": "AccessDenied", "Message": "no"}}, "SendMessage"
+        ),
+        EndpointConnectionError(endpoint_url="https://sqs.invalid"),
+    ],
+)
+def test_aws_errors_exit_one_without_a_traceback(
+    pipeline_env: Aws,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    error: Exception,
+) -> None:
+    install_x_api(monkeypatch, cli, XApiStub())
+
+    def boom(*_a: Any, **_k: Any) -> Any:
+        raise error
+
+    monkeypatch.setattr(cli, "checkpoint_store", boom)
+
+    code = main(FETCH)
+
+    err = capsys.readouterr().err
+    assert code == EXIT_FAILURE
+    assert err.startswith("error: ")
+    assert "Traceback" not in err
 
 
 def test_enqueue_failure_exits_one_and_leaves_checkpoint(

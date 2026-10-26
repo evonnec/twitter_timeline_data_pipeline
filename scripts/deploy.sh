@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Build the Lambda bundle and deploy the stack with SAM (settings in samconfig.toml).
-# Usage: [TWITTER_USERNAME=NASA] [SCHEDULE_EXPRESSION='rate(1 hour)'] scripts/deploy.sh [extra sam deploy args]
+# Usage: [TWITTER_USERNAME=NASA] [SCHEDULE_EXPRESSION='rate(1 hour)']
+#   [SCHEDULE_ENABLED=true|false] scripts/deploy.sh [extra sam deploy args]
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -22,6 +23,9 @@ if [[ -n "${TWITTER_USERNAME:-}" ]]; then
 fi
 if [[ -n "${SCHEDULE_EXPRESSION:-}" ]]; then
   overrides+=("ScheduleExpression=\"${SCHEDULE_EXPRESSION}\"")
+fi
+if [[ -n "${SCHEDULE_ENABLED:-}" ]]; then
+  overrides+=("ScheduleEnabled=\"${SCHEDULE_ENABLED}\"")
 fi
 
 args=()

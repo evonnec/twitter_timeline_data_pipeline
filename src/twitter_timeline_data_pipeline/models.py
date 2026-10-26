@@ -10,7 +10,7 @@ import logging
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
-from typing import Any, Self
+from typing import Any, NoReturn, Self
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +43,10 @@ def normalize_username(username: str) -> str:
     """The form used everywhere: no leading ``@``, lower case (X handles are
     case-insensitive), so one account always maps to one checkpoint and GSI key."""
     return username.removeprefix("@").lower()
+
+
+def _reject_constant(name: str) -> NoReturn:
+    raise ValueError(f"non-finite JSON constant {name}")
 
 
 def _opt_int(value: Any) -> int | None:
@@ -218,13 +222,20 @@ class TweetMessage:
     def from_json(cls, body: str) -> Self:
         """Parse an SQS body. Raises ``MessageError`` for anything malformed."""
         try:
-            data = json.loads(body)
+            data = json.loads(body, parse_constant=_reject_constant)
             if not isinstance(data, dict):
                 raise MessageError(f"expected a JSON object, got {type(data).__name__}")
             return cls.from_dict(data)
         except MessageError:
             raise
-        except (ValueError, KeyError, TypeError, AttributeError) as exc:
+        except (
+            ValueError,
+            KeyError,
+            TypeError,
+            AttributeError,
+            OverflowError,
+            RecursionError,
+        ) as exc:
             raise MessageError(f"malformed message: {exc!r}") from exc
 
 

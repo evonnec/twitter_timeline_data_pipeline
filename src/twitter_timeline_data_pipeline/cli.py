@@ -7,10 +7,13 @@ import sys
 from collections.abc import Callable, Sequence
 from dataclasses import asdict
 
+from botocore.exceptions import BotoCoreError, ClientError
+
 from twitter_timeline_data_pipeline import __version__
 from twitter_timeline_data_pipeline.config import ConfigError, Settings
 from twitter_timeline_data_pipeline.credentials import (
     CredentialsError,
+    CredentialsNotConfigured,
     get_bearer_token,
 )
 from twitter_timeline_data_pipeline.handlers import quiet_library_loggers
@@ -21,13 +24,17 @@ from twitter_timeline_data_pipeline.handlers.fetch import (
     sqs_client,
 )
 from twitter_timeline_data_pipeline.models import normalize_username
-from twitter_timeline_data_pipeline.x_api import XApiError, XClient
+from twitter_timeline_data_pipeline.x_api import (
+    InvalidUsernameError,
+    XApiError,
+    XClient,
+)
 
 logger = logging.getLogger(__name__)
 
 EXIT_OK = 0
-EXIT_FAILURE = 1  # the pipeline ran and something upstream failed
-EXIT_USAGE = 2
+EXIT_FAILURE = 1  # the pipeline ran and something upstream or at runtime failed
+EXIT_USAGE = 2  # bad arguments or configuration (including no token configured)
 
 
 def _int_in_range(name: str, low: int, high: int | None = None) -> Callable[[str], int]:
@@ -48,7 +55,11 @@ def _int_in_range(name: str, low: int, high: int | None = None) -> Callable[[str
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="twitter-pipeline", description="X (Twitter) timeline data pipeline."
+        prog="twitter-pipeline",
+        description="X (Twitter) timeline data pipeline.",
+        epilog="exit codes: 0 success; 1 upstream or runtime failure (X API, "
+        "malformed API data, AWS, unreadable secret); 2 bad arguments or "
+        "configuration (including no bearer token configured)",
     )
     parser.add_argument(
         "--version", action="version", version=f"%(prog)s {__version__}"
@@ -134,10 +145,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     quiet_library_loggers()  # --log-level DEBUG must not leak secrets either
     try:
         return _fetch(args)
-    except (ConfigError, ValueError) as exc:
+    except (ConfigError, CredentialsNotConfigured, InvalidUsernameError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return EXIT_USAGE
-    except (XApiError, CredentialsError, EnqueueError) as exc:
+    except (
+        XApiError,
+        CredentialsError,
+        EnqueueError,
+        ClientError,
+        BotoCoreError,
+        ValueError,  # malformed upstream data; bad arguments were rejected above
+    ) as exc:
         logger.debug("fetch failed", exc_info=True)
         print(f"error: {exc}", file=sys.stderr)
         return EXIT_FAILURE

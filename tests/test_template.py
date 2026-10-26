@@ -104,14 +104,55 @@ def test_handler_path_resolves_to_a_callable(
     assert list(inspect.signature(target).parameters) == ["event", "context"]
 
 
-def test_queue_visibility_timeout_is_at_least_six_times_process_timeout(
+def test_queue_visibility_timeout_is_six_times_process_timeout_plus_batch_window(
     template: Template,
 ) -> None:
     process_timeout = properties(template, "ProcessFunction")["Timeout"]
+    window = sqs_event(template)["MaximumBatchingWindowInSeconds"]
 
     visibility = properties(template, "TweetsQueue")["VisibilityTimeout"]
 
-    assert visibility >= 6 * process_timeout
+    assert visibility >= 6 * process_timeout + window
+
+
+def test_dead_letter_queue_accepts_redrives_only_from_the_tweets_queue(
+    template: Template,
+) -> None:
+    allow = properties(template, "TweetsDeadLetterQueue")["RedriveAllowPolicy"]
+    queue_name = properties(template, "TweetsQueue")["QueueName"]
+
+    assert allow["redrivePermission"] == "byQueue"
+    (arn,) = allow["sourceQueueArns"]
+    assert arn["Fn::Sub"].endswith(":" + queue_name["Fn::Sub"])
+
+
+def test_media_bucket_is_versioned_and_expires_old_versions(
+    template: Template,
+) -> None:
+    bucket = properties(template, "MediaBucket")
+    rules = {r["Id"]: r for r in bucket["LifecycleConfiguration"]["Rules"]}
+
+    assert bucket["VersioningConfiguration"]["Status"] == "Enabled"
+    expire = rules["expire-noncurrent-versions"]
+    assert expire["Status"] == "Enabled"
+    assert expire["NoncurrentVersionExpiration"]["NoncurrentDays"] >= 1
+
+
+def test_media_moves_to_intelligent_tiering(template: Template) -> None:
+    rules = properties(template, "MediaBucket")["LifecycleConfiguration"]["Rules"]
+    (rule,) = (r for r in rules if r["Id"] == "tier-media")
+
+    assert rule["Prefix"] == "media/"
+    assert {t["StorageClass"] for t in rule["Transitions"]} == {"INTELLIGENT_TIERING"}
+
+
+def test_username_index_projects_only_listing_attributes(template: Template) -> None:
+    (index,) = properties(template, "TweetsTable")["GlobalSecondaryIndexes"]
+
+    assert index["Projection"] == {
+        "ProjectionType": "INCLUDE",
+        "NonKeyAttributes": ["text", "media_count", "public_metrics"],
+    }
 
 
 def test_queue_redrives_to_the_dead_letter_queue(template: Template) -> None:

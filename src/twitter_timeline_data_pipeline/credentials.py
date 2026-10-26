@@ -19,7 +19,11 @@ _cache: dict[str, tuple[str, float]] = {}
 
 
 class CredentialsError(RuntimeError):
-    """No token is configured, or the secret is empty or unreadable."""
+    """The secret is empty or unreadable."""
+
+
+class CredentialsNotConfigured(CredentialsError):
+    """Neither a token nor a secret ID is configured: a configuration problem."""
 
 
 def get_bearer_token(
@@ -37,7 +41,7 @@ def get_bearer_token(
         return settings.bearer_token
     secret_id = settings.bearer_token_secret_id
     if not secret_id:
-        raise CredentialsError(
+        raise CredentialsNotConfigured(
             f"set {ENV_VARS['bearer_token_secret_id']} or {ENV_VARS['bearer_token']}"
         )
 
