@@ -24,9 +24,12 @@ from twitter_timeline_data_pipeline.config import DEFAULT_X_API_BASE_URL
 from twitter_timeline_data_pipeline.models import (
     JSONObject,
     Media,
+    QuarantinedItem,
     RawPage,
+    ReferencedPost,
     TimelinePage,
     Tweet,
+    valid_tweet_id,
 )
 
 logger = logging.getLogger(__name__)
@@ -46,7 +49,22 @@ TWEET_FIELDS = (
     "public_metrics",
     "referenced_tweets",
 )
+# Requested with ``request_entities`` (the default): expanded URLs, mentions, hashtags
+# and the other per-Tweet metadata.
+ENTITY_FIELDS = (
+    "edit_controls",
+    "entities",
+    "in_reply_to_user_id",
+    "possibly_sensitive",
+    "withheld",
+)
 EXPANSIONS = ("attachments.media_keys",)
+# Requested with ``expand_referenced`` (the default): the posts a Tweet retweets,
+# quotes or replies to, and their authors. The media of those posts is not requested:
+# ``referenced_tweets.id.attachments.media_keys`` is not in the endpoint's current
+# list of expansions.
+REFERENCE_EXPANSIONS = ("referenced_tweets.id", "referenced_tweets.id.author_id")
+USER_FIELDS = ("name", "username")
 MEDIA_FIELDS = (
     "alt_text",
     "duration_ms",
@@ -127,7 +145,14 @@ class AuthError(XApiError):
 
 
 class NotFoundError(XApiError):
-    """The username doesn't exist, or the account is suspended or protected."""
+    """The username or user ID doesn't exist, or the account is suspended (typed
+    ``resource-not-found`` for a ``user``). A protected account raises ``AccessError``
+    instead."""
+
+
+class AccessError(XApiError):
+    """The timeline answered 200 with only an ``errors`` array saying the account may
+    not be read (e.g. it went protected). ``not-authorized-for-resource``."""
 
 
 class RateLimitError(XApiError):
@@ -136,6 +161,29 @@ class RateLimitError(XApiError):
     def __init__(self, message: str, *, reset_at: float | None = None) -> None:
         super().__init__(message, status_code=429)
         self.reset_at = reset_at
+
+
+PARTIAL_ERRORS_MESSAGE = "timeline page %d has %d partial error(s); first: %s"
+"""Stable, greppable text of the WARNING logged for ``errors`` alongside data."""
+
+UNPARSEABLE_MESSAGE = "unparseable %s quarantined: id=%s error=%s"
+"""Stable, greppable text of the ERROR logged per item that failed to parse."""
+
+_PROBLEM_ERRORS: dict[str, type[XApiError]] = {
+    "not-authorized-for-resource": AccessError,
+    "resource-not-found": NotFoundError,
+}
+
+
+def _quarantine(kind: str, item: Any, exc: Exception) -> QuarantinedItem:
+    tweet_id = None
+    if kind == "tweet" and isinstance(item, Mapping):  # an included one is not a Tweet
+        raw_id = item.get("id")
+        if valid_tweet_id(raw_id):
+            tweet_id = raw_id
+    error = f"{type(exc).__name__}: {exc}"
+    logger.error(UNPARSEABLE_MESSAGE, kind, tweet_id or "unknown", error)
+    return QuarantinedItem(kind=kind, item=item, error=error, tweet_id=tweet_id)
 
 
 def parse_timeline_page(
@@ -150,17 +198,90 @@ def parse_timeline_page(
     meta: Mapping[str, Any] = body.get("meta") or {}
     data = body.get("data")
     next_token = meta.get("next_token")
+    requested = _requested(raw)
     if not data:
-        return TimelinePage(tweets=(), media={}, next_token=next_token, raw=raw)
-    media = (Media.from_dict(m) for m in (body.get("includes") or {}).get("media", ()))
+        return TimelinePage(
+            tweets=(), media={}, next_token=next_token, raw=raw, requested=requested
+        )
+    includes: Mapping[str, Any] = body.get("includes") or {}
+    media_objects = includes.get("media") or []
+    if not isinstance(data, list) or not isinstance(media_objects, list):
+        # No item boundary to quarantine at: fail the page (the cursor keeps it).
+        raise ValueError("response has a non-list data or includes.media")
+    quarantined: list[QuarantinedItem] = []
+    media: dict[str, Media] = {}
+    for entry in media_objects:
+        try:
+            item = Media.from_dict(entry)
+        except Exception as exc:  # any shape problem: quarantine, never lose the page
+            quarantined.append(_quarantine("media", entry, exc))
+        else:
+            media[item.media_key] = item
+    included = _parse_includes(includes, quarantined)
+    tweets: list[Tweet] = []
+    for entry in data:
+        try:
+            tweets.append(Tweet.from_api(entry))
+        except Exception as exc:  # see above
+            quarantined.append(_quarantine("tweet", entry, exc))
     return TimelinePage(
-        tweets=tuple(Tweet.from_api(t) for t in data),
-        media={m.media_key: m for m in media},
+        tweets=tuple(tweets),
+        media=media,
         newest_id=meta.get("newest_id"),
         oldest_id=meta.get("oldest_id"),
         next_token=next_token,
         raw=raw,
+        quarantined=tuple(quarantined),
+        included=included,
+        requested=requested,
     )
+
+
+def _requested(raw: RawPage | None) -> dict[str, bool]:
+    """What the request behind ``raw`` asked for (nothing when there is no request)."""
+    params = raw.params if raw is not None else {}
+    return {
+        "entities": "entities" in str(params.get("tweet.fields", "")).split(","),
+        "expansions": "referenced_tweets.id"
+        in str(params.get("expansions", "")).split(","),
+    }
+
+
+def _parse_includes(
+    includes: Mapping[str, Any], quarantined: list[QuarantinedItem]
+) -> dict[str, ReferencedPost]:
+    """The referenced posts of ``includes`` by ID, authors resolved from
+    ``includes.users``. An entry that fails to parse is quarantined (as
+    ``included_tweet`` / ``included_user``, never counted by the cursor) and, for a
+    post whose ID is readable, stands in as a reference with nothing known (no
+    status): a post that could not be read is not one the API said is gone, so a
+    stored copy of it is kept."""
+
+    def entries(*names: str) -> list[Any]:
+        for name in names:
+            value = includes.get(name)
+            if value:
+                return value if isinstance(value, list) else [value]
+        return []
+
+    usernames: dict[str, str] = {}
+    for entry in entries("users"):
+        try:
+            usernames[str(entry["id"])] = str(entry["username"])
+        except Exception as exc:  # any shape problem: quarantine, keep the page
+            quarantined.append(_quarantine("included_user", entry, exc))
+    posts: dict[str, ReferencedPost] = {}
+    # X is renaming tweets to posts (``includes.posts``), like ``note_post``.
+    for entry in entries("tweets", "posts"):
+        try:
+            post = ReferencedPost.from_api(entry, usernames)
+        except Exception as exc:
+            quarantined.append(_quarantine("included_tweet", entry, exc))
+            if isinstance(entry, Mapping) and valid_tweet_id(entry.get("id")):
+                posts[entry["id"]] = ReferencedPost(id=entry["id"])
+        else:
+            posts[post.id] = post
+    return posts
 
 
 class XClient:
@@ -179,6 +300,8 @@ class XClient:
         timeout: float = 10.0,
         max_retries: int = 3,
         max_rate_limit_wait: float = 60.0,
+        expand_referenced: bool = True,
+        request_entities: bool = True,
         http_client: httpx.Client | None = None,
         sleep: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.time,
@@ -188,6 +311,8 @@ class XClient:
         self._auth_header = {"Authorization": f"Bearer {bearer_token}"}
         self._max_retries = max_retries
         self._max_rate_limit_wait = max_rate_limit_wait
+        self._expand_referenced = expand_referenced
+        self._request_entities = request_entities
         self._sleep = sleep
         self._clock = clock
         self._owns_client = http_client is None
@@ -289,7 +414,8 @@ class XClient:
         Tweets older than it (both bounds are exclusive). A clean empty response (no
         data, no ``next_token``) ends the walk without yielding; an empty one that has a
         ``next_token`` is yielded as an empty page; one with ``errors`` and no data
-        raises ``XApiError``.
+        raises ``XApiError`` (``AccessError`` for ``not-authorized-for-resource``,
+        ``NotFoundError`` for ``resource-not-found``).
         """
         if not 5 <= max_results <= 100:
             raise ValueError(f"max_results must be 5..100, got {max_results}")
@@ -305,12 +431,20 @@ class XClient:
         max_results: int,
         max_pages: int,
     ) -> Iterator[TimelinePage]:
+        tweet_fields: tuple[str, ...] = TWEET_FIELDS
+        if self._request_entities:
+            tweet_fields = tuple(sorted({*tweet_fields, *ENTITY_FIELDS}))
+        expansions: tuple[str, ...] = EXPANSIONS
+        if self._expand_referenced:
+            expansions += REFERENCE_EXPANSIONS
         params: dict[str, str | int] = {
             "max_results": max_results,
-            "tweet.fields": ",".join(TWEET_FIELDS),
-            "expansions": ",".join(EXPANSIONS),
+            "tweet.fields": ",".join(tweet_fields),
+            "expansions": ",".join(expansions),
             "media.fields": ",".join(MEDIA_FIELDS),
         }
+        if self._expand_referenced:
+            params["user.fields"] = ",".join(USER_FIELDS)
         if since_id:
             params["since_id"] = since_id
         if until_id:
@@ -322,13 +456,13 @@ class XClient:
                 if not body.get("data"):
                     # e.g. a protected account: 200 with only an Authorization Error.
                     # Treating that as "no more Tweets" would drop unfetched ranges.
-                    raise XApiError(
+                    raise _problem_error(
                         f"timeline page {page_number} has errors and no data: "
                         f"{_first_error_text(body) or 'no detail'}",
-                        status_code=200,
+                        errors,
                     )
                 logger.warning(
-                    "timeline page %d has %d partial error(s); first: %s",
+                    PARTIAL_ERRORS_MESSAGE,
                     page_number,
                     len(errors),
                     _first_error_text(body) or "no detail",
@@ -337,12 +471,16 @@ class XClient:
             try:
                 page = parse_timeline_page(body, raw=raw)
             except Exception as exc:
+                # Page-level shape errors (a non-list ``data``): the caller lands the
+                # raw page before failing the run.
                 raise PageParseError(
                     f"timeline page {page_number} could not be parsed: {exc!r}",
                     raw=raw,
                 ) from exc
-            if not page.tweets and not page.next_token:
-                return  # a clean empty response ends the walk without a page
+            if not page.tweets and not page.quarantined and not page.next_token:
+                # a clean empty response ends the walk without a page; a page whose
+                # Tweets all failed to parse is not empty, it has items to quarantine
+                return
             # An empty page that still points onward is not the end: yield it (it
             # cost a request) and keep following the token.
             yield page
@@ -432,6 +570,24 @@ def _json_object(response: httpx.Response) -> JSONObject:
     if not isinstance(body, dict):
         raise XApiError("response body is not a JSON object", status_code=200)
     return body
+
+
+def _problem_error(message: str, errors: Any) -> XApiError:
+    """The typed error for an errors-only body: the first entry whose ``type`` URI
+    ends in a known problem name picks the class, any other body is a plain
+    ``XApiError``."""
+    for entry in errors if isinstance(errors, list) else ():
+        if isinstance(entry, Mapping) and isinstance(entry.get("type"), str):
+            cls = _PROBLEM_ERRORS.get(entry["type"].rstrip("/").rsplit("/", 1)[-1])
+            if cls is NotFoundError and (
+                entry.get("resource_type") != "user" or entry.get("parameter") != "id"
+            ):
+                continue  # some other resource (a Tweet, say): not the account
+            if cls is NotFoundError:
+                return cls(f"user not found: {message}", status_code=200)
+            if cls is not None:
+                return cls(message, status_code=200)
+    return XApiError(message, status_code=200)
 
 
 def _first_error_text(body: Mapping[str, Any]) -> str | None:

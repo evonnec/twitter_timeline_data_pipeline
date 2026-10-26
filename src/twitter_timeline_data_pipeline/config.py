@@ -7,6 +7,8 @@ from typing import Self
 
 DEFAULT_X_API_BASE_URL = "https://api.x.com/2"
 DEFAULT_MAX_MEDIA_BYTES = 512 * 1024 * 1024
+DEFAULT_USER_ID_TTL_HOURS = 24.0
+MAX_USER_ID_TTL_HOURS = 8760.0  # one year
 
 # Settings attribute -> environment variable, also used in error messages.
 ENV_VARS: Mapping[str, str] = {
@@ -19,6 +21,7 @@ ENV_VARS: Mapping[str, str] = {
     "media_bucket": "MEDIA_BUCKET",
     "max_results": "MAX_RESULTS",
     "max_pages": "MAX_PAGES",
+    "user_id_ttl_hours": "USER_ID_TTL_HOURS",
     "x_api_base_url": "X_API_BASE_URL",
     "http_timeout": "HTTP_TIMEOUT_SECONDS",
     "max_media_bytes": "MAX_MEDIA_BYTES",
@@ -27,7 +30,12 @@ ENV_VARS: Mapping[str, str] = {
     "retention_days": "RETENTION_DAYS",
     "compliance_max_lookups": "COMPLIANCE_MAX_LOOKUPS",
     "deletion_grace_hours": "DELETION_GRACE_HOURS",
+    "expand_referenced_tweets": "EXPAND_REFERENCED_TWEETS",
+    "request_entities": "REQUEST_ENTITIES",
 }
+
+_TRUE = frozenset({"1", "true", "yes", "on"})
+_FALSE = frozenset({"0", "false", "no", "off"})
 
 
 class ConfigError(RuntimeError):
@@ -51,6 +59,9 @@ class Settings:
     """Tweets per API page; the API allows 5 to 100."""
     max_pages: int = 5
     """Upper bound on pages per fetch run, to stay inside rate limits."""
+    user_id_ttl_hours: float = DEFAULT_USER_ID_TTL_HOURS
+    """How long a stored user ID is trusted before the handle is looked up again.
+    0 looks it up on every run."""
     x_api_base_url: str = DEFAULT_X_API_BASE_URL
     http_timeout: float = 10.0
     max_media_bytes: int = DEFAULT_MAX_MEDIA_BYTES
@@ -69,6 +80,12 @@ class Settings:
     """Most stored Tweet IDs one compliance run checks against the X API."""
     deletion_grace_hours: float = 24.0
     """Hours between tombstoning an unavailable Tweet and removing its content."""
+    expand_referenced_tweets: bool = True
+    """Ask the API for the posts a Tweet retweets, quotes or replies to and their
+    authors. Those posts may be billed as reads under pay-per-use."""
+    request_entities: bool = True
+    """Ask the API for ``entities`` (expanded URLs, mentions, hashtags) and the other
+    per-Tweet metadata fields."""
 
     def __post_init__(self) -> None:
         if not 5 <= self.max_results <= 100:
@@ -78,6 +95,11 @@ class Settings:
         if self.max_pages < 1:
             raise ConfigError(
                 f"{ENV_VARS['max_pages']} must be >= 1, got {self.max_pages}"
+            )
+        if not 0 <= self.user_id_ttl_hours <= MAX_USER_ID_TTL_HOURS:
+            raise ConfigError(
+                f"{ENV_VARS['user_id_ttl_hours']} must be "
+                f"0..{MAX_USER_ID_TTL_HOURS:g}, got {self.user_id_ttl_hours}"
             )
         if self.http_timeout <= 0:
             raise ConfigError(
@@ -131,6 +153,16 @@ class Settings:
                     f"{ENV_VARS[attr]} must be {kind.__name__}, got {raw!r}"
                 ) from None
 
+        def get_flag(attr: str, default: bool) -> bool:
+            raw = get(attr)
+            if raw is None:
+                return default
+            if raw.lower() in _TRUE:
+                return True
+            if raw.lower() in _FALSE:
+                return False
+            raise ConfigError(f"{ENV_VARS[attr]} must be true or false, got {raw!r}")
+
         return cls(
             username=get("username"),
             bearer_token_secret_id=get("bearer_token_secret_id"),
@@ -141,6 +173,9 @@ class Settings:
             media_bucket=get("media_bucket"),
             max_results=get_number("max_results", int, 100),
             max_pages=get_number("max_pages", int, 5),
+            user_id_ttl_hours=get_number(
+                "user_id_ttl_hours", float, DEFAULT_USER_ID_TTL_HOURS
+            ),
             x_api_base_url=get("x_api_base_url") or DEFAULT_X_API_BASE_URL,
             http_timeout=get_number("http_timeout", float, 10.0),
             max_media_bytes=get_number("max_media_bytes", int, DEFAULT_MAX_MEDIA_BYTES),
@@ -153,6 +188,8 @@ class Settings:
             retention_days=get_number("retention_days", int, 0),
             compliance_max_lookups=get_number("compliance_max_lookups", int, 1000),
             deletion_grace_hours=get_number("deletion_grace_hours", float, 24.0),
+            expand_referenced_tweets=get_flag("expand_referenced_tweets", True),
+            request_entities=get_flag("request_entities", True),
         )
 
     def require(self, *attrs: str) -> None:

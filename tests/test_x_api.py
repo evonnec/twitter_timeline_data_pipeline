@@ -17,8 +17,10 @@ from helpers import (
 
 from twitter_timeline_data_pipeline import x_api
 from twitter_timeline_data_pipeline.x_api import (
+    ENTITY_FIELDS,
     EXPANSIONS,
     MEDIA_FIELDS,
+    REFERENCE_EXPANSIONS,
     TWEET_FIELDS,
     AuthError,
     NotFoundError,
@@ -502,9 +504,13 @@ def test_iter_timeline_sends_field_params_and_follows_pagination() -> None:
     assert len(pages) == 2
     assert first.url.path == f"/2/users/{USER_ID}/tweets"
     assert first.url.params["max_results"] == "50"
-    assert first.url.params["tweet.fields"] == ",".join(TWEET_FIELDS)
+    assert first.url.params["tweet.fields"] == ",".join(
+        sorted({*TWEET_FIELDS, *ENTITY_FIELDS})
+    )
     assert "note_tweet" in first.url.params["tweet.fields"].split(",")
-    assert first.url.params["expansions"] == ",".join(EXPANSIONS)
+    assert first.url.params["expansions"] == ",".join(
+        (*EXPANSIONS, *REFERENCE_EXPANSIONS)
+    )
     assert first.url.params["media.fields"] == ",".join(MEDIA_FIELDS)
     assert "pagination_token" not in first.url.params
     assert "since_id" not in first.url.params
@@ -757,7 +763,7 @@ def test_long_post_is_parsed_with_its_full_text() -> None:
 
 
 def test_unparseable_page_raises_an_error_carrying_the_raw_page() -> None:
-    body = {"data": [{"text": "no id"}], "meta": {"result_count": 1}}
+    body = {"data": {"text": "not a list"}, "meta": {"result_count": 1}}
 
     def api(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json=body)
@@ -769,3 +775,36 @@ def test_unparseable_page_raises_an_error_carrying_the_raw_page() -> None:
     assert info.value.raw.endpoint == f"/users/{USER_ID}/tweets"
     assert info.value.status_code == 200
     assert isinstance(info.value, XApiError)
+
+
+def _not_found(**overrides: str) -> dict[str, Any]:
+    error = {
+        "title": "Not Found Error",
+        "resource_type": "user",
+        "parameter": "id",
+        "type": "https://api.twitter.com/2/problems/resource-not-found",
+    }
+    return {"errors": [{**error, **overrides}], "meta": {"result_count": 0}}
+
+
+def test_iter_timeline_user_not_found_raises_not_found() -> None:
+    with (
+        x_client(script(ok(_not_found()))) as client,
+        pytest.raises(NotFoundError, match="not found"),
+    ):
+        list(client.iter_timeline(USER_ID))
+
+
+@pytest.mark.parametrize(
+    "overrides", [{"resource_type": "tweet"}, {"parameter": "ids"}]
+)
+def test_iter_timeline_other_not_found_errors_are_not_a_missing_user(
+    overrides: dict[str, str],
+) -> None:
+    with (
+        x_client(script(ok(_not_found(**overrides)))) as client,
+        pytest.raises(XApiError) as e,
+    ):
+        list(client.iter_timeline(USER_ID))
+
+    assert not isinstance(e.value, NotFoundError)

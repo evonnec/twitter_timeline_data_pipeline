@@ -235,6 +235,7 @@ def test_replay_after_the_purge_does_not_bring_the_tweet_back(
         bucket=aws.bucket,
         prefix="raw/",
         send=send,
+        quarantine=None,
     )
 
     assert sent == [other]

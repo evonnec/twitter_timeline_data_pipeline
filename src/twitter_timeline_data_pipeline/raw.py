@@ -30,7 +30,7 @@ import boto3
 from botocore.exceptions import ClientError
 
 from twitter_timeline_data_pipeline.config import ConfigError
-from twitter_timeline_data_pipeline.models import JSONObject, RawPage
+from twitter_timeline_data_pipeline.models import JSONObject, RawPage, TweetMessage
 
 if TYPE_CHECKING:
     from mypy_boto3_s3 import S3Client
@@ -263,3 +263,35 @@ def iter_raw_objects(
                 continue
             body = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
             yield key, body
+
+
+def restore_referenced_notes(
+    s3: S3Client, bucket: str, message: TweetMessage
+) -> TweetMessage:
+    """``message`` with the ``note_text`` of its referenced posts read back from the raw
+    page it names, where the fetch Lambda left it out to keep the body under SQS's
+    limit. A message that omitted nothing is returned as it is. Raises
+    ``RawPageError`` (and ``ClientError`` for S3) when the page or a text can't be
+    found: the message is then retried, never stored without the text."""
+    if not message.has_omitted_notes:
+        return message
+    if message.raw_key is None:
+        raise RawPageError("referenced note texts were omitted but there is no raw_key")
+    body = s3.get_object(Bucket=bucket, Key=message.raw_key)["Body"].read()
+    includes = Envelope.from_bytes(body).response.get("includes") or {}
+    notes: dict[str, str] = {}
+    for name in ("tweets", "posts"):  # X is renaming tweets to posts
+        for entry in includes.get(name) or ():
+            note = entry.get("note_tweet") or entry.get("note_post") or {}
+            if isinstance(note.get("text"), str):
+                notes[str(entry.get("id"))] = note["text"]
+    restored = []
+    for ref in message.referenced:
+        if ref.note_text_omitted:
+            if ref.id not in notes:
+                raise RawPageError(
+                    f"raw page {message.raw_key} has no note for {ref.id}"
+                )
+            ref = replace(ref, note_text=notes[ref.id], note_text_omitted=False)
+        restored.append(ref)
+    return replace(message, referenced=tuple(restored))

@@ -38,6 +38,12 @@ PHOTO_TWEET, VIDEO_TWEET, GIF_TWEET, PLAIN_TWEET, QUOTE_TWEET = (
 PHOTO_KEY = f"media/{USER_ID}/{PHOTO_TWEET}/3_1700000000000000101.jpg"
 VIDEO_KEY = f"media/{USER_ID}/{VIDEO_TWEET}/7_1700000000000000102.mp4"
 GIF_KEY = f"media/{USER_ID}/{GIF_TWEET}/16_1700000000000000103.mp4"
+VIDEO_PREVIEW_URL = (
+    "https://pbs.twimg.com/ext_tw_video_thumb/1700000000000000102/pu/img/fake.jpg"
+)
+GIF_PREVIEW_URL = "https://pbs.twimg.com/tweet_video_thumb/FakeGif01.jpg"
+VIDEO_PREVIEW_KEY = f"media/{USER_ID}/{VIDEO_TWEET}/7_1700000000000000102_preview.jpg"
+GIF_PREVIEW_KEY = f"media/{USER_ID}/{GIF_TWEET}/16_1700000000000000103_preview.jpg"
 VIDEO_BYTES = b"\x00\x01" * 2_000_000  # 4 MB: crosses the multipart threshold
 
 
@@ -47,6 +53,8 @@ def cdn() -> CdnStub:
     stub.serve(PHOTO_URL, b"jpeg-bytes", "image/jpeg")
     stub.serve(VIDEO_HI_URL, VIDEO_BYTES, "video/mp4")
     stub.serve(GIF_URL, b"gif-as-mp4", "video/mp4")
+    stub.serve(VIDEO_PREVIEW_URL, b"video-poster", "image/jpeg")
+    stub.serve(GIF_PREVIEW_URL, b"gif-poster", "image/jpeg")
     return stub
 
 
@@ -96,7 +104,9 @@ def test_full_pipeline_stores_tweets_and_media(pipeline: Aws, cdn: CdnStub) -> N
     assert fetched["enqueued"] == len(records) == 7
     assert processed == {"batchItemFailures": []}
     assert pipeline.tweets_table.scan()["Count"] == 7
-    assert s3_keys(pipeline) == sorted([PHOTO_KEY, VIDEO_KEY, GIF_KEY])
+    assert s3_keys(pipeline) == sorted(
+        [PHOTO_KEY, VIDEO_KEY, GIF_KEY, VIDEO_PREVIEW_KEY, GIF_PREVIEW_KEY]
+    )
     raw_keys = s3_keys(pipeline, "raw/")
     assert len(raw_keys) == fetched["pages"] == 2
     stored = {i["raw_key"] for i in pipeline.tweets_table.scan()["Items"]}
@@ -115,18 +125,34 @@ def test_full_pipeline_stores_tweets_and_media(pipeline: Aws, cdn: CdnStub) -> N
     assert f"{PHOTO_URL}?name=orig" in urls
     assert VIDEO_HI_URL in urls
     assert not any("lo.mp4" in u or "mid.mp4" in u or ".m3u8" in u for u in urls)
-    assert len(urls) == 3
+    assert VIDEO_PREVIEW_URL in urls and GIF_PREVIEW_URL in urls
+    assert len(urls) == 5
 
     video_item = item(pipeline, VIDEO_TWEET)
     assert video_item["username"] == USERNAME
     assert video_item["media"][0]["status"] == "stored"
     assert video_item["media"][0]["size_bytes"] == len(VIDEO_BYTES)
+    assert video_item["media"][0]["preview_s3_key"] == VIDEO_PREVIEW_KEY
+    assert video_item["media"][0]["preview_image_url"] == VIDEO_PREVIEW_URL
+    assert video_item["media_keys"] == ["7_1700000000000000102"]
+    poster = pipeline.s3.get_object(Bucket=pipeline.bucket, Key=VIDEO_PREVIEW_KEY)
+    assert poster["Body"].read() == b"video-poster"
     assert video_item["public_metrics"]["like_count"] == 7
     quote = item(pipeline, QUOTE_TWEET)
     assert quote["referenced_tweets"] == [
-        {"type": "quoted", "id": "1600000000000000009"}
+        {
+            "type": "quoted",
+            "id": "1600000000000000009",
+            "status": "unavailable",
+            "unavailable_since": quote["fetched_at"],
+        }
     ]
-    assert quote["media_count"] == 0  # its media key was missing from includes
+    # Its media key was missing from includes: recorded, not dropped.
+    assert quote["media_count"] == 1
+    assert quote["media_keys"] == ["3_1700000000000000199"]
+    assert quote["media"] == [
+        {"media_key": "3_1700000000000000199", "type": "unknown", "status": "missing"}
+    ]
     assert item(pipeline, PLAIN_TWEET)["media"] == []
     assert item(pipeline, "1600000000000000001")["referenced_tweets"][0]["type"] == (
         "replied_to"
@@ -251,8 +277,8 @@ def test_a_poison_message_fails_alone_and_a_transient_failure_succeeds_on_retry(
     retry = process_handler({"Records": [gif_record]}, None)
 
     assert retry == {"batchItemFailures": []}
-    assert GIF_KEY in s3_keys(pipeline)
-    assert len(cdn.requests) == downloads + 1  # only the GIF was fetched again
+    assert {GIF_KEY, GIF_PREVIEW_KEY} <= set(s3_keys(pipeline))
+    assert len(cdn.requests) == downloads + 2  # only the GIF and its poster again
     assert item(pipeline, GIF_TWEET)["media"][0]["status"] == "stored"
 
 

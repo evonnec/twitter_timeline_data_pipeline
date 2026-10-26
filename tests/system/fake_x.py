@@ -12,6 +12,10 @@ It behaves like the real service wherever the pipeline could notice:
   ``text`` and ``edit_history_tweet_ids`` always do); media arrive under
   ``includes.media`` only with ``expansions=attachments.media_keys``; a key whose media
   is withheld is reported as a partial error; an unknown field or expansion is a 400.
+- ``expansions=referenced_tweets.id`` adds the posts a post retweets, quotes or replies
+  to under ``includes.tweets`` (a deleted original is a partial error instead), and
+  ``referenced_tweets.id.author_id`` their authors under ``includes.users`` (with the
+  ``user.fields`` asked for).
 - A long post (over 280 characters) has a truncated ``text`` preview; the full body is
   only in ``note_tweet.text``, which is returned only when ``note_tweet`` is requested.
 - Every request needs ``Authorization: Bearer <token>`` with a currently valid token.
@@ -101,6 +105,8 @@ VALID_EXPANSIONS = frozenset(
     }
 )
 
+VALID_USER_FIELDS = frozenset({"id", "name", "username", "created_at", "verified"})
+
 type Endpoint = Literal["user", "timeline", "lookup", "other"]
 
 _USER_PATH = re.compile(r"/2/users/by/username/(?P<handle>[^/]+)")
@@ -146,6 +152,7 @@ class FakeTweet:
     note_text: str | None = None
     public_metrics: dict[str, int] = field(default_factory=dict)
     referenced_tweets: list[dict[str, str]] = field(default_factory=list)
+    entities: dict[str, Any] | None = None
     lang: str = "en"
     json_overrides: dict[str, Any] = field(default_factory=dict)
     """Fields to serve exactly as given (odd shapes the real API has produced)."""
@@ -315,6 +322,29 @@ class FakeXApi:
         """Put a removed post back (a protected account made public again)."""
         self._gone.pop(tweet.id, None)
         self._timelines[tweet.author_id].append(tweet)
+
+    def repost(self, username: str, original: FakeTweet) -> FakeTweet:
+        """Retweet ``original`` (as the real API shows it: ``RT @author: `` plus the
+        text cut at 140 characters)."""
+        author = next(u for u in self._users.values() if u.id == original.author_id)
+        text = f"RT @{author.username}: {original.full_text}"
+        tweet = self.post(username, text=text[:139] + "…" if len(text) > 140 else text)
+        tweet.referenced_tweets = [{"type": "retweeted", "id": original.id}]
+        return tweet
+
+    def quote(self, username: str, original: FakeTweet, text: str) -> FakeTweet:
+        tweet = self.post(username, text=text)
+        tweet.referenced_tweets = [{"type": "quoted", "id": original.id}]
+        return tweet
+
+    def reply(self, username: str, original: FakeTweet, text: str) -> FakeTweet:
+        tweet = self.post(username, text=text)
+        tweet.referenced_tweets = [{"type": "replied_to", "id": original.id}]
+        return tweet
+
+    def delete(self, tweet: FakeTweet) -> None:
+        """The post is deleted: gone from its author's timeline and from expansions."""
+        self._timelines[tweet.author_id].remove(tweet)
 
     def timeline(self, username: str) -> list[FakeTweet]:
         """Every post of the account, newest first."""
@@ -551,6 +581,7 @@ class FakeXApi:
         tweet_fields = _csv(params, "tweet.fields", VALID_TWEET_FIELDS, problems)
         media_fields = _csv(params, "media.fields", VALID_MEDIA_FIELDS, problems)
         expansions = _csv(params, "expansions", VALID_EXPANSIONS, problems)
+        _csv(params, "user.fields", VALID_USER_FIELDS, problems)
         try:
             max_results = int(params.get("max_results", "10"))
         except ValueError:
@@ -618,6 +649,19 @@ class FakeXApi:
                     for m in t.media
                     if not m.in_includes
                 ]
+            if "referenced_tweets.id" in expansions:
+                found, missing = self._resolve_references(page)
+                includes = body.setdefault("includes", {})
+                if found:
+                    includes["tweets"] = [_tweet_json(t, tweet_fields) for t in found]
+                    if "referenced_tweets.id.author_id" in expansions:
+                        authors = {t.author_id for t in found}
+                        includes["users"] = [
+                            _user_json(u)
+                            for u in self._users.values()
+                            if u.id in authors
+                        ]
+                errors += [_missing_tweet_error(i) for i in missing]
             if errors:
                 body["errors"] = errors
             meta["newest_id"] = page[0].id
@@ -632,6 +676,17 @@ class FakeXApi:
             ).hexdigest()[:26]
         body["meta"] = meta
         return httpx.Response(200, json=body, headers=headers)
+
+    def _resolve_references(
+        self, page: list[FakeTweet]
+    ) -> tuple[list[FakeTweet], list[str]]:
+        """The referenced posts that still exist, and the IDs of those that don't."""
+        everything = {t.id: t for tweets in self._timelines.values() for t in tweets}
+        ids = list(dict.fromkeys(r["id"] for t in page for r in t.referenced_tweets))
+        return (
+            [everything[i] for i in ids if i in everything],
+            [i for i in ids if i not in everything],
+        )
 
     def _token(self, user_id: str, below: int, page: int) -> str:
         token = hashlib.sha256(f"{user_id}:{below}:{page}".encode()).hexdigest()[:26]
@@ -704,6 +759,23 @@ def _missing_media_error(media_key: str) -> dict[str, Any]:
     }
 
 
+def _missing_tweet_error(tweet_id: str) -> dict[str, Any]:
+    return {
+        "value": tweet_id,
+        "detail": f"Could not find tweet with referenced_tweets.id: [{tweet_id}].",
+        "title": "Not Found Error",
+        "resource_type": "tweet",
+        "parameter": "referenced_tweets.id",
+        "resource_id": tweet_id,
+        "type": "https://api.twitter.com/2/problems/resource-not-found",
+    }
+
+
+def _user_json(user: _User) -> dict[str, Any]:
+    """``id``, ``name`` and ``username`` are the user object's default fields."""
+    return {"id": user.id, "name": user.username, "username": user.username}
+
+
 def _tweet_json(tweet: FakeTweet, fields: set[str]) -> dict[str, Any]:
     out: dict[str, Any] = {
         "id": tweet.id,
@@ -726,6 +798,8 @@ def _tweet_json(tweet: FakeTweet, fields: set[str]) -> dict[str, Any]:
         out["attachments"] = {"media_keys": [m.media_key for m in tweet.media]}
     if "note_tweet" in fields and tweet.note_text is not None:
         out["note_tweet"] = {"text": tweet.note_text}
+    if "entities" in fields and tweet.entities is not None:
+        out["entities"] = dict(tweet.entities)
     if "possibly_sensitive" in fields:
         out["possibly_sensitive"] = False
     if "reply_settings" in fields:

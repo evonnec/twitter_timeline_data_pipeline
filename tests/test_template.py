@@ -12,6 +12,7 @@ from cfnlint.api import lint_all  # type: ignore[import-untyped]
 from cfnlint.decode import cfn_yaml  # type: ignore[import-untyped]
 
 from twitter_timeline_data_pipeline.config import ENV_VARS
+from twitter_timeline_data_pipeline.storage import MEDIA_HOSTS_OVERRIDE_ENV
 
 ROOT = Path(__file__).parent.parent
 TEMPLATE = ROOT / "template.yaml"
@@ -209,6 +210,17 @@ def test_max_media_bytes_parameter_feeds_the_process_function(
         "Ref": "MaxMediaBytes"
     }
     assert "MAX_MEDIA_BYTES" not in env_of(template, "FetchFunction")
+
+
+def test_expansion_parameters_feed_the_fetch_function_only(template: Template) -> None:
+    for parameter, variable in (
+        ("ExpandReferencedTweets", "EXPAND_REFERENCED_TWEETS"),
+        ("RequestEntities", "REQUEST_ENTITIES"),
+    ):
+        assert template["Parameters"][parameter]["Default"] == "true"
+        assert template["Parameters"][parameter]["AllowedValues"] == ["true", "false"]
+        assert env_of(template, "FetchFunction")[variable] == {"Ref": parameter}
+        assert variable not in env_of(template, "ProcessFunction")
 
 
 def test_dead_letter_queue_keeps_messages_longer_than_the_source(
@@ -734,6 +746,15 @@ def test_only_the_compliance_function_can_delete(template: Template) -> None:
             for p in properties(template, name)["Policies"]
             if isinstance(p, dict) and "Statement" not in p
         ]
+        if name == "ProcessFunction":
+            # the one exception: the text of a referenced original that became
+            # unavailable (#18), under text/* and nothing else
+            (delete,) = (
+                s for s in statements if "s3:DeleteObject" in _as_list(s["Action"])
+            )
+            assert delete["Action"] == "s3:DeleteObject"
+            assert delete["Resource"] == {"Fn::Sub": "${MediaBucket.Arn}/text/*"}
+            actions -= {"s3:DeleteObject"}
         has_delete = any(a.startswith(deleting_prefixes) for a in actions)
         assert has_delete == (name == "ComplianceFunction"), name
         assert not actions & deleting or name == "ComplianceFunction"
@@ -757,18 +778,23 @@ def test_compliance_function_has_an_errors_alarm(template: Template) -> None:
     assert props["MetricName"] == "Errors"
 
 
-def test_fetch_function_writes_only_under_raw(template: Template) -> None:
+def test_fetch_function_writes_only_under_raw_and_quarantine(
+    template: Template,
+) -> None:
     statements = policy_statements(template, "FetchFunction")
-    (put,) = (s for s in statements if "s3:PutObject" in _as_list(s["Action"]))
+    puts = [s for s in statements if "s3:PutObject" in _as_list(s["Action"])]
 
-    assert put["Effect"] == "Allow"
-    assert put["Action"] == "s3:PutObject"
-    assert put["Resource"] == {"Fn::Sub": "${MediaBucket.Arn}/raw/*"}
+    assert all(s["Effect"] == "Allow" and s["Action"] == "s3:PutObject" for s in puts)
+    # one statement per prefix, each scoped to exactly that prefix
+    assert [s["Resource"] for s in puts] == [
+        {"Fn::Sub": "${MediaBucket.Arn}/raw/*"},
+        {"Fn::Sub": "${MediaBucket.Arn}/quarantine/*"},
+    ]
     # nothing else of S3: no reads, no listing, no other prefix
     other = [
         s
         for s in statements
-        if s is not put and any(a.startswith("s3:") for a in _as_list(s["Action"]))
+        if s not in puts and any(a.startswith("s3:") for a in _as_list(s["Action"]))
     ]
     assert other == []
 
@@ -806,3 +832,11 @@ def test_process_function_cannot_write_raw_pages(template: Template) -> None:
         {"Fn::Sub": "${MediaBucket.Arn}/media/*"},
         {"Fn::Sub": "${MediaBucket.Arn}/text/*"},
     ]
+
+
+def test_no_function_sets_the_test_only_media_host_override(template: Template) -> None:
+    for name, props in functions(template).items():
+        assert MEDIA_HOSTS_OVERRIDE_ENV not in props.get("Environment", {}).get(
+            "Variables", {}
+        ), name
+    assert MEDIA_HOSTS_OVERRIDE_ENV not in TEMPLATE.read_text()

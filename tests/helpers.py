@@ -13,6 +13,7 @@ import pytest
 from twitter_timeline_data_pipeline.models import (
     SCHEMA_VERSION,
     Media,
+    ReferencedPost,
     Tweet,
     TweetMessage,
 )
@@ -143,6 +144,8 @@ def make_message(
     tweet_id: str = "1700000000000000005",
     *,
     media: tuple[Media, ...] = (),
+    referenced: tuple[ReferencedPost, ...] = (),
+    requested: Mapping[str, bool] | None = None,
     username: str = USERNAME,
     tweet: Mapping[str, Any] | None = None,
     fetched_at: str = FETCHED_AT,
@@ -152,6 +155,8 @@ def make_message(
         username=username,
         tweet=make_tweet(tweet_id, **(tweet or {})),
         media=media,
+        referenced=referenced,
+        requested=dict(requested or {}),
         fetched_at=fetched_at,
         schema_version=schema_version,
     )
@@ -175,7 +180,13 @@ def install_x_api(
         passthrough = {
             k: v
             for k, v in kwargs.items()
-            if k in ("max_rate_limit_wait", "max_retries")
+            if k
+            in (
+                "max_rate_limit_wait",
+                "max_retries",
+                "expand_referenced",
+                "request_entities",
+            )
         }
         return XClient(
             token,

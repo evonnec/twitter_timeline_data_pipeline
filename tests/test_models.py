@@ -522,7 +522,10 @@ def test_timeline_page_messages_warn_on_missing_media_key(
     quoted = messages[-1]
     assert quoted.tweet.media_keys == ("3_1700000000000000199",)
     assert quoted.media == ()
-    assert [r.getMessage() for r in caplog.records] == [
+    assert quoted.missing_media_keys == ("3_1700000000000000199",)
+    assert [
+        r.getMessage() for r in caplog.records if "media key" in r.getMessage()
+    ] == [
         "media key 3_1700000000000000199 of tweet 1700000000000000001 "
         "missing from includes"
     ]
@@ -652,6 +655,8 @@ def test_golden_v1_message_without_note_text_parses() -> None:
     assert parsed.schema_version == 1
     assert parsed.tweet.note_text is None
     assert parsed.tweet.full_text == "old format"
+    assert parsed.referenced == ()
+    assert parsed.tweet.entities is None and parsed.tweet.withheld is None
 
 
 def test_unknown_keys_are_ignored_at_message_and_tweet_level() -> None:
@@ -666,6 +671,40 @@ def test_unknown_keys_are_ignored_at_message_and_tweet_level() -> None:
     assert parsed == TweetMessage.from_dict(
         json.loads((FIXTURES / "message_v1.json").read_text())
     )
+
+
+def test_golden_v1_message_without_missing_media_keys_parses() -> None:
+    """Messages from before ``missing_media_keys`` existed read as "none reported"."""
+    body = (FIXTURES / "message_v1.json").read_text()
+    assert "missing_media_keys" not in body
+
+    parsed = TweetMessage.from_json(body)
+
+    assert parsed.missing_media_keys == ()
+    assert parsed.schema_version == 1
+
+
+def test_missing_media_keys_round_trip_and_leave_the_rest_readable() -> None:
+    data = json.loads((FIXTURES / "message_v1.json").read_text())
+    data["missing_media_keys"] = ["3_9", 4]
+
+    parsed = TweetMessage.from_dict(data)
+
+    assert parsed.missing_media_keys == ("3_9", "4")
+    assert TweetMessage.from_json(parsed.to_json()) == parsed
+    # What an old reader sees: the same message minus an extra key it ignores.
+    del data["missing_media_keys"]
+    assert replace(parsed, missing_media_keys=()) == TweetMessage.from_dict(data)
+
+
+def test_hls_only_means_variants_but_no_mp4() -> None:
+    hls = [{"content_type": "application/x-mpegURL", "url": "https://v/p.m3u8"}]
+
+    assert media_of("video", variants=hls).is_hls_only
+    assert media_of("animated_gif", variants=hls).is_hls_only
+    assert not media_of("video").is_hls_only
+    assert not media_of("video", variants=[mp4("https://v", 5)]).is_hls_only
+    assert not media_of("photo", variants=hls).is_hls_only
 
 
 def test_note_post_is_accepted_as_the_renamed_field() -> None:

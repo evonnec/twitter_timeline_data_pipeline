@@ -48,9 +48,9 @@ flowchart LR
 A run, step by step:
 
 1. EventBridge invokes `FetchFunction` on the schedule (`rate(1 hour)` by default). The event may carry `{"username": "..."}`; otherwise the `TWITTER_USERNAME` setting is used. The name is normalized once (leading `@` removed, lower-cased) and used everywhere below.
-2. The function reads the bearer token from Secrets Manager (cached in memory for 15 minutes), resolves the username to a user ID, and reads the account's cursor from the state table: the newest Tweet ID already fetched, plus any *gaps* (ID ranges known to be unfetched; see the [state table](#state-table-statetable)).
+2. The function reads the bearer token from Secrets Manager (cached in memory for 15 minutes), reads the account's cursor from the state table, and takes the user ID from it (the handle is looked up only when the stored ID is missing or older than `USER_ID_TTL_HOURS`; see [identity changes](#identity-changes)): the newest Tweet ID already fetched, plus any *gaps* (ID ranges known to be unfetched; see the [state table](#state-table-statetable)).
 3. New Tweets first. It pages through `GET /2/users/:id/tweets` with `since_id` set to the newest ID, newest first, in pages of `MAX_RESULTS` Tweets. A first run has no `since_id`. `MAX_PAGES` is a budget of API requests, counting empty and failed ones; when gaps exist it is at least 2, one request is kept for the oldest gap, and the rest go to the new Tweets and the newest gaps.
-4. Each page is first written, unchanged, to the media bucket under `raw/` (see [Raw API pages](#raw-api-pages)). Only then does it become one message per Tweet, sent to the queue with `SendMessageBatch` (10 at a time; only entries SQS reports as failed are retried). Each message carries the raw object's key as `raw_key`. If the upload fails, nothing from that page is enqueued and the run fails with its cursor unmoved, so the page is fetched again by the next run.
+4. Each page is first written, unchanged, to the media bucket under `raw/` (see [Raw API pages](#raw-api-pages)). Only then does it become one message per Tweet, sent to the queue with `SendMessageBatch` (10 at a time; only entries SQS reports as failed are retried, and not those failed with `SenderFault`: see [Quarantine](#quarantine)). A Tweet that fails to parse is quarantined and the rest of the page goes on. Each message carries the raw object's key as `raw_key`. If the upload fails, nothing from that page is enqueued and the run fails with its cursor unmoved, so the page is fetched again by the next run.
 5. After each page is fully enqueued, the cursor is saved. While the page still has a `next_token`, the not-yet-fetched rest is recorded as a gap just below the lowest ID seen; a page without `next_token` closes it. So a run that hits the cap, a rate limit or an error leaves a gap, never a hole.
 6. Then the gaps. Whatever remains of the shared `MAX_PAGES` budget goes to the gaps, newest gap first, with `since_id` and `until_id` set to the gap's bounds. Each saved page lowers the gap's `until_id`, and the gap is removed when a page has no `next_token`.
 7. A 429 that resets later than the function will wait ends the run cleanly after saving: the invocation succeeds and the summary has `stopped_reason: "rate_limited"` (alerting on that comes with issue #19). Any other error fails the invocation, with progress up to the last full page saved; an error in one gap is raised only after the other gaps have had their turn. The next run resumes from the cursor and re-sends at most the page that was in flight.
@@ -86,7 +86,23 @@ One message per Tweet. The body is compact UTF-8 JSON, with only the characters 
     },
     "edit_history_tweet_ids": ["1850000000000000001"],
     "media_keys": ["3_1850000000000000002"],
-    "note_text": null
+    "note_text": null,
+    "entities": {
+      "urls": [
+        {
+          "url": "https://t.co/abc",
+          "expanded_url": "https://example.com/launch",
+          "display_url": "example.com/launch",
+          "start": 12,
+          "end": 28
+        }
+      ]
+    },
+    "display_entities": null,
+    "in_reply_to_user_id": null,
+    "possibly_sensitive": null,
+    "edit_controls": null,
+    "withheld": null
   },
   "media": [
     {
@@ -101,6 +117,9 @@ One message per Tweet. The body is compact UTF-8 JSON, with only the characters 
       "alt_text": null
     }
   ],
+  "missing_media_keys": [],
+  "referenced": [],
+  "requested": {},
   "fetched_at": "2024-10-25T14:35:00Z",
   "schema_version": 1
 }
@@ -108,11 +127,15 @@ One message per Tweet. The body is compact UTF-8 JSON, with only the characters 
 
 You can regenerate it with `TweetMessage(...).to_json()` from `twitter_timeline_data_pipeline.models`.
 
-**Long posts.** For a post over 280 characters the API's `text` is only a truncated preview; the full body is in `note_tweet.text`, which the fetch Lambda requests. It travels as `tweet.note_text` (`null` for a short post, and absent from messages queued by the old fetch Lambda). Entities of the long text are not collected.
+**Long posts.** For a post over 280 characters the API's `text` is only a truncated preview; the full body is in `note_tweet.text`, which the fetch Lambda requests. It travels as `tweet.note_text` (`null` for a short post, and absent from messages queued by the old fetch Lambda). For a long post the stored `entities` are the ones of `note_tweet.entities` (their offsets index the full text); the Tweet-level ones, which index the preview, are kept as `display_entities` when the post is long.
 
-**Compatibility.** `note_text` is an additive, optional field, so `schema_version` stays 1. A reader builds a Tweet from explicit keys and ignores unknown ones, so a processor from before this field still parses a new message (and stores the preview), and a new processor reading an old message gets `note_text = null`. The version only changes for a change a reader cannot ignore.
+**Missing media.** A key in the Tweet's `attachments.media_keys` that the response's `includes.media` does not return (deleted or withheld media) is logged (`media key ... missing from includes`) and listed in `missing_media_keys`; the Tweet's `media_keys` still holds every attached key. The field is optional (absent means none were reported).
 
-**Size.** Each Tweet is one message, encoded as UTF-8. Only the characters SQS rejects or UTF-8 cannot encode (lone surrogates, U+FFFE, U+FFFF) are escaped, because escaping every non-ASCII character made emoji three to six times larger. The queues' `MaximumMessageSize` is 1 MiB (SQS's maximum; the dead-letter queue matches so redriven messages fit), and the fetch Lambda also groups messages so one `SendMessageBatch` call stays under 1 MiB in total. The worst case measured is about 450 KB, under the 1 MiB limit: a 25,000-weighted-character post of 35-byte emoji sequences (12,500 of them, such as woman, skin tone, heart, kiss mark, man, skin tone) with four photos whose alt text is 1,000 characters each. That text alone is over DynamoDB's 400 KB item limit, so when the estimated item size is over 350 KB the processor moves the text (and, if still needed, `display_text`) to S3 (see the Tweets table) and keeps the item under the limit. A body over the limit stops the run with `MessageTooLargeError` instead of dropping data: the checkpoint is not advanced and the Lambda's Errors alarm fires.
+**Referenced posts and entities.** The fetch Lambda requests the `referenced_tweets.id` and `referenced_tweets.id.author_id` expansions, so the API returns the original of a retweet (whose own `text` is cut at about 140 characters, `RT @user: ...`), the quoted post and the post replied to under `includes.tweets`, and their authors under `includes.users`. Each message carries a compact copy of each in `referenced`: `{id, type, text, note_text, author_id, author_username, created_at, entities, status, note_text_omitted}` (`note_text` for a long original, `status` below, `note_text_omitted` see Size), and `requested` (`{"entities": bool, "expansions": bool}`: what the API was asked for, taken from the request's parameters, so a re-fetch can tell "none returned" from "not requested"; a message without it counts as nothing requested). A referenced post the API did not return (deleted, withheld or protected) is kept as `{id, type, status: "unavailable"}` and logged; the reference is never dropped. `tweet.entities` holds `urls` (`url`, `expanded_url`, `display_url`, `unwound_url`, `media_key`, `title`, `description`, `start`, `end`), `annotations`, `mentions` (`username`, `id`, offsets), `hashtags` and `cashtags` (`tag`, offsets); `tweet` also carries `in_reply_to_user_id`, `possibly_sensitive`, `edit_controls` and `withheld` when the API returns them. The media of referenced posts is not requested: `referenced_tweets.id.attachments.media_keys` is not in the endpoint's current expansion list in X's documentation (a possible flag later). Both requests can be turned off (`EXPAND_REFERENCED_TWEETS`, `REQUEST_ENTITIES`); with the expansion off the references are only `{type, id}` and carry no `status`.
+
+**Compatibility.** `note_text`, `missing_media_keys`, `referenced` and the entity fields are additive, optional fields, so `schema_version` stays 1. A reader builds a Tweet from explicit keys and ignores unknown ones, so a processor from before this field still parses a new message (and stores the preview), and a new processor reading an old message gets `note_text = null` and no `missing_media_keys`. The version only changes for a change a reader cannot ignore.
+
+**Size.** Each Tweet is one message, encoded as UTF-8. Only the characters SQS rejects or UTF-8 cannot encode (lone surrogates, U+FFFE, U+FFFF) are escaped, because escaping every non-ASCII character made emoji three to six times larger. The queues' `MaximumMessageSize` is 1 MiB (SQS's maximum; the dead-letter queue matches so redriven messages fit), and the fetch Lambda also groups messages so one `SendMessageBatch` call stays under 1 MiB in total. The worst case measured for the Tweet itself is about 450 KB, under the 1 MiB limit: a 25,000-weighted-character post of 35-byte emoji sequences (12,500 of them, such as woman, skin tone, heart, kiss mark, man, skin tone) with four photos whose alt text is 1,000 characters each. That text alone is over DynamoDB's 400 KB item limit, so when the estimated item size is over 350 KB the processor moves the text (and, if still needed, `display_text`) to S3 (see the Tweets table) and keeps the item under the limit. A long post that also replies to and quotes long posts measured 1,314,790 bytes with the originals' texts inline, over the limit. When a body is over it and the Tweet has a raw page, the fetch Lambda leaves the referenced posts' `note_text` out of the message (`note_text_omitted: true` on each copy, a WARNING is logged) and the processor reads them back from the raw page named by `raw_key` (`response.includes.tweets[].note_tweet.text`) before writing, so nothing is lost and the run does not stall; the slimmed body is about the Tweet's own size (at most about 450 KB plus the copies' other fields). A record whose raw page or note cannot be read is retried (and reaches the DLQ), never stored without the text. A body still over the limit, or over it with no raw page (`--no-raw`, or no bucket), stops the run with `MessageTooLargeError` instead of dropping data: the checkpoint is not advanced and the Lambda's Errors alarm fires.
 
 **Field name.** X's docs and OpenAPI spec show a `post.fields` / `note_post` rename in progress. `Tweet.from_api` reads `note_tweet` and falls back to `note_post`, but the request still asks for `note_tweet`: run a smoke test with a real token before deploying to confirm long posts come back with their full text.
 
@@ -142,20 +165,36 @@ You can regenerate it with `TweetMessage(...).to_json()` from `twitter_timeline_
 | `created_at` | S | ISO 8601 |
 | `conversation_id` | S | |
 | `lang` | S | |
-| `referenced_tweets` | L of M | `{type, id}`; type is `retweeted`, `quoted` or `replied_to` |
+| `referenced_tweets` | L of M | `{type, id}`; type is `retweeted`, `quoted` or `replied_to`. With the expansion on, also the original's `text` (full: for a long post `note_tweet.text`, with `display_text` the preview and `is_long_post: true`), `author_id`, `author_username` and `created_at`; `status` is `unavailable` for a post the API did not return (then only `type` and `id` are known). A referenced text is moved to S3 like `text` (`text_truncated`, `text_s3_key` in the entry; key `text/<author_id>/<tweet_id>.ref.<referenced_id>.json`) when the item is still near the size limit after `text` and `display_text` have been moved. A later fetch that lacks the text keeps these fields and adds `stale_since` and `last_seen_fetched_at` (see Assumptions and limitations) |
+| `entities` | M | Of the text stored in `text`: `urls[]` (`url`, `expanded_url`, `display_url`, `unwound_url`, `media_key`, `title`, `description`, `start`, `end`), `mentions[]` (`username`, `id`, `start`, `end`), `hashtags[]` and `cashtags[]` (`tag`, `start`, `end`), `annotations[]` (`probability` is a number stored exactly). Absent when the Tweet has none or `REQUEST_ENTITIES` is off |
+| `display_entities` | M | Only for a long post: the Tweet-level entities, which index the preview in `display_text` |
+| `in_reply_to_user_id` | S | |
+| `possibly_sensitive` | BOOL | |
+| `edit_controls` | M | `edits_remaining`, `is_edit_eligible`, `editable_until` as returned |
+| `withheld` | M | `copyright`, `country_codes`, `scope` as returned |
 | `public_metrics` | M | retweet, reply, like and quote counts at fetch time |
 | `edit_history_tweet_ids` | L of S | |
-| `media` | L of M | one entry per media item (below) |
-| `media_count` | N | |
+| `media_keys` | L of S | every media key the Tweet attaches, in the API's order, including keys the API did not return (see `missing` below) |
+| `media` | L of M | one entry per key in `media_keys` (below) |
+| `media_count` | N | `len(media_keys)`: the attached media, not only the downloaded ones |
 | `fetched_at` | S | when the fetch Lambda saw the Tweet; a write is skipped if the stored value is later |
 | `stored_at` | S | when the item was written |
 | `schema_version` | N | a write is skipped if the stored value is higher |
 | `expires_at` | N | Epoch seconds after which DynamoDB's TTL removes the item. Only written when `RetentionDays` is above 0 |
 | `deleted_at`, `deletion_reason`, `tombstone` | S | Only on a tombstoned Tweet (unavailable at the source): when it was found, why (`deleted`, `protected`, `suspended` or `withheld`), and the sparse-index marker (`"1"`) |
+| `revision` | N | incremented by every write; guards the read-merge-write of `put_tweet` |
 
 **Reading the full text.** Use `text` unless `text_truncated` is `true`; then `GetObject` the key in `text_s3_key` from the media bucket (`text/<author_id>/<tweet_id>.json`, or the lower-cased username when the Tweet has no author ID) and `json.loads` it: the object is the text as one JSON string (UTF-8, `application/json`), so any characters, a lone surrogate included, read back exactly. The object is written before the item and create-only, so a redelivery leaves it alone. Only a post whose item would pass 350 KB is offloaded (a handful of emoji-only posts at most). A message without `note_text` never replaces a stored long post, whatever its `fetched_at`.
 
-Each `media` entry has `media_key`, `type`, `status` (`stored` and `exists` for files in S3; otherwise `unavailable`, `skipped`, `too_large` or `retrying`, see below) and, when known, `s3_key`, `content_type`, `source_url` and `size_bytes`. Statuses without a file in S3: `unavailable` (the source answered 4xx other than 429, or redirected), `skipped` (nothing to download: HLS-only video, or a URL that isn't https on an X media host), `too_large` (over `MAX_MEDIA_BYTES`; `size_bytes` is the estimate or the byte count where the download was stopped) and `retrying` (transient errors persisted through the message's last receive, so the Tweet was written without the file; `source_url` and the planned `s3_key` are recorded and a media-retry message is queued). `retrying` is not final: `MediaRetryFunction` replaces the entry with `stored`, `exists`, `unavailable`, `too_large` or `skipped` once it has dealt with the media. An entry still `retrying` means the retry is pending, or (after the media-retry dead-letter queue alarm) failed and awaits an operator; the `source_url` says what to fetch.
+Each `media` entry has `media_key`, `type`, `status` and, when known, the storage outcome (`s3_key`, `content_type`, `source_url`, `size_bytes`, `preview_s3_key`, `preview_status`, `preview_size_bytes`) and the media's own fields as the API gave them: `url` (as given: a stored photo's `source_url` is the `name=orig` rewrite), `alt_text`, `width`, `height`, `duration_ms`, `preview_image_url` and `variants` (a list of `{content_type, bit_rate, url}`; `bit_rate` only when given). Absent values are omitted. Integers are clamped to +-(2^63 - 1). A key whose media the API did not return has `type` `unknown`, status `missing` and nothing else.
+
+`status` is one of: `stored` (uploaded now) and `exists` (already in S3), both with `s3_key`; and, without a file in S3, `unavailable` (the source answered 4xx other than 429, or redirected), `skipped` (nothing to download: no URL, or one that isn't https on an X media host), `skipped_hls` (a video or animated GIF whose only variants are HLS playlists, so there is no file; the poster frame is still stored), `too_large` (over `MAX_MEDIA_BYTES`; `size_bytes` is the estimate or the byte count where the download was stopped), `missing` (see above) and `retrying` (transient errors persisted through the message's last receive, so the Tweet was written without the file or poster frame; `source_url` and the planned `s3_key` and `preview_s3_key` are recorded and a media-retry message is queued). `retrying` is not final: `MediaRetryFunction` replaces the entry with `stored`, `exists`, `unavailable`, `too_large`, `skipped` or `skipped_hls` once it has dealt with the media. An entry still `retrying` means the retry is pending, or (after the media-retry dead-letter queue alarm) failed and awaits an operator; the `source_url` says what to fetch.
+
+`preview_s3_key` is the stored poster frame of a `video` or `animated_gif` that has an allowed `preview_image_url` (`media/<author_id>/<tweet_id>/<media_key>_preview.jpg`). It is downloaded the same way as the file (size cap, time budget, host allowlist, no redirects, an existing object is not fetched again) and is part of the same retry unit: a transient failure retries the whole record, and on the last receive the entry becomes `retrying` and the retry consumer stores both. `preview_status` records how the poster frame ended: `stored`, `exists`, `unavailable`, `too_large` (with `preview_size_bytes`, the estimate or count) or `retrying`. A poster frame that is permanently unavailable or too large has no `preview_s3_key` and the status stays that of the file. An entry that is `retrying` only for its poster frame has no `source_url` for it: the source is `preview_image_url`. **Re-fetches never erase media.** Every `put_tweet` first reads the stored item (consistent) and merges it in: a stored entry whose key a newer fetch lacks (`missing` in `includes.media`, or not listed at all) is kept whole, with `missing_since` (the fetch that first lost it) and `last_seen_fetched_at` added. Only a key that was never seen is written as `missing`; a fetch that has the media again replaces the entry as usual. The put is conditional on the item's `revision` (a number every write increments, `media_retry`'s update included; any other in-place updater must `ADD revision 1` too). If another write lands in between, it re-reads and merges again, up to 3 times; after that it raises `WriteContentionError`, the record fails and SQS redelivers it (the DLQ alarm covers the last receive), so nothing is dropped as stale. When first deploying this version, let the media-retry queue drain (or disable `MediaRetryFunction`'s event source) during the deploy: a retry still running the previous code doesn't bump `revision`, so in that one-off window its result could be overwritten by a concurrent merge.
+
+**Legacy items** (written before this) have no `media_keys`, their `media_count` counts the stored entries only (a key the API omitted was dropped), and an HLS-only video says `skipped` rather than `skipped_hls`.
+
+Every S3 object of an item is named by the item: `s3_key` and `preview_s3_key` of each `media` entry, `text_s3_key` and `display_text_s3_key`, and, for each entry of `referenced_tweets`, its own `text_s3_key` and `display_text_s3_key` (objects `text/<owner>/<tweet_id>.ref.<referenced_id>[.display_text].json`). The only object a write deletes is a referenced text whose original is now `unavailable` (see Assumptions and limitations).
 
 ### Media-retry message (`MediaRetryQueue`)
 
@@ -188,6 +227,8 @@ One item per account: partition key `username` (S, lower case) and
 | --- | --- | --- |
 | `newest_id` | N | Highest Tweet ID reached by the new-Tweets phase (a gap page can enqueue a higher one, which is re-fetched later). Never decreases. Absent until the first Tweet. |
 | `gaps` | L of M | Exclusive ID ranges known to be unfetched, each `{until_id, since_id, empty_runs, first_empty_at}` (N; `empty_runs` and the ISO-8601 UTC `first_empty_at` only when `empty_runs` is above 0). A missing `since_id` means "down to the end of what the API serves" (about the 3,200 most recent posts); a missing `until_id` means "up from the newest Tweet". |
+| `user_id` | S | Numeric user ID the handle resolved to. Absent on items written before this existed (the next run looks the handle up, logs the binding and stores it). |
+| `user_id_resolved_at` | S | ISO-8601 UTC time (`...Z`) the ID was last confirmed by a lookup (only a lookup sets it; an unreadable or timezone-less value counts as expired). The ID is reused until it is `USER_ID_TTL_HOURS` old, then looked up again (and this time refreshed if unchanged). |
 | `version` | N | Optimistic lock, incremented on every write. |
 | `updated_at` | S | UTC timestamp of the last write. |
 
@@ -199,6 +240,32 @@ The list is kept normalized on every save: overlapping or adjacent gaps are merg
 
 Every write is conditional on the `version` that run read (a missing `version` counts as 0, so items written before gaps existed are read as they are and upgraded on the first write). If another run got there first, the write fails, the run stops fetching, logs a warning and returns `stopped_reason: "state_conflict"`. Anything it already enqueued is a harmless duplicate, `newest_id` never moves backwards, and no gap is dropped.
 
+#### Identity changes
+
+The checkpoint belongs to the account, not just the handle. If the account renames and someone else registers the old handle, a lookup returns a different user ID. Whenever a lookup (or the `user_id` in the fetch event) differs from the stored `user_id`, the run raises `IdentityChangedError` and the invocation fails (so the `Errors` alarm fires). It logs at ERROR, stable text for a metric filter to match: `identity changed for handle <handle>: stored user_id <old>, now <new>; nothing ingested`. The lookup happens when the stored ID is missing or older than `USER_ID_TTL_HOURS`, so a takeover is caught at the next expiry (up to 24 h by default); until then the cached ID keeps reading the original account, never the new owner. A timeline response of "user not found" for a cached ID also triggers a fresh lookup with the same check. No Tweet of the new owner is ever enqueued. On a lookup-time change nothing is enqueued and the state is untouched. On the cached-ID not-found path, pages enqueued earlier in that run stay enqueued and a backfill requested by the event has already been saved; nothing is lost or attributed to the wrong account. A CloudWatch metric and alarm on that log text is planned (#19); until then the failed invocation is the signal.
+
+The first time a handle is tied to an ID (a new account, an item from before `user_id` existed, or one whose `user_id` was removed) the run logs a WARNING, `binding handle <handle> to user_id <id> (no user ID was stored)`. That is the one moment a takeover could not be told apart from the account itself, so check it is the account you mean.
+
+**Runbook after an identity change (or when the old handle is freed).** The schedule carries no input, so every run keeps using `TwitterUsername`. The old handle's state item is what catches the takeover: never delete it or its `user_id`, or the next run binds the handle to its new owner and ingests that person's posts.
+
+1. Stop the bleeding first: either set `TwitterUsername` to the account's new handle and redeploy, or disable the schedule (`ScheduleState=false`).
+2. Optionally carry the cursor over so the new handle does not refetch everything. Read the old item, then write a new item under the new handle (lower case) with the same `newest_id`, `gaps` and `user_id` (set `user_id_resolved_at` to now, `version` to 1):
+
+   ```bash
+   aws dynamodb get-item --table-name "$STATE_TABLE" --consistent-read \
+     --key '{"username": {"S": "<old handle>"}}'
+   aws dynamodb put-item --table-name "$STATE_TABLE" --item '{
+     "username": {"S": "<new handle>"}, "user_id": {"S": "<original id>"},
+     "user_id_resolved_at": {"S": "<now, e.g. 2026-10-01T12:00:00Z>"},
+     "newest_id": {"N": "<newest_id>"}, "gaps": {"L": []}, "version": {"N": "1"}}'
+   ```
+
+   Copy `gaps` as read (or `[]` to drop them). Without this step the new handle starts from scratch and fetches the account's most recent ~3,200 posts, as a first run does. Stored Tweets are not affected either way.
+3. If the old handle is simply freed (nobody took it), runs after the TTL expires fail with a not-found error until you do step 1; the cached ID is used until then.
+4. If you really want the handle's new owner under the old handle, that is a new account for this pipeline: use a different state table or the new-handle approach above, not the old item.
+
+The event may carry `"user_id": "<numeric id>"` as an assertion: it must equal the stored ID, and when none is stored the handle is looked up and must resolve to it (otherwise `IdentityChangedError`). It never replaces a lookup, so it cannot bind a handle to an ID the handle does not have. The CLI `--dry-run` has no state table and resolves the handle on every call.
+
 ### S3 media bucket
 
 Key layout:
@@ -207,7 +274,7 @@ Key layout:
 media/<author_id>/<tweet_id>/<media_key><extension>
 ```
 
-If a Tweet has no `author_id`, the lower-cased username is used instead. The key is deterministic, so a repeat delivery finds the object and skips the download. Photos are fetched at original size (`name=orig`, other query parameters are kept). For videos and animated GIFs, the highest-bit-rate `video/mp4` variant is stored.
+If a Tweet has no `author_id`, the lower-cased username is used instead. The key is deterministic, so a repeat delivery finds the object and skips the download. Photos are fetched at original size (`name=orig`, other query parameters are kept). For videos and animated GIFs, the highest-bit-rate `video/mp4` variant is stored, and the poster frame (`preview_image_url`) goes next to it as `media/<author_id>/<tweet_id>/<media_key>_preview.jpg`.
 
 The same bucket also holds the full text of oversized long posts at `text/<author_id>/<tweet_id>.json` (a JSON string, `application/json`, user metadata `tweet-id`); see the Tweets table. These objects are not tiered.
 
@@ -220,7 +287,7 @@ Each object has the `Content-Type` of the source and user metadata `tweet-id`, `
 - **Cursor after enqueue, per page.** The cursor is saved only after a page's messages are enqueued, so a failed run re-sends at most the page in flight (harmless duplicates) rather than losing any, and a capped or failed run leaves a recorded gap instead of a hole.
 - **Overlapping fetch runs are harmless.** The fetch function has no reserved concurrency. The cursor write is conditional on a version, so a run that lost a race stops instead of overwriting, and duplicate messages are handled by idempotent processing.
 - **Partial batch responses, DLQ and alarms.** `ProcessFunction` returns the IDs of failed records, so one bad message does not retry the other nine. Transient media errors (timeouts, 429, 5xx) fail the record for retry, until its last receive (see below). Malformed messages and unexpected errors fail it too and end up in the DLQ after `MaxReceiveCount` receives (kept 14 days). `MediaRetryFunction` works the same way on its own queue (`BatchSize` 1): a failed retry is redelivered and ends up in the media-retry DLQ after `MediaRetryMaxReceiveCount` receives. Alarms cover a non-empty DLQ, a non-empty media-retry DLQ, fetch errors (1 hour window) and whole-invocation process errors (5 minute window). Because of partial batch responses, a failed record is not a Lambda `Errors` datapoint, so the two DLQ alarms are the signal for record-level failures. DLQ messages expire after 14 days. Set `AlarmTopicArn` to get notified through SNS.
-- **A media failure on the last receive is queued, never dropped.** On a message's last receive (`MaxReceiveCount`) the process function does not fail the record for media it cannot store. For each such media item it runs the cheap checks first (not an allowed source: `skipped`; too big by estimate: `too_large`; already in S3: `exists`), and records what it still cannot store as `retrying` with its `source_url`. It writes the Tweet and then sends one message per `retrying` item to the media-retry queue. If a send fails, the record is reported failed instead and goes to the main DLQ (alarm), so a retry is never lost silently. It does not send retries when its write was skipped as stale, since the newer item has its own media state. Retries can duplicate (a redelivered Tweet message may queue them again); the consumer's conditional update makes that harmless.
+- **A media failure on the last receive is queued, never dropped.** On a message's last receive (`MaxReceiveCount`) the process function does not fail the record for media it cannot store. For each such media item it runs the cheap checks first (not an allowed source: `skipped`; too big by estimate: `too_large`; already in S3: `exists`; a poster frame not yet in S3 keeps the entry `retrying` whatever the file's own result), and records what it still cannot store as `retrying` with its `source_url`. It writes the Tweet and then sends one message per `retrying` item to the media-retry queue. If a send fails, the record is reported failed instead and goes to the main DLQ (alarm), so a retry is never lost silently. It does not send retries when its write was skipped as stale, since the newer item has its own media state. Retries can duplicate (a redelivered Tweet message may queue them again); the consumer's conditional update makes that harmless.
 - **Streaming uploads.** Media is downloaded only over https from `pbs.twimg.com` and `video.twimg.com` (message bodies are treated as untrusted), redirects are not followed, and the file is streamed from the CDN straight into S3 `upload_fileobj` through a small file-like adapter, so a large video is never held in memory.
 - **Least-privilege IAM.** The fetch function can send to its queue, read one secret, and get/put items in the state table. The process function can write to the tweets table, put/get objects in the bucket and list it (so a missing key is a 404, not a 403), and send to the media-retry queue only. The media-retry function can get and update items in the tweets table (no `PutItem`) and put/get/abort/list on the bucket; it has no SQS permissions beyond its event source. None can touch the others' resources.
 - **Secrets handling.** The stack creates an empty secret, so the token is never in the template, a parameter or an environment variable. `scripts/put_secret.sh` fills it in without putting the token in the process arguments. The fetch function only gets the secret's ARN. It caches the token for 15 minutes, so a rotated secret is picked up without a redeploy, and drops the cache on a 401/403. The token is sent only in the `Authorization` header and is excluded from log output and `repr`. The AWS SDK and HTTP library loggers (`botocore`, `boto3`, `s3transfer`, `urllib3`, `httpcore`, `httpx`) are held at WARNING even when `LogLevel` is `DEBUG`, since at DEBUG they can log secret values.
@@ -251,11 +318,29 @@ raw/<user_id>/dt=YYYY-MM-DD/<run_id>-<page_no>.json.gz
 
 `request.params` holds the query parameters (the bearer token is a header and is never stored); `response` is the body as received. `fetched_at` is the same value the page's messages carry. Each message has an optional `raw_key` (additive, `schema_version` stays 1) and the Tweet item stores it as `raw_key`, so any item can be traced to the page it came from.
 
-Pages are written once (`If-None-Match: *`; an existing key is the same page from an earlier attempt and is left alone). The `FetchFunction` role may only `s3:PutObject` under `raw/*`, and `ProcessFunction` is limited to `media/*` and `text/*`, so neither can overwrite or delete a raw page; only `ComplianceFunction` can, to redact a purged Tweet. No lifecycle rule touches `raw/`: nothing is expired, and noncurrent versions are expired only under `media/` and `text/`. There is no storage-class transition either: gzipped pages are far below the 128 KB minimum S3 applies to lifecycle transitions, so one would do nothing. The pages are encrypted, private and versioned like the media.
+Pages are written once (`If-None-Match: *`; an existing key is the same page from an earlier attempt and is left alone). The `FetchFunction` role may only `s3:PutObject` under `raw/*` and `quarantine/*` (see [Quarantine](#quarantine)), and `ProcessFunction` may write `media/*` and `text/*`, delete under `text/*` only (the text of an original that became unavailable) and only read `raw/*` (to fill in referenced note texts left out of an oversized message), so neither can overwrite or delete a raw page; only `ComplianceFunction` can, to redact a purged Tweet. No lifecycle rule touches `raw/`: nothing is expired, and noncurrent versions are expired only under `media/` and `text/`. There is no storage-class transition either: gzipped pages are far below the 128 KB minimum S3 applies to lifecycle transitions, so one would do nothing. The pages are encrypted, private and versioned like the media.
 
 A page the parser rejects (valid JSON of an unexpected shape) is landed first and then fails the run with the cursor unmoved, so the data is kept and can be replayed once the parser is fixed.
 
 **Retention and deletion.** A raw page holds up to 100 Tweets, so it is never deleted for one Tweet; pages are kept indefinitely. When a Tweet is purged (see [Data classification, retention and deletion](#data-classification-retention-and-deletion)), the compliance job rewrites every raw page that holds it: the Tweet and any `includes.media` only it used are removed, its ID is added to the envelope field `redactions` (a list of Tweet IDs), the page is put back at the same key and the older versions of that key are deleted. `replay` never replays a Tweet listed in `redactions`.
+
+### Quarantine
+
+Nothing is dropped, and one bad item doesn't block an account. Parsing is per item: a Tweet (or an `includes.media` object) that fails to parse, for example a `null` metric, is *quarantined* and the rest of the page is enqueued. A bad media object is treated as missing for its Tweet, which is still stored. The cursor may move past a quarantined Tweet because it is kept twice: in the raw page and in a quarantine object. A Tweet whose `id` is not a decimal string counts as unparseable. A quarantined Tweet's ID moves the cursor only when it lies inside the page's own ID range (its parsed Tweets and `meta.oldest_id`..`newest_id`); otherwise it is treated as having no ID, so a bogus ID can't skip real Tweets.
+
+```text
+quarantine/<user_id>/dt=YYYY-MM-DD/<run_id>-<page_no>-<index>.json
+```
+
+Each object is plain JSON (`application/json`): `{"kind": "tweet" | "media" | "included_tweet" | "included_user" | "message", "raw_key": "<the raw page>", "error": "...", "item": <the JSON as received>}`. `run_id` and `page_no` match the raw page's key (`index` counts the page's quarantined items from 000). A `message` is an SQS message body that SQS rejected with `SenderFault` (a body SQS refuses as invalid; one over the size limit never gets that far, it fails the page first): such an entry would fail the same way again, so it isn't retried, it is quarantined and the run goes on. Entries that failed for other reasons are still retried, and `EnqueueError` is raised if they keep failing.
+
+If a quarantine write fails (or there is no media bucket to write to: `fetch --no-raw` without `MEDIA_BUCKET` is unsafe for malformed pages, they fail the run), the page fails like a failed raw upload and the cursor stays, so the next run fetches it again. For an unparseable Tweet or media object nothing from the page is enqueued, because those are written before any message is sent. For a `message` object, messages sent earlier in the page stay enqueued; the re-send is a harmless duplicate. The `FetchFunction` role may `s3:PutObject` under `quarantine/*` only.
+
+Every quarantined item logs a stable line: `unparseable <kind> quarantined: id=... error=...` (ERROR, when parsed) and `quarantined <kind>: key=... raw_key=... error=...` (WARNING, when written). Errors alongside data log `timeline page N has K partial error(s); first: ...` (WARNING). Metrics and alarms for unparseable or quarantined items and for partial errors come with issue #19; until then these log lines are the signal.
+
+**Inspect and recover.** List and read the objects with `aws s3 ls "s3://$BUCKET/quarantine/$USER_ID/" --recursive` and `aws s3 cp <key> -`. To recover Tweets and media, fix the parser, then replay the raw prefix: `twitter-pipeline replay --raw s3://$BUCKET/raw/<user_id>/dt=.../` (see [Replay raw pages](#replay-raw-pages)). Replay re-parses the raw pages with the fixed code, so the formerly quarantined items are parsed this time; anything that still fails is quarantined again, with the replay's own run ID. For a `message` object, `item` is the message body: fix the cause and send it with `aws sqs send-message --queue-url "$QUEUE" --message-body "$(aws s3 cp <key> - | jq -c .item)"` (`item` is the parsed body, so `jq -c .item` turns it back into one JSON line).
+
+**Errors-only responses.** A 200 with `errors` and no `data` is never read as an empty timeline. It raises a typed error and the run fails: `AccessError` for the problem type `not-authorized-for-resource` (e.g. the account went protected), `NotFoundError` for `resource-not-found`, a plain `XApiError` for any other.
 
 ## Repository layout
 
@@ -274,6 +359,9 @@ A page the parser rejects (valid JSON of an unexpected shape) is landed first an
 ├── scripts/
 │   ├── build_lambda.sh                build build/lambda/ for Python 3.14 on arm64
 │   ├── deploy.sh                      build, then sam deploy
+│   ├── integration_test.sh            run the integration tests with Docker (see below)
+│   ├── check_iam.sh                   offline IAM policy check of the template
+│   ├── expand_sam_template.py         expand the SAM transform (used by check_iam.sh)
 │   ├── put_secret.sh                  store the bearer token in Secrets Manager
 │   └── delete.sh                      delete the stack
 ├── src/twitter_timeline_data_pipeline/
@@ -282,6 +370,7 @@ A page the parser rejects (valid JSON of an unexpected shape) is landed first an
 │   ├── x_api.py                       X API v2 client (retries, rate limits, pagination)
 │   ├── models.py                      Tweet, Media, SQS messages (schema_version 1)
 │   ├── raw.py                         raw API pages: envelope, S3 keys, writer, reader
+│   ├── quarantine.py                  quarantine objects: key layout and writer
 │   ├── replay.py                      rebuild messages from raw pages (no API calls)
 │   ├── storage.py                     DynamoDB and S3 persistence, checkpoint store
 │   ├── cli.py                         `twitter-pipeline` command
@@ -291,6 +380,8 @@ A page the parser rejects (valid JSON of an unexpected shape) is landed first an
 │       ├── media_retry.py             MediaRetryFunction handler
 │       └── compliance.py              ComplianceFunction handler: tombstone and purge
 └── tests/                             moto-mocked tests, no AWS account needed
+    ├── system/                        in-process simulation of the event source mapping and DLQ
+    └── integration/                   built bundle in the Lambda runtime image, with LocalStack
 ```
 
 ## Local development
@@ -316,9 +407,10 @@ uv build                     # build the sdist and wheel into dist/
 | Format | `ruff format --check` |
 | Type check | `mypy` (strict) |
 | Test | `pytest` with coverage on Python 3.14 and 3.15; 3.15 shows readiness for the next Lambda runtime. JUnit and coverage reports are uploaded as artifacts |
-| Validate template | `cfn-lint template.yaml` and `shellcheck scripts/*.sh` |
+| Validate template | `cfn-lint template.yaml`, `shellcheck scripts/*.sh`, and the offline IAM check (`scripts/check_iam.sh`; see [IAM policy validation](#iam-policy-validation)) |
 | Build | After all of the above: `uv build`, a smoke test of the wheel in an isolated environment (import, `--help`, `--version`), and the Lambda bundle zipped as `twitter_timeline_data_pipeline-<version>-lambda-arm64.zip` |
-| GitHub Release | On `v*` tags only: checks the tag, then creates the release |
+| Integration | After Build: runs the Lambda zip that Build produced in the real Lambda runtime image against LocalStack (see [Integration tests](#integration-tests)) |
+| GitHub Release | On `v*` tags only, after Build and Integration: checks the tag, then creates the release |
 
 ### Cutting a release
 
@@ -344,6 +436,66 @@ This repository is private, and publishing to PyPI would make the package public
 2. Create the `pypi` environment in the repository settings, ideally limited to `v*` tags with required reviewers.
 3. Set the repository variable `PUBLISH_TO_PYPI` to `true`.
 
+## Integration tests
+
+The unit tests and the in-process simulation in `tests/system/` import the source tree. The integration tests run the **built Lambda bundle** (`build/lambda/`, the same files as the release zip) in the real Lambda runtime image, so a missing dependency, a wrong-platform wheel or a bad handler path fails before a deploy does.
+
+**What runs where**
+
+- Each of the three functions runs the unzipped bundle in `public.ecr.aws/lambda/python:3.14` for `linux/arm64`, through the image's built-in Runtime Interface Emulator, and is invoked over its HTTP API. On an amd64 host (the CI runner) the image runs under QEMU.
+- [LocalStack](https://github.com/localstack/localstack) (pinned to `4.14.0`) provides SQS, S3, DynamoDB and Secrets Manager. The functions reach it through `AWS_ENDPOINT_URL`.
+- `tests/integration/stub_server.py` (standard library only, started with `uv run`) stands in for the X API and the media CDN. It needs the bearer token, so the fetch function really reads it from Secrets Manager.
+- The tests (`tests/integration/`) assert that fetched Tweets land in DynamoDB and their media in S3 (and that a media file that is gone at the source is recorded as `unavailable`), that a second fetch uses the saved checkpoint, that a poison message is received `maxReceiveCount` times and then sits in the dead-letter queue, and that in a mixed batch only the failing record is redelivered (the partial batch response).
+
+**What is emulated, and how it differs from a deployment**
+
+- The tables, bucket, queues and secret are created from the properties in `template.yaml` (key schemas, indexes, versioning, message sizes, and each function's `Environment` block with every `!Ref` resolved), not by deploying the template: LocalStack's community edition has no Python 3.14 Lambda runtime. If a function gains an environment variable that the harness cannot resolve, the run fails instead of silently going without it.
+- Queue visibility timeouts are 2 seconds and `maxReceiveCount` is 3, so the poison-message test takes seconds. The poller in `tests/integration/esm.py` plays the Lambda event source mapping: it receives a batch, invokes the function with the SQS event shape, and deletes only the records not listed in `batchItemFailures`. The visibility timeout, receive counts and the move to the dead-letter queue are LocalStack's SQS. What the real mapping adds (scaling, batching window, `MaximumConcurrency`) is not emulated.
+- Encryption, point-in-time recovery, lifecycle rules, IAM, alarms, tracing and the schedule are not emulated. The media-retry path is exercised for real: the stub CDN answers 503, the process function runs out of receives and queues a retry, then the media-retry function stores the file. The queued retry is delayed 5 minutes in the code, so the test checks that it is queued and delayed, then sends an undelayed copy of the same message.
+- The process function may download only from `pbs.twimg.com` and `video.twimg.com`. The stub is on another host, so the tests set the test-only variable `MEDIA_ALLOWED_HOSTS_OVERRIDE` (comma-separated bare hostnames, also allowed over plain http). The functions log a `WARNING` when it is active and ignore it, with an `ERROR`, unless `AWS_ENDPOINT_URL` is also set (as a second safeguard against it ever applying in a real deployment), and a template test fails if any function sets it. Never set it on a real deployment.
+
+**Running locally**
+
+You need Docker, `curl`, `python3` and uv. On a non-arm64 host, enable arm64 emulation once: `docker run --privileged --rm tonistiigi/binfmt --install arm64`.
+
+```bash
+scripts/build_lambda.sh             # or unzip a CI "lambda" artifact into build/lambda/
+scripts/integration_test.sh         # start everything, run the tests, clean up; logs print on failure
+
+# or step by step, to iterate on the tests against a running stack:
+scripts/integration_test.sh up
+scripts/integration_test.sh test
+scripts/integration_test.sh logs
+scripts/integration_test.sh down
+```
+
+The first run pulls two images, and the arm64 image under emulation starts slowly. The integration tests are not collected by a plain `uv run pytest`; the script sets `RUN_INTEGRATION=1` and the `IT_*` variables the fixtures read. LocalStack releases after `4.14.0` require an account auth token: set `LOCALSTACK_AUTH_TOKEN` (the CI job passes the repository secret of that name through when it exists) and change `LOCALSTACK_IMAGE` if you move to a newer release.
+
+**In CI**
+
+The LocalStack and QEMU (binfmt) images are pinned by digest. The `integration` job downloads the `lambda` artifact that the Build job uploaded, unzips it, sets up QEMU, and runs `scripts/integration_test.sh up`, then `test`, then (on failure) `logs`, and always `down`. Each is a separate step, so a failure names the stage. The arm64 hosted runners are not assumed to exist for a private repository; if they are available, the QEMU step can be dropped.
+
+### IAM policy validation
+
+IAM Access Analyzer's `validate-policy` is the authoritative check, but it needs AWS credentials, which CI does not have. CI instead runs `scripts/check_iam.sh` in the template job: it expands the SAM transform offline (so the `Policies` shorthand becomes real IAM roles) and runs [checkov](https://www.checkov.io/)'s IAM checks on the result (the roles' trust policies, full `*:*` administrator statements and `*` actions, privilege escalation, data exfiltration, credentials exposure, permissions management, and write access without constraints). It does not flag wildcard resources, and the S3 bucket policy (`MediaBucketPolicy`) is not covered by these checks. The tools are pinned by version and by `--exclude-newer`. Any finding fails the job, and so does a run that checked nothing: the script requires at least three `AWS::IAM::Role` resources after expansion and at least one passed check on each. To accept a finding, add its ID to `WAIVED` in the script with the reason beside it; there are none today.
+
+To run Access Analyzer by hand, with credentials, against a deployed stack (the policies then have literal ARNs, which the template's `!Sub` and `!GetAtt` values are not):
+
+```bash
+STACK=twitter-timeline-pipeline
+for role in $(aws cloudformation describe-stack-resources --stack-name "$STACK" \
+    --query "StackResources[?ResourceType=='AWS::IAM::Role'].PhysicalResourceId" --output text); do
+  for policy in $(aws iam list-role-policies --role-name "$role" --query PolicyNames --output text); do
+    echo "== $role / $policy"
+    aws iam get-role-policy --role-name "$role" --policy-name "$policy" \
+      --query PolicyDocument --output json > "/tmp/$policy.json"
+    aws accessanalyzer validate-policy --policy-type IDENTITY_POLICY \
+      --policy-document "file:///tmp/$policy.json" \
+      --query 'findings[].[findingType,issueCode,findingDetails]' --output text
+  done
+done
+```
+
 ## Running locally
 
 The `twitter-pipeline` command runs the fetch step from a terminal. A dry run needs only a bearer token and makes no AWS calls:
@@ -365,7 +517,7 @@ uv run twitter-pipeline replay --raw "s3://$(out MediaBucketName)/raw/1000000001
 uv run twitter-pipeline replay --raw "s3://$(out MediaBucketName)/raw/1000000001/"
 ```
 
-`replay` lists every object under the prefix (it must start with `raw/`; a trailing `/` is added, so the prefix matches whole path segments: `raw/1` selects `raw/1/...`, not `raw/10/...`; from a whole user down to one `dt=` day), reads the envelopes, re-parses each response with the same code the fetch uses and enqueues the messages to `QUEUE_URL`, in key order. It calls no API and never reads or changes the fetch cursor. Messages are rebuilt with the envelope's `username`, its original `fetched_at` and the object's key as `raw_key`: for an unchanged parser the bodies are identical to what the fetch sent. Because `fetched_at` is the original one, the processor's conditional write keeps a replay from overwriting an item fetched later; it rewrites items of the same fetch. `--dry-run` prints the bodies to stdout and makes no queue calls. Zero-byte keys ending in `/` (console folders) are skipped and listed in the summary. An object that can't be read (not gzip, wrong envelope, an invalid `fetched_at`) stops the replay with its key in the error (exit 1), and so does a prefix with no pages (zero objects); the log has a `replayed <key>` line per object, and `--start-after <key>` resumes after the last one. Needed permissions: `s3:ListBucket` on the bucket (prefix `raw/`), `s3:GetObject` on `raw/*` and, unless `--dry-run`, `sqs:SendMessage` on the queue. a bad URI or a missing `QUEUE_URL` exits 2. Replay is safe to repeat. It is the way to reprocess after a parser change or to restore a wiped table; use the DLQ redrive below for messages that merely failed.
+`replay` lists every object under the prefix (it must start with `raw/`; a trailing `/` is added, so the prefix matches whole path segments: `raw/1` selects `raw/1/...`, not `raw/10/...`; from a whole user down to one `dt=` day), reads the envelopes, re-parses each response with the same code the fetch uses and enqueues the messages to `QUEUE_URL`, in key order. It calls no API and never reads or changes the fetch cursor. Messages are rebuilt with the envelope's `username`, its original `fetched_at` and the object's key as `raw_key`: for an unchanged parser the bodies are identical to what the fetch sent. Because `fetched_at` is the original one, the processor's conditional write keeps a replay from overwriting an item fetched later; it rewrites items of the same fetch. Items that fail to parse, and messages SQS rejects with `SenderFault`, are quarantined in the same bucket as in a fetch (see [Quarantine](#quarantine)); a dry run only logs them. `--dry-run` prints the bodies to stdout and makes no queue calls. Zero-byte keys ending in `/` (console folders) are skipped and listed in the summary. An object that can't be read (not gzip, wrong envelope, an invalid `fetched_at`) stops the replay with its key in the error (exit 1), and so does a prefix with no pages (zero objects); the log has a `replayed <key>` line per object, and `--start-after <key>` resumes after the last one. Needed permissions: `s3:ListBucket` on the bucket (prefix `raw/`), `s3:GetObject` on `raw/*` and, unless `--dry-run`, `sqs:SendMessage` on the queue and `s3:PutObject` on `quarantine/*` (for items that fail to parse). a bad URI or a missing `QUEUE_URL` exits 2. Replay is safe to repeat. It is the way to reprocess after a parser change or to restore a wiped table; use the DLQ redrive below for messages that merely failed.
 
 ### Environment variables
 
@@ -380,13 +532,17 @@ uv run twitter-pipeline replay --raw "s3://$(out MediaBucketName)/raw/1000000001
 | `MEDIA_BUCKET` | fetch, process, media-retry, CLI fetch | none | Name of the media bucket. The fetch needs it to land raw pages and fails without it. A non-dry CLI fetch also requires it (exit 2) unless `--no-raw` is given: the fetch moves the shared cursor, so skipping raw pages loses them for good |
 | `MAX_RESULTS` | fetch | `100` | Tweets per API page, 5 to 100 |
 | `MAX_PAGES` | fetch | `5` | Maximum pages per run, at least 1 |
+| `EXPAND_REFERENCED_TWEETS` | fetch | `true` | Request the posts each Tweet retweets, quotes or replies to, with their authors. Under pay-per-use these may be billed as reads. `true` or `false` |
+| `REQUEST_ENTITIES` | fetch | `true` | Request `entities`, `in_reply_to_user_id`, `possibly_sensitive`, `edit_controls` and `withheld`. `true` or `false` |
+| `USER_ID_TTL_HOURS` | fetch | `24` | Hours a stored user ID is reused before the handle is looked up again; 0 looks it up on every run, at most 8760. Set from the `UserIdTtlHours` parameter |
 | `X_API_BASE_URL` | fetch | `https://api.x.com/2` | API base URL, for testing against a stub |
 | `HTTP_TIMEOUT_SECONDS` | both | `10` | Timeout for API and media HTTP requests, must be above 0 |
+| `MEDIA_ALLOWED_HOSTS_OVERRIDE` | process, media-retry | none | Test only: extra media hosts (comma-separated bare hostnames, http allowed). Logs a warning; the template never sets it |
 | `MAX_MEDIA_BYTES` | process, media-retry | `536870912` (512 MiB) | Largest media file stored, must be above 0 |
 | `MAX_RECEIVE_COUNT` | process | none | The queue's `maxReceiveCount`; on a message's last receive its failing media are recorded as `retrying` and queued for the media-retry function instead of failing the record. Unset disables this. At least 1 |
 | `MEDIA_RETRY_QUEUE_URL` | process | none | URL of the media-retry queue |
 
-Blank values count as unset. The template sets everything except `TWITTER_BEARER_TOKEN`, `X_API_BASE_URL` and `HTTP_TIMEOUT_SECONDS`. It sets `MAX_MEDIA_BYTES` and `MAX_RECEIVE_COUNT` from the `MaxMediaBytes` and `MaxReceiveCount` parameters.
+Blank values count as unset. The template sets everything except `TWITTER_BEARER_TOKEN`, `X_API_BASE_URL`, `HTTP_TIMEOUT_SECONDS` and `MEDIA_ALLOWED_HOSTS_OVERRIDE`. It sets `MAX_MEDIA_BYTES` and `MAX_RECEIVE_COUNT` from the `MaxMediaBytes` and `MaxReceiveCount` parameters, and `EXPAND_REFERENCED_TWEETS` and `REQUEST_ENTITIES` from `ExpandReferencedTweets` and `RequestEntities`.
 
 ## Deploying
 
@@ -434,6 +590,8 @@ Extra arguments are passed to `sam deploy`, for example `scripts/deploy.sh --reg
 | `ScheduleEnabled` | `true` | Set to `false` to disable the schedule rule |
 | `MaxPages` | `5` | Maximum timeline pages per run |
 | `MaxResults` | `100` | Tweets per page (5 to 100) |
+| `ExpandReferencedTweets` | `true` | Sets `EXPAND_REFERENCED_TWEETS`: also request referenced posts and their authors (possibly billed as extra reads under pay-per-use) |
+| `RequestEntities` | `true` | Sets `REQUEST_ENTITIES`: also request entities and the extra per-Tweet fields |
 | `MaxMediaBytes` | `536870912` | Largest media file stored, in bytes; bigger ones are recorded as `too_large` |
 | `MaxReceiveCount` | `5` | Receives before a message moves to the DLQ; also tells the process function which receive is the last, when it queues unstored media for retry instead of failing the record |
 | `MediaRetryMaxReceiveCount` | `10` | Receives of a media-retry message before it moves to the media-retry DLQ (at least 5,400 s apart) |
@@ -639,14 +797,15 @@ The script reads the table and bucket names from the stack outputs, runs `sam de
 - X API access now requires a paid plan. Billing is currently pay-per-use, charged per post read, and rate limits depend on the plan; check current pricing before deploying. Cost scales with Tweets read per run, which is bounded by `MaxPages x MaxResults` and multiplied by the schedule frequency, so lower `MaxPages` or run less often to spend less.
 - Each run fetches at most `MAX_PAGES x MAX_RESULTS` Tweets (500 by default), but nothing is skipped when that is not enough: the remainder is kept as a gap and fetched by later runs, so a first run backfills over several runs. The API itself only exposes an account's 3,200 most recent Tweets (800 with `exclude=replies`); Tweets that age out of that window before they are fetched are unreachable, and the gap covering them is dropped with a warning after 3 consecutive empty runs spanning at least 24 hours. If `MAX_PAGES x MAX_RESULTS` per run is lower than the account's posting rate, gaps accumulate; raise `MaxPages` or run more often.
 - Media downloads are bounded. A file over `MaxMediaBytes` is recorded as `too_large`, judged before downloading from a video's `bit_rate x duration_ms` or the response `Content-Length`, or while streaming from the bytes counted; nothing is left in S3 and the Tweet is still stored. The function also watches the invocation's remaining time. It runs a batch's records cheapest first (estimated media bytes; text-only and photos before videos, videos of unknown size last; a record whose estimate can't be computed counts as free), so a slow video is tried after its siblings. It stops starting records once under 20 s remain (room for one stalled read, finishing or aborting an upload, and the DynamoDB write) and returns the rest in `batchItemFailures`, so only those are retried. Each download gets the time left minus that margin, split across connect, headers and body reads, and fails as a transient error when it runs out; the upload is aborted. On a message's last receive (`MaxReceiveCount`) a media failure of any kind no longer fails the record: the media gets the cheap checks (`skipped`, `too_large`, `exists`) and otherwise is recorded as `retrying` with its `source_url`, the Tweet is written, and a media-retry message is queued for it. A last-receive record that cannot be started for lack of time is handled the same way (every media queued for retry, no download and no S3 call when under 3 s remain) if at least 3 s remain. The media-retry function has a 900 s timeout and one message per invocation, so a video that needs more than about 880 s of download time never completes there: it lands in the media-retry DLQ (alarm) with its metadata and `source_url`, for manual handling. Other limits: a record left unstarted on its last receive with under 3 s left still goes to the DLQ without metadata (alarm; the message is intact, so a redrive works); a retry message that cannot be sent fails its record into the main DLQ the same way; and `BatchSize` stays at 10, so a slow download delays the records behind it until the next invocation. Lower `BatchSize` (keeping it within the visibility timeout rule) for media-heavy accounts.
-- A media key that is missing from the response's `includes` (deleted or withheld media) is dropped with a warning, so the Tweet is stored without that media entry.
+- A media key that is missing from the response's `includes` (deleted or withheld media) is logged with a warning and stored as a `missing` entry, so the item's `media_keys` and `media_count` still show what the Tweet attached. There is no metric for it yet.
 - Tweet writes are conditional on `fetched_at` and `schema_version`, so an older delivery never replaces a newer item. Fetch runs less than a second apart can't be ordered, and there is no stale-write metric yet, only an INFO log line. A stale message still runs the media step first: usually one `HeadObject` per media item, which can leave an S3 object the stored item doesn't reference, and a transient media error on a stale message still fails it for retry. The fetch time must be a valid UTC-convertible ISO 8601 string no more than 5 minutes ahead; other messages are rejected as malformed.
 - Edited Tweets get a new ID and are stored as new items; the old ones remain. `edit_history_tweet_ids` links them.
 - Deletions at the source are propagated by the compliance function, with the delays described in [Data classification, retention and deletion](#data-classification-retention-and-deletion). Between a deletion and the next compliance run the Tweet is still stored.
+- A re-fetch never erases richer data, except where the API says the data is gone. The stored item is read on every write and merged (`carry_forward`) under the revision guard. `in_reply_to_user_id` is always kept. `entities`, `display_entities`, `possibly_sensitive`, `edit_controls` and `withheld` are kept when the message did not ask the API for them (`requested.entities` is false or absent, e.g. `REQUEST_ENTITIES` off); when it did, the answer wins, absent included. A referenced post the API said nothing about (`EXPAND_REFERENCED_TWEETS` off) keeps its stored copy (text, author, date, entities, or a stored `unavailable` status) with `stale_since` (the first fetch without it) and `last_seen_fetched_at`. A referenced original reported `unavailable` (deleted, protected or withheld) does not keep its copy: deletion wins. Its text, author and S3 object are dropped (the object is deleted after the write; a failed delete is logged) and only `{id, type, status, unavailable_since}` remain. An include entry that fails to parse is quarantined (`included_tweet`, `included_user`) and its reference is kept without a status, so a stored copy survives a parser fault.
 - Metrics (`public_metrics`) are a snapshot at fetch time and are not refreshed.
-- Videos that only have HLS variants (no `video/mp4`) are recorded with status `skipped` and nothing is downloaded.
+- Videos that only have HLS variants (no `video/mp4`) are recorded with status `skipped_hls`: only the poster frame is stored, and the playlist URL stays in `variants`.
 - Media whose download returns a 4xx other than 429, or a redirect, is recorded as `unavailable`; the Tweet is still stored. Media at a non-https URL or a host other than the two X CDN hosts is recorded as `skipped`. 429 and 5xx responses and timeouts are retried.
-- One account is fetched per stack through `TwitterUsername`. The fetch event can override the username; names are normalized to lower case, with each account keeping its own cursor.
+- One account is fetched per stack through `TwitterUsername`. The fetch event can override the username (and may carry `user_id`); names are normalized to lower case, with each account keeping its own cursor.
 - The bearer token is app-only, so protected accounts and private data are not available.
 
 ## Python 3.14 features used

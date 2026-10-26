@@ -23,13 +23,17 @@ from twitter_timeline_data_pipeline.models import (
     MessageError,
     TweetMessage,
 )
+from twitter_timeline_data_pipeline.raw import restore_referenced_notes
 from twitter_timeline_data_pipeline.storage import (
+    MEDIA_HOSTS_OVERRIDE_ENV,
     MediaRetryQueue,
     MediaStore,
     StoredMedia,
     TransientMediaError,
     TweetStore,
+    WriteContentionError,
     estimated_size,
+    media_hosts_override,
 )
 
 if TYPE_CHECKING:
@@ -87,6 +91,7 @@ def process_records(
     remaining_ms: Callable[[], int] | None = None,
     max_receive_count: int | None = None,
     retry_queue: MediaRetryQueue | None = None,
+    restore_notes: Callable[[TweetMessage], TweetMessage] | None = None,
 ) -> list[str]:
     """Process SQS records; return the ``messageId`` of each one that failed.
 
@@ -136,6 +141,19 @@ def process_records(
                     message_id,
                 )
                 continue
+            if message.has_omitted_notes:
+                # Left out of the body to fit SQS's limit; read back from the raw page
+                # (an error here retries the record, it is never stored without them).
+                if restore_notes is None:
+                    raise MessageError("referenced notes omitted, no raw page reader")
+                message = restore_notes(message)
+            if message.missing_media_keys:
+                logger.warning(
+                    "tweet %s: media keys missing from includes, recorded as "
+                    "missing: %s",
+                    message.tweet.id,
+                    list(message.missing_media_keys),
+                )
             # Media first: a transient failure must leave no metadata that points at
             # media that isn't there.
             stored: list[StoredMedia] = []
@@ -171,7 +189,7 @@ def process_records(
         except MessageError:
             logger.exception("message %s is malformed", message_id)
             failed.append(message_id)
-        except TransientMediaError as exc:
+        except (TransientMediaError, WriteContentionError) as exc:
             logger.warning("message %s will be retried: %s", message_id, exc)
             failed.append(message_id)
         except Exception:
@@ -278,6 +296,21 @@ def _http_client(timeout: float) -> httpx.Client:
 
 
 @functools.cache
+def _test_media_hosts() -> frozenset[str]:
+    """Hosts from the test-only allowlist override; cached so the warning is logged
+    once per container, on its first invocation."""
+    hosts = media_hosts_override()
+    if hosts:
+        logger.warning(
+            "%s is set: media downloads are also allowed from %s over http or https. "
+            "This is for integration tests and must never be set in a real deployment.",
+            MEDIA_HOSTS_OVERRIDE_ENV,
+            sorted(hosts),
+        )
+    return hosts
+
+
+@functools.cache
 def _tweet_store(table_name: str, bucket: str, retention_days: int = 0) -> TweetStore:
     dynamodb = boto3.resource("dynamodb", config=_short_timeouts())
     return TweetStore(
@@ -302,6 +335,7 @@ def handler(event: Any, context: Any) -> dict[str, list[dict[str, str]]]:
             settings.media_bucket,
             _http_client(settings.http_timeout),
             max_bytes=settings.max_media_bytes,
+            test_hosts=_test_media_hosts(),
         ),
         tweet_store=_tweet_store(
             settings.tweets_table, settings.media_bucket, settings.retention_days
@@ -309,5 +343,8 @@ def handler(event: Any, context: Any) -> dict[str, list[dict[str, str]]]:
         remaining_ms=getattr(context, "get_remaining_time_in_millis", None),
         max_receive_count=settings.max_receive_count,
         retry_queue=MediaRetryQueue(_sqs_client(), settings.media_retry_queue_url),
+        restore_notes=functools.partial(
+            restore_referenced_notes, _s3_client(), settings.media_bucket
+        ),
     )
     return {"batchItemFailures": [{"itemIdentifier": i} for i in failed]}

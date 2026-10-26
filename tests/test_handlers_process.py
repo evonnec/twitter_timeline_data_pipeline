@@ -1,6 +1,7 @@
 import json
 import logging
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
 
@@ -44,6 +45,7 @@ from twitter_timeline_data_pipeline.storage import (
     MediaStore,
     PutResult,
     TweetStore,
+    WriteContentionError,
 )
 
 SAMPLE_EVENT = Path(__file__).parent.parent / "events" / "sqs.json"
@@ -512,6 +514,7 @@ def test_final_receive_after_a_slow_download_writes_the_tweet_and_queues_a_retry
             "status": "retrying",
             "source_url": VIDEO_HI_URL,
             "s3_key": f"media/{USER_ID}/{GOOD}/7_{GOOD}.mp4",
+            "variants": [{"content_type": "video/mp4", "url": VIDEO_HI_URL}],
         }
     ]
     (retry,) = queue.sent
@@ -1244,3 +1247,132 @@ def test_aws_client_factories_are_cached(aws: Aws) -> None:
     assert process._s3_client() is process._s3_client()
     assert process._tweet_store("t", "b") is process._tweet_store("t", "b")
     assert process._tweet_store("t", "b") is not process._tweet_store("u", "b")
+
+
+# ---- poster frames and missing keys (#17) -------------------------------------
+
+PREVIEW_URL = "https://pbs.twimg.com/ext_tw_video_thumb/1/pu/img/p.jpg"
+
+
+def preview_video_message() -> TweetMessage:
+    return video_message(
+        GOOD,
+        preview_image_url=PREVIEW_URL,
+        alt_text="clip",
+        variants=[{"content_type": "video/mp4", "url": VIDEO_HI_URL}],
+    )
+
+
+def run_preview_record(
+    aws: Aws, cdn: CdnStub, message: TweetMessage, receive: str
+) -> tuple[list[str], RecordingRetryQueue]:
+    queue = RecordingRetryQueue()
+    failed = process_records(
+        [receives(sqs_record("m1", body(message)), receive)],
+        media_store=MediaStore(aws.s3, aws.bucket, cdn.client()),
+        tweet_store=TweetStore(aws.tweets_table, aws.s3, aws.bucket),
+        max_receive_count=5,
+        retry_queue=queue,
+    )
+    return failed, queue
+
+
+def preview_cdn(preview_status: int | None) -> CdnStub:
+    cdn = CdnStub()
+    cdn.serve(VIDEO_HI_URL, b"video", "video/mp4")
+    if preview_status is None:
+        cdn.serve(PREVIEW_URL, b"poster", "image/jpeg")
+    else:
+        cdn.fail(PREVIEW_URL, preview_status)
+    return cdn
+
+
+def test_a_transient_poster_frame_failure_is_retried_before_the_last_receive(
+    aws: Aws,
+) -> None:
+    failed, queue = run_preview_record(
+        aws, preview_cdn(503), preview_video_message(), "2"
+    )
+
+    assert failed == ["m1"]
+    assert queue.sent == []
+    assert stored_tweet_ids(aws) == set()
+
+
+def test_a_poster_frame_that_fails_on_the_last_receive_is_queued_for_retry(
+    aws: Aws,
+) -> None:
+    failed, queue = run_preview_record(
+        aws, preview_cdn(503), preview_video_message(), "5"
+    )
+
+    assert failed == []
+    (entry,) = ddb_get(aws.tweets_table, tweet_id=GOOD)["media"]
+    assert entry["status"] == "retrying"
+    assert entry["preview_s3_key"] == f"media/{USER_ID}/{GOOD}/7_{GOOD}_preview.jpg"
+    assert entry["preview_image_url"] == PREVIEW_URL
+    assert entry["alt_text"] == "clip"
+    (retry,) = queue.sent
+    assert retry.media.preview_image_url == PREVIEW_URL
+
+
+def test_a_stored_poster_frame_is_referenced_on_the_item(aws: Aws) -> None:
+    failed, queue = run_preview_record(
+        aws, preview_cdn(None), preview_video_message(), "1"
+    )
+
+    assert failed == [] and queue.sent == []
+    (entry,) = ddb_get(aws.tweets_table, tweet_id=GOOD)["media"]
+    assert entry["status"] == "stored"
+    assert entry["preview_s3_key"] in s3_keys(aws)
+
+
+def test_missing_media_keys_are_recorded_and_logged(
+    aws: Aws, caplog: pytest.LogCaptureFixture
+) -> None:
+    pic = photo("3_ok", PHOTO_URL)
+    message = make_message(
+        GOOD,
+        media=(pic,),
+        tweet={"media_keys": ["3_gone", "3_ok"]},
+    )
+    message = replace(message, missing_media_keys=("3_gone",))
+    cdn = CdnStub()
+    cdn.serve(PHOTO_URL, b"x", "image/jpeg")
+
+    with caplog.at_level(logging.WARNING):
+        failed, _ = run_preview_record(aws, cdn, message, "1")
+
+    assert failed == []
+    item = ddb_get(aws.tweets_table, tweet_id=GOOD)
+    assert item["media_keys"] == ["3_gone", "3_ok"]
+    assert [(e["media_key"], e["status"]) for e in item["media"]] == [
+        ("3_gone", "missing"),
+        ("3_ok", "stored"),
+    ]
+    assert item["media_count"] == 2
+    assert any("3_gone" in m and "missing" in m for m in caplog.messages)
+
+
+def photo_cdn() -> CdnStub:
+    cdn = CdnStub()
+    cdn.serve(PHOTO_URL, b"x", "image/jpeg")
+    return cdn
+
+
+def test_write_contention_fails_the_record_for_redelivery(aws: Aws) -> None:
+    class Contended(TweetStore):
+        def put_tweet(self, *_a: Any, **_k: Any) -> PutResult:
+            raise WriteContentionError("changed under its merge")
+
+    queue = RecordingRetryQueue()
+    failed = process_records(
+        [receives(sqs_record("m1", body(photo_message(GOOD))), "5")],
+        media_store=MediaStore(aws.s3, aws.bucket, photo_cdn().client()),
+        tweet_store=Contended(aws.tweets_table, aws.s3, aws.bucket),
+        max_receive_count=5,
+        retry_queue=queue,
+    )
+
+    assert failed == ["m1"]  # not acked as stale: SQS redelivers, then the DLQ alarm
+    assert queue.sent == []
