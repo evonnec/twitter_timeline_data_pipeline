@@ -34,8 +34,11 @@ build-backend = "uv_build"
 [dependency-groups]
 dev = [
     "boto3-stubs[dynamodb,s3,secretsmanager,sqs]>=1.43.118",
+    "cfn-lint>=1.58.0",
+    "moto[dynamodb,s3,secretsmanager,sqs]>=5.2.4",
     "mypy>=2.4.0",
     "pytest>=9.1.1",
+    "pytest-cov>=7.1.0",
     "ruff>=0.17.2",
 ]
 
@@ -64,7 +67,7 @@ python_version = "3.14"
 strict = true
 # `mypy .` checks both trees; src/ is the import root for the package.
 mypy_path = "src"
-files = ["src"]
+files = ["src", "tests"]
 
 [tool.pytest.ini_options]
 minversion = "9.0"
