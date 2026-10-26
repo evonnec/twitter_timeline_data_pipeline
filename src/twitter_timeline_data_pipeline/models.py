@@ -7,6 +7,7 @@ carries ``schema_version`` so a reader can reject a format it doesn't understand
 
 import json
 import logging
+import re
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -14,7 +15,24 @@ from typing import Any, NoReturn, Self
 
 logger = logging.getLogger(__name__)
 
+# Stays 1 on purpose. ``note_text`` is an additive, optional field: a reader builds a
+# Tweet from explicit keys and ignores unknown ones, so an old processor still parses
+# a new message (it just stores the preview), and a new processor reading an old
+# message gets ``note_text=None``. Bump only for a change a reader can't ignore.
 SCHEMA_VERSION = 1
+
+# SQS accepts only #x9 | #xA | #xD | #x20-#xD7FF | #xE000-#xFFFD | #x10000-#x10FFFF.
+# json.dumps already escapes the control characters below #x20; the rest of what SQS
+# rejects (or UTF-8 can't encode) is matched here: surrogate code points (a lone
+# surrogate can't be encoded) plus U+FFFE and U+FFFF.
+_DISALLOWED_CHARS = re.compile("[\ud800-\udfff\ufffe\uffff]")
+
+
+def escape_disallowed_chars(json_text: str) -> str:
+    """Escape (as ``\\uXXXX``) the characters in JSON text that SQS rejects or UTF-8
+    can't encode, so the text encodes as strict UTF-8 and parses back unchanged."""
+    return _DISALLOWED_CHARS.sub(lambda m: f"\\u{ord(m[0]):04x}", json_text)
+
 
 type TweetId = str
 type MediaKey = str
@@ -174,20 +192,40 @@ class Tweet:
     public_metrics: Mapping[str, int] = field(default_factory=dict)
     edit_history_tweet_ids: tuple[TweetId, ...] = ()
     media_keys: tuple[MediaKey, ...] = ()
+    # Full text of a long post (over 280 characters), from ``note_tweet.text``. For
+    # those posts ``text`` is only a truncated preview.
+    note_text: str | None = None
+
+    @property
+    def full_text(self) -> str:
+        """The whole post: ``note_text`` for a long post, else ``text``."""
+        return self.note_text or self.text
 
     @classmethod
     def from_api(cls, data: Mapping[str, Any]) -> Self:
         """Build from an API Tweet object (media keys live under ``attachments``)."""
         attachments = data.get("attachments") or {}
-        return cls._build(data, media_keys=attachments.get("media_keys") or ())
+        # X is renaming the field (the docs and OpenAPI spec show ``note_post``).
+        note = data.get("note_tweet") or data.get("note_post") or {}
+        return cls._build(
+            data,
+            media_keys=attachments.get("media_keys") or (),
+            note_text=note.get("text"),
+        )
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> Self:
         """Build from the ``tweet`` object of an SQS message (flat ``media_keys``)."""
-        return cls._build(data, media_keys=data.get("media_keys") or ())
+        return cls._build(
+            data,
+            media_keys=data.get("media_keys") or (),
+            note_text=data.get("note_text"),
+        )
 
     @classmethod
-    def _build(cls, data: Mapping[str, Any], *, media_keys: Any) -> Self:
+    def _build(
+        cls, data: Mapping[str, Any], *, media_keys: Any, note_text: Any
+    ) -> Self:
         return cls(
             id=str(data["id"]),
             text=str(data["text"]),
@@ -206,6 +244,7 @@ class Tweet:
                 str(i) for i in data.get("edit_history_tweet_ids") or ()
             ),
             media_keys=tuple(str(k) for k in media_keys),
+            note_text=_opt_str(note_text),
         )
 
 
@@ -223,9 +262,10 @@ class TweetMessage:
         return asdict(self)
 
     def to_json(self) -> str:
-        # ASCII-escaped on purpose: lone surrogates and U+FFFE/U+FFFF in a Tweet's text
-        # would otherwise fail to encode or be rejected by SQS.
-        return json.dumps(self.to_dict(), separators=(",", ":"))
+        # UTF-8, escaping only what SQS rejects or UTF-8 can't encode. Escaping every
+        # non-ASCII character inflated emoji 3 to 6 times and ate the size limit.
+        body = json.dumps(self.to_dict(), separators=(",", ":"), ensure_ascii=False)
+        return escape_disallowed_chars(body)
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> Self:

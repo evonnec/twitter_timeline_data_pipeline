@@ -151,7 +151,14 @@ def test_username_index_projects_only_listing_attributes(template: Template) -> 
 
     assert index["Projection"] == {
         "ProjectionType": "INCLUDE",
-        "NonKeyAttributes": ["text", "media_count", "public_metrics"],
+        # text may be a prefix of an offloaded text; the markers say so.
+        "NonKeyAttributes": [
+            "text",
+            "text_truncated",
+            "text_s3_key",
+            "media_count",
+            "public_metrics",
+        ],
     }
 
 
@@ -349,3 +356,18 @@ def test_process_function_can_abort_multipart_uploads(template: Template) -> Non
     actions = {a for s in statements for a in _as_list(s["Action"])}
 
     assert "s3:AbortMultipartUpload" in actions
+
+
+@pytest.mark.parametrize("name", ["TweetsQueue", "TweetsDeadLetterQueue"])
+def test_queues_accept_messages_up_to_the_size_the_fetch_guard_allows(
+    template: Template, name: str
+) -> None:
+    from twitter_timeline_data_pipeline.handlers.fetch import SQS_MAX_MESSAGE_BYTES
+
+    assert properties(template, name)["MaximumMessageSize"] == SQS_MAX_MESSAGE_BYTES
+
+
+def test_fetch_is_deployed_after_the_processor(template: Template) -> None:
+    # A fetcher that sends long posts must not go live before a processor that
+    # understands them.
+    assert resource(template, "FetchFunction")["DependsOn"] == "ProcessFunction"

@@ -82,10 +82,12 @@ Resources:
             - {AttributeName: username, KeyType: HASH}
             - {AttributeName: created_at, KeyType: RANGE}
           # Listings need only these; INCLUDE keeps GSI write units and storage well
-          # below ALL. Fetch other attributes with GetItem on tweet_id.
+          # below ALL. Fetch other attributes with GetItem on tweet_id. text may be a
+          # prefix of an offloaded text; text_truncated and text_s3_key say so.
           Projection:
             ProjectionType: INCLUDE
-            NonKeyAttributes: [text, media_count, public_metrics]
+            NonKeyAttributes:
+              [text, text_truncated, text_s3_key, media_count, public_metrics]
       PointInTimeRecoverySpecification:
         PointInTimeRecoveryEnabled: true
       SSESpecification:
@@ -162,6 +164,8 @@ Resources:
     Type: AWS::SQS::Queue
     Properties:
       MessageRetentionPeriod: 1209600  # 14 days
+      # Matches SQS_MAX_MESSAGE_BYTES; the DLQ must take whatever the main queue does.
+      MaximumMessageSize: 1048576
       SqsManagedSseEnabled: true
       RedriveAllowPolicy:
         redrivePermission: byQueue
@@ -177,6 +181,7 @@ Resources:
       # 6 x ProcessFunction timeout (120 s) + its 10 s batching window, per AWS guidance
       # for SQS event sources.
       VisibilityTimeout: 730
+      MaximumMessageSize: 1048576  # matches SQS_MAX_MESSAGE_BYTES
       RedrivePolicy:
         deadLetterTargetArn: !GetAtt TweetsDeadLetterQueue.Arn
         maxReceiveCount: 5
@@ -195,6 +200,9 @@ Resources:
   # --- Functions -------------------------------------------------------------
   FetchFunction:
     Type: AWS::Serverless::Function
+    # Deploy the processor first: it understands note_text and offloads big texts to
+    # S3, so it must be live before the fetcher can send long posts.
+    DependsOn: ProcessFunction
     Properties:
       Description: Pulls a user's timeline from the X API and queues one message per Tweet.
       Handler: twitter_timeline_data_pipeline.handlers.fetch.handler

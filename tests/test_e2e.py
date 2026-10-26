@@ -1,5 +1,6 @@
 """Fetch handler -> moto SQS -> process handler -> moto DynamoDB and S3."""
 
+import json
 from typing import Any
 
 import httpx
@@ -7,6 +8,8 @@ import pytest
 from conftest import Aws
 from helpers import (
     GIF_URL,
+    KISS,
+    LONG_POST_ID,
     PHOTO_URL,
     USER_ID,
     VIDEO_HI_URL,
@@ -16,6 +19,8 @@ from helpers import (
     ddb_get,
     ddb_items,
     install_x_api,
+    long_post_api_object,
+    long_post_timeline,
     make_message,
     sqs_record,
     synthetic_timeline,
@@ -277,3 +282,56 @@ def test_redriving_an_older_message_after_a_newer_one_leaves_the_item_unchanged(
     stored = item(pipeline, "7")
     assert stored["public_metrics"] == {"like_count": 5000}
     assert stored["fetched_at"] == "2026-10-25T12:00:00Z"
+
+
+def test_long_post_is_stored_in_full(
+    pipeline_env: Aws, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    install_x_api(monkeypatch, fetch, long_post_timeline())
+    post = long_post_api_object()
+
+    fetched = fetch_handler({"username": USERNAME}, None)
+    processed = process_handler({"Records": drain(pipeline_env)}, None)
+
+    assert fetched["enqueued"] == 1
+    assert processed == {"batchItemFailures": []}
+    stored = item(pipeline_env, LONG_POST_ID)
+    assert stored["text"] == post["note_tweet"]["text"]
+    assert len(stored["text"]) > 280
+    assert stored["display_text"] == post["text"]
+    assert stored["is_long_post"] is True
+
+
+def test_a_worst_case_long_post_is_stored_with_its_full_text_in_s3(
+    pipeline_env: Aws, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 12,500 x 35-byte emoji sequences: 25,000 weighted characters, a 437,500-byte text.
+    text = KISS * 12_500
+    stub = long_post_timeline()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        response = stub(request)
+        if not request.url.path.endswith("/tweets"):
+            return response
+        body = response.json()
+        body["data"][0]["note_tweet"]["text"] = text
+        return httpx.Response(200, json=body)
+
+    install_x_api(monkeypatch, fetch, handler)
+    pipeline_env.sqs.set_queue_attributes(
+        QueueUrl=pipeline_env.queue_url,
+        Attributes={"MaximumMessageSize": "1048576"},
+    )
+
+    fetched = fetch_handler({"username": USERNAME}, None)
+    processed = process_handler({"Records": drain(pipeline_env)}, None)
+
+    assert fetched["enqueued"] == 1
+    assert processed == {"batchItemFailures": []}
+    stored = item(pipeline_env, LONG_POST_ID)
+    assert stored["text_truncated"] is True
+    key = f"text/{USER_ID}/{LONG_POST_ID}.json"
+    assert stored["text_s3_key"] == key
+    assert len(stored["text"]) < len(text)
+    obj = pipeline_env.s3.get_object(Bucket=pipeline_env.bucket, Key=key)
+    assert json.loads(obj["Body"].read()) == text

@@ -47,7 +47,7 @@ A run, step by step:
 
 ### SQS message
 
-One message per Tweet. The body is compact, ASCII-escaped JSON (so odd characters in Tweet text cannot make SQS reject it) with `"schema_version": 1`; the processor rejects any other version. This example is generated from the real model, with fake IDs:
+One message per Tweet. The body is compact UTF-8 JSON, with only the characters SQS rejects escaped (see **Size** below), and `"schema_version": 1`; the processor rejects any other version. This example is generated from the real model, with fake IDs:
 
 ```json
 {
@@ -67,7 +67,8 @@ One message per Tweet. The body is compact, ASCII-escaped JSON (so odd character
       "quote_count": 1
     },
     "edit_history_tweet_ids": ["1850000000000000001"],
-    "media_keys": ["3_1850000000000000002"]
+    "media_keys": ["3_1850000000000000002"],
+    "note_text": null
   },
   "media": [
     {
@@ -89,22 +90,35 @@ One message per Tweet. The body is compact, ASCII-escaped JSON (so odd character
 
 You can regenerate it with `TweetMessage(...).to_json()` from `twitter_timeline_data_pipeline.models`.
 
+**Long posts.** For a post over 280 characters the API's `text` is only a truncated preview; the full body is in `note_tweet.text`, which the fetch Lambda requests. It travels as `tweet.note_text` (`null` for a short post, and absent from messages queued by the old fetch Lambda). Entities of the long text are not collected.
+
+**Compatibility.** `note_text` is an additive, optional field, so `schema_version` stays 1. A reader builds a Tweet from explicit keys and ignores unknown ones, so a processor from before this field still parses a new message (and stores the preview), and a new processor reading an old message gets `note_text = null`. The version only changes for a change a reader cannot ignore.
+
+**Size.** Each Tweet is one message, encoded as UTF-8. Only the characters SQS rejects or UTF-8 cannot encode (lone surrogates, U+FFFE, U+FFFF) are escaped, because escaping every non-ASCII character made emoji three to six times larger. The queues' `MaximumMessageSize` is 1 MiB (SQS's maximum; the dead-letter queue matches so redriven messages fit), and the fetch Lambda also groups messages so one `SendMessageBatch` call stays under 1 MiB in total. The worst case measured is about 450 KB, under the 1 MiB limit: a 25,000-weighted-character post of 35-byte emoji sequences (12,500 of them, such as woman, skin tone, heart, kiss mark, man, skin tone) with four photos whose alt text is 1,000 characters each. That text alone is over DynamoDB's 400 KB item limit, so when the estimated item size is over 350 KB the processor moves the text (and, if still needed, `display_text`) to S3 (see the Tweets table) and keeps the item under the limit. A body over the limit stops the run with `MessageTooLargeError` instead of dropping data: the checkpoint is not advanced and the Lambda's Errors alarm fires.
+
+**Field name.** X's docs and OpenAPI spec show a `post.fields` / `note_post` rename in progress. `Tweet.from_api` reads `note_tweet` and falls back to `note_post`, but the request still asks for `note_tweet`: run a smoke test with a real token before deploying to confirm long posts come back with their full text.
+
 ### Tweets table (`TweetsTable`)
 
 | Item | Value |
 | --- | --- |
 | Partition key | `tweet_id` (S) |
-| GSI `username-created_at-index` | partition `username` (S), sort `created_at` (S), projects `text`, `media_count` and `public_metrics` only |
+| GSI `username-created_at-index` | partition `username` (S), sort `created_at` (S), projects `text`, `text_truncated`, `text_s3_key`, `media_count` and `public_metrics` only |
 | Billing | on demand; point-in-time recovery and encryption on |
 
-`created_at` is stored as the API's ISO 8601 string, which sorts chronologically. The index projects `INCLUDE` rather than `ALL`: that roughly halves its write units and storage per Tweet. The trade-off is that a listing returns only those three attributes plus the keys, so read anything else (`media`, `referenced_tweets`, ...) with `GetItem` on `tweet_id`. Attributes written by `TweetStore.to_item` (attributes whose value is `None` are omitted):
+`created_at` is stored as the API's ISO 8601 string, which sorts chronologically. The index projects `INCLUDE` rather than `ALL`: that roughly halves its write units and storage per Tweet. The trade-off is that a listing returns only those five attributes plus the keys, so read anything else (`media`, `referenced_tweets`, ...) with `GetItem` on `tweet_id`. The projected `text` is the full text for a long post (the preview is `display_text`, which the index does not project) unless the item was offloaded: then it is only a prefix, so check `text_truncated` and read the full text from `text_s3_key`. Attributes written by `TweetStore.to_item` (attributes whose value is `None` are omitted):
 
 | Attribute | Type | Notes |
 | --- | --- | --- |
 | `tweet_id` | S | Tweet ID |
 | `username` | S | Normalized account name (lower case) |
 | `author_id` | S | |
-| `text` | S | |
+| `text` | S | The full text; for a long post, `note_tweet.text`. When `text_truncated` is `true`, only the first 2,000 characters (a lone surrogate shown as U+FFFD) |
+| `text_truncated` | BOOL | Only present (`true`) when the text was moved to S3 because the item would be near DynamoDB's 400 KB limit (estimated over 350 KB), or because it holds a lone surrogate, which DynamoDB can't store |
+| `text_s3_key` | S | Only with `text_truncated`: the S3 key of the full text |
+| `display_text` | S | Only for a long post: the API's truncated preview |
+| `display_text_truncated`, `display_text_s3_key` | BOOL, S | The same for `display_text`, in the rare case it is the big field |
+| `is_long_post` | BOOL | `true` when the post has a `note_tweet`, else `false`. Absent on items written before this field existed, and `false` for messages queued by the old fetch Lambda |
 | `created_at` | S | ISO 8601 |
 | `conversation_id` | S | |
 | `lang` | S | |
@@ -116,6 +130,8 @@ You can regenerate it with `TweetMessage(...).to_json()` from `twitter_timeline_
 | `fetched_at` | S | when the fetch Lambda saw the Tweet; a write is skipped if the stored value is later |
 | `stored_at` | S | when the item was written |
 | `schema_version` | N | a write is skipped if the stored value is higher |
+
+**Reading the full text.** Use `text` unless `text_truncated` is `true`; then `GetObject` the key in `text_s3_key` from the media bucket (`text/<author_id>/<tweet_id>.json`, or the lower-cased username when the Tweet has no author ID) and `json.loads` it: the object is the text as one JSON string (UTF-8, `application/json`), so any characters, a lone surrogate included, read back exactly. The object is written before the item and create-only, so a redelivery leaves it alone. Only a post whose item would pass 350 KB is offloaded (a handful of emoji-only posts at most). A message without `note_text` never replaces a stored long post, whatever its `fetched_at`.
 
 Each `media` entry has `media_key`, `type`, `status` (`stored` and `exists` for files in S3, `unavailable` or `skipped`) and, when known, `s3_key`, `content_type`, `source_url` and `size_bytes`.
 
@@ -132,6 +148,8 @@ media/<author_id>/<tweet_id>/<media_key><extension>
 ```
 
 If a Tweet has no `author_id`, the lower-cased username is used instead. The key is deterministic, so a repeat delivery finds the object and skips the download. Photos are fetched at original size (`name=orig`, other query parameters are kept). For videos and animated GIFs, the highest-bit-rate `video/mp4` variant is stored.
+
+The same bucket also holds the full text of oversized long posts at `text/<author_id>/<tweet_id>.json` (a JSON string, `application/json`, user metadata `tweet-id`); see the Tweets table. These objects are not tiered.
 
 Each object has the `Content-Type` of the source and user metadata `tweet-id`, `media-key` and `source-url`. The bucket is encrypted (SSE-S3), blocks all public access, refuses non-TLS requests, and aborts incomplete multipart uploads after 7 days. Versioning is on, so a deleted or overwritten object can be recovered for 30 days (noncurrent versions then expire). Objects under `media/` move to S3 Intelligent-Tiering on day 0, so cold video stops costing Standard rates; the trade-off is a small per-object monitoring fee, and objects under 128 KB are never tiered.
 
@@ -451,7 +469,7 @@ The script reads the table and bucket names from the stack outputs, runs `sam de
 - Unparenthesized multiple exceptions (PEP 758): `except KeyError, ValueError:` in `x_api.py`.
 - `type` statement aliases (PEP 695): `TweetId`, `MediaStatus` and others.
 - Generic function syntax (PEP 695): `get_number[N: (int, float)]` in `config.py`.
-- `itertools.batched` to split messages into SQS batches of 10.
+- Size-aware chunking of messages into `SendMessageBatch` calls: at most 10 messages and 1 MiB in total per call.
 - `typing.override` on the `_IterReader` methods.
 - Structural pattern matching (`match`) to choose a media download source.
 
