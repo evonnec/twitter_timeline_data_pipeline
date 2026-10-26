@@ -381,3 +381,103 @@ def test_handler_missing_settings_lists_every_missing_variable() -> None:
     assert str(info.value) == (
         "missing required environment variables: TWEETS_TABLE, MEDIA_BUCKET"
     )
+
+
+def test_the_poster_frame_is_settled_with_the_file(aws: Aws, cdn: CdnStub) -> None:
+    preview_url = "https://pbs.twimg.com/ext_tw_video_thumb/1/pu/img/p.jpg"
+    video_url = "https://video.twimg.com/ext_tw_video/1/pu/vid/hi.mp4"
+    cdn.serve(video_url, b"video", "video/mp4")
+    cdn.serve(preview_url, b"poster", "image/jpeg")
+    media = Media.from_dict(
+        {
+            "media_key": "7_v",
+            "type": "video",
+            "alt_text": "clip",
+            "preview_image_url": preview_url,
+            "variants": [{"content_type": "video/mp4", "url": video_url}],
+        }
+    )
+    base = f"media/{USER_ID}/{TWEET}/7_v"
+    put_item(
+        aws,
+        (
+            media,
+            StoredMedia(
+                media_key="7_v",
+                type="video",
+                status="retrying",
+                s3_key=f"{base}.mp4",
+                source_url=video_url,
+                preview_s3_key=f"{base}_preview.jpg",
+            ),
+        ),
+    )
+
+    assert run(aws, cdn, [retry_record(media)]) == []
+
+    (entry,) = media_of(aws)
+    assert entry["status"] == "stored"
+    assert entry["s3_key"] == f"{base}.mp4"
+    assert entry["preview_s3_key"] == f"{base}_preview.jpg"
+    assert entry["alt_text"] == "clip"
+    assert entry["preview_image_url"] == preview_url
+    poster = aws.s3.get_object(Bucket=aws.bucket, Key=entry["preview_s3_key"])
+    assert poster["Body"].read() == b"poster"
+
+
+def test_an_hls_only_video_open_for_its_poster_frame_ends_skipped_hls(
+    aws: Aws, cdn: CdnStub
+) -> None:
+    preview_url = "https://pbs.twimg.com/ext_tw_video_thumb/1/pu/img/p.jpg"
+    cdn.serve(preview_url, b"poster", "image/jpeg")
+    media = Media.from_dict(
+        {
+            "media_key": "7_h",
+            "type": "video",
+            "preview_image_url": preview_url,
+            "variants": [
+                {"content_type": "application/x-mpegURL", "url": "https://v/p.m3u8"}
+            ],
+        }
+    )
+    key = f"media/{USER_ID}/{TWEET}/7_h_preview.jpg"
+    put_item(
+        aws,
+        (
+            media,
+            StoredMedia(
+                media_key="7_h",
+                type="video",
+                status="retrying",
+                preview_s3_key=key,
+            ),
+        ),
+    )
+
+    assert run(aws, cdn, [retry_record(media)]) == []
+
+    (entry,) = media_of(aws)
+    assert (entry["status"], entry["preview_s3_key"]) == ("skipped_hls", key)
+    assert "s3_key" not in entry
+
+
+def test_a_failing_poster_frame_keeps_the_retry_message(aws: Aws, cdn: CdnStub) -> None:
+    preview_url = "https://pbs.twimg.com/ext_tw_video_thumb/1/pu/img/p.jpg"
+    cdn.fail(preview_url, 503)
+    media = Media.from_dict(
+        {
+            "media_key": "7_h",
+            "type": "video",
+            "preview_image_url": preview_url,
+            "variants": [
+                {"content_type": "application/x-mpegURL", "url": "https://v/p.m3u8"}
+            ],
+        }
+    )
+    put_item(
+        aws,
+        (media, StoredMedia(media_key="7_h", type="video", status="retrying")),
+    )
+
+    assert run(aws, cdn, [retry_record(media, "r9")]) == ["r9"]
+    assert media_of(aws)[0]["status"] == "retrying"

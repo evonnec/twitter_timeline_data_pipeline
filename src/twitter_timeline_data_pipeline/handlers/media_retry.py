@@ -2,7 +2,8 @@
 
 The process function queues one message per media item it had to give up on during its
 message's last receive (the Tweet is already stored, with that media ``retrying``).
-This function downloads the file the way the process function does and then replaces
+This function downloads the file (and the poster frame of a video or GIF; both are
+one retry unit) the way the process function does and then replaces
 that one entry of the Tweet item, only if it is still the ``retrying`` entry for the
 same ``media_key``.
 
@@ -16,7 +17,6 @@ media-retry dead-letter queue, which has an alarm. Nothing is dropped silently.
 
 import logging
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import asdict
 from typing import Any
 
 from twitter_timeline_data_pipeline.config import Settings
@@ -31,6 +31,7 @@ from twitter_timeline_data_pipeline.storage import (
     MediaStore,
     TransientMediaError,
     TweetStore,
+    media_entry,
 )
 
 logger = logging.getLogger(__name__)
@@ -72,7 +73,7 @@ def _retry_one(
     if budget_s is not None and budget_s <= 0:
         raise TransientMediaError("not enough time left to start")
     stored = media_store.store(retry.to_tweet_message(), retry.media, budget_s=budget_s)
-    entry = {k: v for k, v in asdict(stored).items() if v is not None}
+    entry = media_entry(stored, retry.media)
     if "source_url" not in entry and current.get("source_url"):
         entry["source_url"] = current["source_url"]  # keep it for a skipped result
     if tweet_store.resolve_media(retry.tweet_id, index, key, entry):

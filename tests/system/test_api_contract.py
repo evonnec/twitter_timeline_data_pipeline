@@ -94,10 +94,6 @@ def test_one_malformed_tweet_does_not_block_the_rest(make_sim: MakeSim) -> None:
     assert_quiet(sim)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="#17: a media key missing from includes is dropped from the stored item",
-)
 def test_withheld_media_key_is_recorded(make_sim: MakeSim) -> None:
     """A Tweet has two photos; the API omits one from ``includes.media`` (withheld)
     and reports it as a partial error.
@@ -118,3 +114,7 @@ def test_withheld_media_key_is_recorded(make_sim: MakeSim) -> None:
         withheld.media_key,
     }
     assert item["media_count"] == 2
+    assert item["media_keys"] == [shown.media_key, withheld.media_key]
+    status = {m["media_key"]: m["status"] for m in item["media"]}
+    assert status[withheld.media_key] == "missing"
+    assert status[shown.media_key] == "stored"

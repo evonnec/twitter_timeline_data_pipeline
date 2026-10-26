@@ -125,6 +125,13 @@ def process_records(
             continue
         try:
             message = TweetMessage.from_json(record["body"])
+            if message.missing_media_keys:
+                logger.warning(
+                    "tweet %s: media keys missing from includes, recorded as "
+                    "missing: %s",
+                    message.tweet.id,
+                    list(message.missing_media_keys),
+                )
             # Media first: a transient failure must leave no metadata that points at
             # media that isn't there.
             stored: list[StoredMedia] = []

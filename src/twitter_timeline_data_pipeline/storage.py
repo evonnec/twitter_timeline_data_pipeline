@@ -25,7 +25,7 @@ import posixpath
 import re
 import time
 from collections.abc import Buffer, Callable, Iterable, Iterator, Mapping, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from typing import TYPE_CHECKING, Any, Literal, cast, override
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -52,16 +52,28 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 type MediaStatus = Literal[
-    "stored", "exists", "unavailable", "skipped", "too_large", "retrying"
+    "stored",
+    "exists",
+    "unavailable",
+    "skipped",
+    "skipped_hls",
+    "too_large",
+    "retrying",
+    "missing",
 ]
 """stored: uploaded now. exists: already in S3. unavailable: the source returned a
 4xx other than 429 (or a redirect, which isn't followed). skipped: nothing to download:
-a video with only an HLS variant, or a URL that isn't https on an allowed media host.
-too_large: over the size cap, by estimate or by counted bytes; ``size_bytes`` holds the
-estimate or the count at abort, and nothing is in S3. retrying: transient errors
+no usable URL, or one that isn't https on an allowed media host. skipped_hls: a video
+or animated GIF whose only variants are HLS playlists, so there is no file (its
+poster frame is still stored, see ``preview_s3_key``). missing: the Tweet attaches the
+key but the API's ``includes.media`` did not return it (deleted or withheld media);
+nothing else is known about it. too_large: over the size cap, by estimate or by
+counted bytes; ``size_bytes`` holds the estimate or the count at abort, and nothing is
+in S3. retrying: transient errors
 outlasted the record's last SQS receive, so the Tweet was written without this file and
 a message on the media-retry queue will store it later and replace this status;
-``source_url`` (and the planned ``s3_key``) are recorded."""
+``source_url`` (and the planned ``s3_key`` and ``preview_s3_key``) are recorded. A
+poster frame that can't be stored yet also makes the entry ``retrying``."""
 
 # Media is only downloaded from the X CDN; message bodies are untrusted input.
 ALLOWED_MEDIA_HOSTS = frozenset({"pbs.twimg.com", "video.twimg.com"})
@@ -91,6 +103,31 @@ class StoredMedia:
     content_type: str | None = None
     source_url: str | None = None
     size_bytes: int | None = None
+    # The poster frame of a video or animated GIF, when it is stored (or planned).
+    preview_s3_key: str | None = None
+
+
+def media_entry(stored: StoredMedia, media: Media | None = None) -> dict[str, Any]:
+    """The item's ``media`` map for one key: the storage outcome, plus the media's own
+    fields from the message (``alt_text``, ``width``, ``height``, ``duration_ms``,
+    ``preview_image_url``, ``variants``) so nothing the API said is lost. None values
+    and an empty variant list are left out."""
+    entry: dict[str, Any] = {}
+    if media is not None:
+        entry = {
+            "alt_text": media.alt_text,
+            "width": media.width,
+            "height": media.height,
+            "duration_ms": media.duration_ms,
+            "preview_image_url": media.preview_image_url,
+            "variants": [
+                {k: v for k, v in asdict(variant).items() if v is not None}
+                for variant in media.variants
+            ]
+            or None,
+        }
+    entry.update(asdict(stored))
+    return {k: v for k, v in entry.items() if v is not None}
 
 
 @dataclass(frozen=True, slots=True)
@@ -220,12 +257,43 @@ class MediaStore:
     def _target(self, message: TweetMessage, media: Media) -> _Target | StoredMedia:
         """Where ``media`` is downloaded from and stored; ``skipped`` if nowhere."""
         skipped = StoredMedia(
-            media_key=media.media_key, type=media.type, status="skipped"
+            media_key=media.media_key,
+            type=media.type,
+            status="skipped_hls" if media.is_hls_only else "skipped",
         )
         source = media.download_source()
         if source is None:
             return skipped
         raw_url, known_type = source
+        target = self._allowed_target(
+            media,
+            raw_url,
+            known_type,
+            lambda url: self.object_key(message, media, _extension(known_type, url)),
+        )
+        return skipped if target is None else target
+
+    def _preview_target(self, message: TweetMessage, media: Media) -> _Target | None:
+        """Where the poster frame of a video or animated GIF is stored, or None when
+        there is none to store (other types, no URL, or a host that isn't allowed)."""
+        if media.type not in ("video", "animated_gif") or not media.preview_image_url:
+            return None
+        return self._allowed_target(
+            media,
+            media.preview_image_url,
+            None,
+            lambda _: self.object_key(message, media, "_preview.jpg"),
+        )
+
+    @staticmethod
+    def _allowed_target(
+        media: Media,
+        raw_url: str,
+        known_type: str | None,
+        key_for: Callable[[str], str],
+    ) -> _Target | None:
+        """A download target for ``raw_url``, or None (logged) when it isn't https on an
+        allowed media host."""
         try:
             url = _original_size_url(raw_url)
             parts = urlsplit(url)
@@ -238,12 +306,9 @@ class MediaStore:
                 media.media_key,
                 host,
             )
-            return skipped
+            return None
         return _Target(
-            raw_url=raw_url,
-            url=url,
-            known_type=known_type,
-            key=self.object_key(message, media, _extension(known_type, url)),
+            raw_url=raw_url, url=url, known_type=known_type, key=key_for(url)
         )
 
     def _cheap_result(
@@ -295,19 +360,46 @@ class MediaStore:
         """
         target = self._target(message, media)
         if isinstance(target, StoredMedia):
-            return target
+            main = target
+        else:
+            try:
+                cheap = self._cheap_result(media, target, head=head)
+            except Exception:
+                logger.exception("cheap checks failed for media %s", media.media_key)
+                cheap = None
+            main = cheap or StoredMedia(
+                media_key=media.media_key,
+                type=media.type,
+                status="retrying",
+                s3_key=target.key,
+                source_url=target.url,
+            )
+        preview = self._preview_target(message, media)
+        if preview is None:
+            return main
         try:
-            cheap = self._cheap_result(media, target, head=head)
+            found = head and self._exists(preview.key)
         except Exception:
-            logger.exception("cheap checks failed for media %s", media.media_key)
-            cheap = None
-        return cheap or StoredMedia(
-            media_key=media.media_key,
-            type=media.type,
-            status="retrying",
-            s3_key=target.key,
-            source_url=target.url,
+            logger.exception("cheap checks failed for preview of %s", media.media_key)
+            found = False
+        # A poster frame still to be stored keeps the entry open, whatever the file's
+        # own outcome: the retry consumer settles both, and the file's outcome is
+        # found again there.
+        return replace(
+            main,
+            status=main.status if found else "retrying",
+            preview_s3_key=preview.key,
         )
+
+    def _exists(self, key: str) -> bool:
+        """Whether ``key`` is in the bucket; raises for an error other than a miss."""
+        try:
+            self._s3.head_object(Bucket=self._bucket, Key=key)
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") not in _MISSING_OBJECT_CODES:
+                raise
+            return False
+        return True
 
     def store(
         self,
@@ -318,15 +410,41 @@ class MediaStore:
     ) -> StoredMedia:
         """Upload one media item unless it's already stored.
 
-        Raises ``TransientMediaError`` for failures worth retrying, including a
-        download that outlasts ``budget_s`` seconds; returns status ``unavailable``
-        for permanent ones and ``too_large`` for files over the size cap, so the Tweet
-        is still recorded.
+        A video or animated GIF with a ``preview_image_url`` also gets its poster frame
+        stored, the same way (``preview_s3_key``). One that is permanently unavailable
+        or too large is just left out of the result.
+
+        Raises ``TransientMediaError`` for failures worth retrying (on either file),
+        including a download that outlasts ``budget_s`` seconds; returns status
+        ``unavailable`` for permanent ones and ``too_large`` for files over the size
+        cap, so the Tweet is still recorded.
         """
         deadline = None if budget_s is None else self._clock() + budget_s
         target = self._target(message, media)
-        if isinstance(target, StoredMedia):
-            return target
+        main = (
+            target
+            if isinstance(target, StoredMedia)
+            else self._download(message, media, target, deadline)
+        )
+        preview = self._preview_target(message, media)
+        if preview is None:
+            return main
+        stored = self._download(message, media, preview, deadline)
+        if stored.s3_key is None:
+            logger.warning(
+                "media %s preview not stored: %s", media.media_key, stored.status
+            )
+            return main
+        return replace(main, preview_s3_key=stored.s3_key)
+
+    def _download(
+        self,
+        message: TweetMessage,
+        media: Media,
+        target: _Target,
+        deadline: float | None,
+    ) -> StoredMedia:
+        """Store the file at ``target`` unless it is already in S3."""
         url, key = target.url, target.key
         known_type = target.known_type
 
@@ -533,6 +651,21 @@ class TweetStore:
         ``username-created_at-index`` GSI.
         """
         tweet = message.tweet
+        # One entry per attached key, in the Tweet's order. A key with no stored
+        # outcome is one the API's ``includes.media`` didn't return: kept as
+        # ``missing`` so it can't pass for a text-only Tweet. Media outside the key
+        # list (a message that lists none) follows, so nothing stored is dropped.
+        stored = {m.media_key: m for m in media}
+        described = {m.media_key: m for m in message.media}
+        keys = list(dict.fromkeys([*tweet.media_keys, *stored]))
+        entries = [
+            media_entry(
+                stored.get(key)
+                or StoredMedia(media_key=key, type="unknown", status="missing"),
+                described.get(key),
+            )
+            for key in keys
+        ]
         item: dict[str, Any] = {
             "tweet_id": tweet.id,
             "username": message.username,
@@ -549,10 +682,9 @@ class TweetStore:
             ],
             "public_metrics": dict(tweet.public_metrics),
             "edit_history_tweet_ids": list(tweet.edit_history_tweet_ids),
-            "media": [
-                {k: v for k, v in asdict(m).items() if v is not None} for m in media
-            ],
-            "media_count": len(media),
+            "media_keys": keys,
+            "media": entries,
+            "media_count": len(entries),
             "fetched_at": message.fetched_at,
             "stored_at": utc_now_iso(),
             "schema_version": message.schema_version,
