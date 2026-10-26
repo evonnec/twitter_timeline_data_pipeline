@@ -144,7 +144,7 @@ def _extension(content_type: str | None, url: str) -> str:
     return suffix if suffix in _KNOWN_EXTENSIONS else ""
 
 
-def _estimated_size(media: Media, url: str) -> int | None:
+def estimated_size(media: Media, url: str) -> int | None:
     """Bytes implied by the chosen variant's ``bit_rate`` and the media's duration."""
     if media.type not in ("video", "animated_gif") or not media.duration_ms:
         return None
@@ -243,16 +243,30 @@ class MediaStore:
             )
 
         # Skip before opening a connection when the message already says it's too big.
-        estimate = _estimated_size(media, raw_url)
+        estimate = estimated_size(media, raw_url)
         if estimate is not None and estimate > self._max_bytes:
             logger.warning(
                 "media %s too large: estimated %d bytes", media.media_key, estimate
             )
             return result("too_large", size_bytes=estimate)
 
+        timeout: Any = httpx.USE_CLIENT_DEFAULT
+        if deadline is not None:
+            left = deadline - self._clock()
+            if left <= 0:
+                raise TransientMediaError("no time left to download")
+            # Connect, TLS and headers each get their own timeout, and only body
+            # reads are checked against the deadline. A third of the time left per
+            # phase keeps the whole exchange inside it, and the body then overruns
+            # by at most one read.
+            read = self._http.timeout.read
+            timeout = httpx.Timeout(left / 3 if read is None else min(read, left / 3))
+
         try:
             # Redirects stay off so a media host can't bounce the download elsewhere.
-            with self._http.stream("GET", url, follow_redirects=False) as response:
+            with self._http.stream(
+                "GET", url, follow_redirects=False, timeout=timeout
+            ) as response:
                 status = response.status_code
                 if status == 429 or status >= 500:
                     raise TransientMediaError(f"HTTP {status} fetching {url}")

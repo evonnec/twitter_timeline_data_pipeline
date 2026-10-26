@@ -5,8 +5,10 @@ from typing import Any
 
 import httpx
 import pytest
+from botocore.exceptions import ClientError
 from conftest import Aws
 from helpers import (
+    GIF_URL,
     PHOTO_URL,
     USER_ID,
     VIDEO_HI_URL,
@@ -22,6 +24,7 @@ from twitter_timeline_data_pipeline import __version__
 from twitter_timeline_data_pipeline.config import ConfigError
 from twitter_timeline_data_pipeline.handlers import process
 from twitter_timeline_data_pipeline.handlers.process import (
+    MIN_WRITE_MS,
     SAFETY_MARGIN_MS,
     handler,
     process_records,
@@ -533,6 +536,185 @@ def test_media_over_the_cap_is_recorded_and_the_tweet_is_stored(aws: Aws) -> Non
     assert s3_keys(aws) == []
 
 
+def test_cheapest_records_run_first_and_unknown_size_videos_last(
+    aws: Aws, cdn: CdnStub
+) -> None:
+    big = video_message(
+        "1700000000000000101",
+        duration_ms=10_000,
+        variants=[
+            {"content_type": "video/mp4", "bit_rate": 8_000_000, "url": VIDEO_HI_URL}
+        ],
+    )
+    unknown = video_message(
+        "1700000000000000102",
+        variants=[{"content_type": "video/mp4", "url": VIDEO_HI_URL}],
+    )
+    small = video_message(
+        "1700000000000000103",
+        duration_ms=1_000,
+        variants=[
+            {"content_type": "video/mp4", "bit_rate": 8_000, "url": VIDEO_HI_URL}
+        ],
+    )
+    gif = make_message(
+        "1700000000000000104",
+        media=(
+            Media.from_dict(
+                {
+                    "media_key": "16_1",
+                    "type": "animated_gif",
+                    "variants": [
+                        {"content_type": "video/mp4", "bit_rate": 0, "url": GIF_URL}
+                    ],
+                }
+            ),
+        ),
+    )
+    hls = make_message(
+        "1700000000000000105",
+        media=(
+            Media.from_dict(
+                {
+                    "media_key": "7_hls",
+                    "type": "video",
+                    "variants": [{"content_type": "x/hls", "url": VIDEO_HI_URL}],
+                }
+            ),
+        ),
+    )
+    records = [
+        sqs_record("unknown", body(unknown)),
+        sqs_record("big", body(big)),
+        sqs_record("photo", body(photo_message(GOOD))),
+        sqs_record("small", body(small)),
+        sqs_record("gif", body(gif)),
+        sqs_record("hls", body(hls)),
+        sqs_record("bad", "{nope"),
+        sqs_record("text", body(make_message(NO_MEDIA))),
+    ]
+    order: list[str] = []
+
+    class Spy(TweetStore):
+        def put_tweet(self, message: TweetMessage, media: Any) -> None:
+            order.append(message.tweet.id)
+            super().put_tweet(message, media)
+
+    process_records(
+        records,
+        media_store=MediaStore(aws.s3, aws.bucket, cdn.client()),
+        tweet_store=Spy(aws.tweets_table),
+    )
+
+    assert order == [
+        GOOD,
+        "1700000000000000104",
+        "1700000000000000105",
+        NO_MEDIA,
+        "1700000000000000103",
+        "1700000000000000101",
+        "1700000000000000102",
+    ]
+
+
+def test_a_slow_video_first_does_not_starve_its_siblings_on_the_last_receive(
+    aws: Aws,
+) -> None:
+    clock = [0.0]
+    cdn = slow_cdn(clock, VIDEO_HI_URL)
+    cdn.serve(PHOTO_URL, b"jpeg", "image/jpeg")
+    slow_video = video_message(
+        TRANSIENT, variants=[{"content_type": "video/mp4", "url": VIDEO_HI_URL}]
+    )
+    records = [
+        receives(sqs_record("slow", body(slow_video)), "5"),
+        receives(sqs_record("photo", body(photo_message(GOOD))), "5"),
+        receives(sqs_record("text", body(make_message(NO_MEDIA))), "5"),
+    ]
+
+    failed = process_records(
+        records,
+        media_store=MediaStore(
+            aws.s3, aws.bucket, cdn.client(), clock=lambda: clock[0]
+        ),
+        tweet_store=TweetStore(aws.tweets_table),
+        remaining_ms=lambda: int(SAFETY_MARGIN_MS + 30_000 - clock[0] * 1000),
+        max_receive_count=5,
+    )
+
+    assert failed == []
+    assert stored_tweet_ids(aws) == {TRANSIENT, GOOD, NO_MEDIA}
+    assert ddb_get(aws.tweets_table, tweet_id=GOOD)["media"][0]["status"] == "stored"
+    assert ddb_get(aws.tweets_table, tweet_id=TRANSIENT)["media"][0]["status"] == (
+        "failed"
+    )
+
+
+def test_last_receive_record_without_time_is_written_with_failed_media(
+    aws: Aws, cdn: CdnStub
+) -> None:
+    failed = process_records(
+        [
+            receives(sqs_record("m1", body(photo_message(GOOD))), "5"),
+            receives(sqs_record("m2", body(make_message(NO_MEDIA))), "5"),
+            receives(sqs_record("m3", body(photo_message(TRANSIENT))), "4"),
+        ],
+        media_store=MediaStore(aws.s3, aws.bucket, cdn.client()),
+        tweet_store=TweetStore(aws.tweets_table),
+        remaining_ms=Countdown(SAFETY_MARGIN_MS - 1),
+        max_receive_count=5,
+    )
+
+    assert failed == ["m3"]  # not its last receive
+    assert cdn.requests == []
+    assert s3_keys(aws) == []
+    assert ddb_get(aws.tweets_table, tweet_id=GOOD)["media"][0]["status"] == "failed"
+    assert stored_tweet_ids(aws) == {GOOD, NO_MEDIA}
+
+
+def test_last_receive_record_with_almost_no_time_is_still_reported(
+    aws: Aws, cdn: CdnStub
+) -> None:
+    failed = process_records(
+        [receives(sqs_record("m1", body(photo_message(GOOD))), "5")],
+        media_store=MediaStore(aws.s3, aws.bucket, cdn.client()),
+        tweet_store=TweetStore(aws.tweets_table),
+        remaining_ms=Countdown(MIN_WRITE_MS - 1),
+        max_receive_count=5,
+    )
+
+    assert failed == ["m1"]
+    assert stored_tweet_ids(aws) == set()
+
+
+def test_last_receive_records_any_media_exception_as_failed(
+    aws: Aws, cdn: CdnStub
+) -> None:
+    def deny(**_kw: Any) -> None:
+        raise ClientError({"Error": {"Code": "500", "Message": "boom"}}, "HeadObject")
+
+    aws.s3.meta.events.register("before-call.s3.HeadObject", deny)
+    records = [receives(sqs_record("m1", body(photo_message(GOOD))), "5")]
+    store = MediaStore(aws.s3, aws.bucket, cdn.client())
+
+    assert (
+        process_records(
+            records,
+            media_store=store,
+            tweet_store=TweetStore(aws.tweets_table),
+            max_receive_count=5,
+        )
+        == []
+    )
+    assert ddb_get(aws.tweets_table, tweet_id=GOOD)["media"][0]["status"] == "failed"
+
+    other = TweetStore(aws.tweets_table)
+    earlier = [receives(sqs_record("m2", body(photo_message(NO_MEDIA))), "4")]
+    assert process_records(
+        earlier, media_store=store, tweet_store=other, max_receive_count=5
+    ) == ["m2"]
+
+
 # ---- handler -------------------------------------------------------------------
 
 
@@ -684,6 +866,14 @@ def test_http_client_factory_configuration() -> None:
     finally:
         client.close()
         process._http_client(8.0).close()
+
+
+def test_s3_client_has_bounded_timeouts_and_retries(aws: Aws) -> None:
+    config: Any = process._s3_client().meta.config
+
+    assert (config.connect_timeout, config.read_timeout) == (5, 10)
+    assert config.retries["mode"] == "standard"
+    assert config.retries["total_max_attempts"] == 4  # max_attempts=3 retries
 
 
 def test_aws_client_factories_are_cached(aws: Aws) -> None:

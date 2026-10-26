@@ -800,21 +800,93 @@ def test_store_accepts_a_body_exactly_at_the_cap(aws: Aws) -> None:
     assert (stored.status, stored.size_bytes) == ("stored", 100)
 
 
-def test_store_slow_download_hits_its_deadline_and_leaves_nothing(aws: Aws) -> None:
+def test_store_slow_download_hits_its_deadline_and_aborts_the_multipart_upload(
+    aws: Aws,
+) -> None:
     clock = FakeClock()
+    calls: list[str] = []
+    for op in ("CreateMultipartUpload", "AbortMultipartUpload"):
+        aws.s3.meta.events.register(
+            f"before-call.s3.{op}", lambda *, op=op, **_kw: calls.append(op)
+        )
 
     def slow() -> Iterator[bytes]:
         for _ in range(200):
             clock.now += 1
-            yield b"\x00" * 65536
+            yield b"\x00" * 1024 * 1024
 
     cdn = streaming_cdn(VIDEO_HI_URL, slow())
     item = video()
     store = MediaStore(aws.s3, aws.bucket, cdn.client(), clock=clock)
 
     with pytest.raises(TransientMediaError, match="time budget"):
-        store.store(make_message(media=(item,)), item, budget_s=10)
+        store.store(make_message(media=(item,)), item, budget_s=12)
 
+    assert calls.count("CreateMultipartUpload") == 1  # past the 8 MiB threshold
+    assert calls.count("AbortMultipartUpload") == 1
     assert keys_in_bucket(aws) == []
     assert leftover_uploads(aws) == []
-    assert clock.now == 10  # stopped as soon as the deadline was reached
+    assert clock.now == 12  # stopped as soon as the deadline was reached
+
+
+def test_store_gives_the_http_phases_a_share_of_the_time_left(aws: Aws) -> None:
+    clock = FakeClock()
+    seen: list[dict[str, Any]] = []
+
+    def stall(request: httpx.Request) -> httpx.Response:
+        seen.append(request.extensions["timeout"])
+        clock.now += 100  # a header phase that hangs until its timeout
+        raise httpx.ReadTimeout("stalled", request=request)
+
+    http = httpx.Client(transport=httpx.MockTransport(stall), timeout=10.0)
+    store = MediaStore(aws.s3, aws.bucket, http, clock=clock)
+
+    with pytest.raises(TransientMediaError, match="ReadTimeout"):
+        store.store(make_message(media=(PHOTO,)), PHOTO, budget_s=24)
+
+    assert seen == [{"connect": 8.0, "read": 8.0, "write": 8.0, "pool": 8.0}]
+
+
+def test_store_keeps_the_client_timeout_when_there_is_plenty_of_time(
+    aws: Aws,
+) -> None:
+    seen: list[dict[str, Any]] = []
+
+    def serve(request: httpx.Request) -> httpx.Response:
+        seen.append(request.extensions["timeout"])
+        return httpx.Response(200, content=b"x")
+
+    http = httpx.Client(transport=httpx.MockTransport(serve), timeout=10.0)
+    MediaStore(aws.s3, aws.bucket, http).store(
+        make_message(media=(PHOTO,)), PHOTO, budget_s=300
+    )
+    MediaStore(aws.s3, aws.bucket, http).store(
+        make_message("1700000000000000006", media=(PHOTO,)), PHOTO
+    )
+
+    assert seen[0]["read"] == 10.0
+    assert seen[1]["read"] == 10.0
+
+
+def test_store_without_a_read_timeout_uses_a_third_of_the_time_left(aws: Aws) -> None:
+    seen: list[dict[str, Any]] = []
+
+    def serve(request: httpx.Request) -> httpx.Response:
+        seen.append(request.extensions["timeout"])
+        return httpx.Response(200, content=b"x")
+
+    http = httpx.Client(transport=httpx.MockTransport(serve), timeout=None)
+    MediaStore(aws.s3, aws.bucket, http, clock=FakeClock()).store(
+        make_message(media=(PHOTO,)), PHOTO, budget_s=30
+    )
+
+    assert seen[0]["read"] == 10.0
+
+
+def test_store_with_no_time_left_makes_no_request(aws: Aws) -> None:
+    cdn = CdnStub()
+
+    with pytest.raises(TransientMediaError, match="no time left"):
+        media_store(aws, cdn).store(make_message(media=(PHOTO,)), PHOTO, budget_s=0)
+
+    assert cdn.requests == []

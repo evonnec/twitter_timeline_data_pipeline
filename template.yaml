@@ -39,6 +39,7 @@ Parameters:
     Type: Number
     Default: 5
     MinValue: 1
+    MaxValue: 1000
     Description: >-
       Receives before a message moves to the dead-letter queue. On the last one the
       Tweet is written even if its media keeps failing.
