@@ -1127,7 +1127,9 @@ def test_nested_overlapping_runs_never_leave_a_hole_at_any_save(
     else:  # pragma: no cover
         raise AssertionError("did not converge")
 
-    assert store.saves > 0 or not timeline.ids
+    # The per-save hook must have run whenever there was anything to save; a timeline
+    # with nothing above the checkpoint legitimately saves nothing.
+    assert store.saves > 0 or not [i for i in timeline.served if i > checkpoint]
     assert not store.violations, store.violations[:3]
     assert {i for i in timeline.served if i > checkpoint} <= store.accepted()
 
