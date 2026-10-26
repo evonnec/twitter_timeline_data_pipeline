@@ -42,7 +42,7 @@ flowchart LR
 A run, step by step:
 
 1. EventBridge invokes `FetchFunction` on the schedule (`rate(1 hour)` by default). The event may carry `{"username": "..."}`; otherwise the `TWITTER_USERNAME` setting is used. The name is normalized once (leading `@` removed, lower-cased) and used everywhere below.
-2. The function reads the bearer token from Secrets Manager (cached in memory for 15 minutes), resolves the username to a user ID, and reads the account's cursor from the state table: the newest Tweet ID already fetched, plus any *gaps* (ID ranges known to be unfetched; see the [state table](#state-table-statetable)).
+2. The function reads the bearer token from Secrets Manager (cached in memory for 15 minutes), reads the account's cursor from the state table, and takes the user ID from it (the handle is looked up only when the stored ID is missing or older than `USER_ID_TTL_HOURS`; see [identity changes](#identity-changes)): the newest Tweet ID already fetched, plus any *gaps* (ID ranges known to be unfetched; see the [state table](#state-table-statetable)).
 3. New Tweets first. It pages through `GET /2/users/:id/tweets` with `since_id` set to the newest ID, newest first, in pages of `MAX_RESULTS` Tweets. A first run has no `since_id`. `MAX_PAGES` is a budget of API requests, counting empty and failed ones; when gaps exist it is at least 2, one request is kept for the oldest gap, and the rest go to the new Tweets and the newest gaps.
 4. Each page is first written, unchanged, to the media bucket under `raw/` (see [Raw API pages](#raw-api-pages)). Only then does it become one message per Tweet, sent to the queue with `SendMessageBatch` (10 at a time; only entries SQS reports as failed are retried). Each message carries the raw object's key as `raw_key`. If the upload fails, nothing from that page is enqueued and the run fails with its cursor unmoved, so the page is fetched again by the next run.
 5. After each page is fully enqueued, the cursor is saved. While the page still has a `next_token`, the not-yet-fetched rest is recorded as a gap just below the lowest ID seen; a page without `next_token` closes it. So a run that hits the cap, a rate limit or an error leaves a gap, never a hole.
@@ -176,6 +176,8 @@ One item per account: partition key `username` (S, lower case) and
 | --- | --- | --- |
 | `newest_id` | N | Highest Tweet ID reached by the new-Tweets phase (a gap page can enqueue a higher one, which is re-fetched later). Never decreases. Absent until the first Tweet. |
 | `gaps` | L of M | Exclusive ID ranges known to be unfetched, each `{until_id, since_id, empty_runs, first_empty_at}` (N; `empty_runs` and the ISO-8601 UTC `first_empty_at` only when `empty_runs` is above 0). A missing `since_id` means "down to the end of what the API serves" (about the 3,200 most recent posts); a missing `until_id` means "up from the newest Tweet". |
+| `user_id` | S | Numeric user ID the handle resolved to. Absent on items written before this existed (the next run looks the handle up, logs the binding and stores it). |
+| `user_id_resolved_at` | S | ISO-8601 UTC time (`...Z`) the ID was last confirmed by a lookup (only a lookup sets it; an unreadable or timezone-less value counts as expired). The ID is reused until it is `USER_ID_TTL_HOURS` old, then looked up again (and this time refreshed if unchanged). |
 | `version` | N | Optimistic lock, incremented on every write. |
 | `updated_at` | S | UTC timestamp of the last write. |
 
@@ -184,6 +186,32 @@ The list is kept normalized on every save: overlapping or adjacent gaps are merg
 **Empty responses never end a range by themselves.** A `200` with `errors` and no data (for example an account that turned protected) raises an error instead of reading as "no more Tweets"; an empty page that still has a `next_token` is followed. A gap is dropped only after 3 consecutive empty runs spanning at least 24 hours (`empty_runs`, `first_empty_at`), so a short API incident cannot erase a range that still holds data. A run counts as empty when no page for the gap carried data and the walk ended on a clean empty response (no data, no errors, no `next_token`; empty pages that still pointed onward don't prevent it). Both fields reset whenever data comes back. Because the API sends a `next_token` on the last page, every run's new-Tweets walk ends on such an empty response, which is recorded as the gap's first empty run without a second request. A gap that has reached its last run waits out the 24 hours without being asked again (it costs no requests and doesn't count as unfinished), then gets one request first in its next run to drop. Gaps that came back empty are checked after the ones that may still hold Tweets, so a burst isn't starved by them. If the API recovers during the wait, the Tweets in such a gap arrive at the end of it, delayed but not lost. The drop is logged at WARNING as `dropping gap for <user> (since_id=..., until_id=...): out of the API's reach`, stable text for a metric filter to match. That is how a range that has aged out of the API's window finally goes away.
 
 Every write is conditional on the `version` that run read (a missing `version` counts as 0, so items written before gaps existed are read as they are and upgraded on the first write). If another run got there first, the write fails, the run stops fetching, logs a warning and returns `stopped_reason: "state_conflict"`. Anything it already enqueued is a harmless duplicate, `newest_id` never moves backwards, and no gap is dropped.
+
+#### Identity changes
+
+The checkpoint belongs to the account, not just the handle. If the account renames and someone else registers the old handle, a lookup returns a different user ID. Whenever a lookup (or the `user_id` in the fetch event) differs from the stored `user_id`, the run raises `IdentityChangedError` and the invocation fails (so the `Errors` alarm fires). It logs at ERROR, stable text for a metric filter to match: `identity changed for handle <handle>: stored user_id <old>, now <new>; nothing ingested`. The lookup happens when the stored ID is missing or older than `USER_ID_TTL_HOURS`, so a takeover is caught at the next expiry (up to 24 h by default); until then the cached ID keeps reading the original account, never the new owner. A timeline response of "user not found" for a cached ID also triggers a fresh lookup with the same check. No Tweet of the new owner is ever enqueued. On a lookup-time change nothing is enqueued and the state is untouched. On the cached-ID not-found path, pages enqueued earlier in that run stay enqueued and a backfill requested by the event has already been saved; nothing is lost or attributed to the wrong account. A CloudWatch metric and alarm on that log text is planned (#19); until then the failed invocation is the signal.
+
+The first time a handle is tied to an ID (a new account, an item from before `user_id` existed, or one whose `user_id` was removed) the run logs a WARNING, `binding handle <handle> to user_id <id> (no user ID was stored)`. That is the one moment a takeover could not be told apart from the account itself, so check it is the account you mean.
+
+**Runbook after an identity change (or when the old handle is freed).** The schedule carries no input, so every run keeps using `TwitterUsername`. The old handle's state item is what catches the takeover: never delete it or its `user_id`, or the next run binds the handle to its new owner and ingests that person's posts.
+
+1. Stop the bleeding first: either set `TwitterUsername` to the account's new handle and redeploy, or disable the schedule (`ScheduleState=false`).
+2. Optionally carry the cursor over so the new handle does not refetch everything. Read the old item, then write a new item under the new handle (lower case) with the same `newest_id`, `gaps` and `user_id` (set `user_id_resolved_at` to now, `version` to 1):
+
+   ```bash
+   aws dynamodb get-item --table-name "$STATE_TABLE" --consistent-read \
+     --key '{"username": {"S": "<old handle>"}}'
+   aws dynamodb put-item --table-name "$STATE_TABLE" --item '{
+     "username": {"S": "<new handle>"}, "user_id": {"S": "<original id>"},
+     "user_id_resolved_at": {"S": "<now, e.g. 2026-10-01T12:00:00Z>"},
+     "newest_id": {"N": "<newest_id>"}, "gaps": {"L": []}, "version": {"N": "1"}}'
+   ```
+
+   Copy `gaps` as read (or `[]` to drop them). Without this step the new handle starts from scratch and fetches the account's most recent ~3,200 posts, as a first run does. Stored Tweets are not affected either way.
+3. If the old handle is simply freed (nobody took it), runs after the TTL expires fail with a not-found error until you do step 1; the cached ID is used until then.
+4. If you really want the handle's new owner under the old handle, that is a new account for this pipeline: use a different state table or the new-handle approach above, not the old item.
+
+The event may carry `"user_id": "<numeric id>"` as an assertion: it must equal the stored ID, and when none is stored the handle is looked up and must resolve to it (otherwise `IdentityChangedError`). It never replaces a lookup, so it cannot bind a handle to an ID the handle does not have. The CLI `--dry-run` has no state table and resolves the handle on every call.
 
 ### S3 media bucket
 
@@ -260,6 +288,9 @@ A page the parser rejects (valid JSON of an unexpected shape) is landed first an
 ├── scripts/
 │   ├── build_lambda.sh                build build/lambda/ for Python 3.14 on arm64
 │   ├── deploy.sh                      build, then sam deploy
+│   ├── integration_test.sh            run the integration tests with Docker (see below)
+│   ├── check_iam.sh                   offline IAM policy check of the template
+│   ├── expand_sam_template.py         expand the SAM transform (used by check_iam.sh)
 │   ├── put_secret.sh                  store the bearer token in Secrets Manager
 │   └── delete.sh                      delete the stack
 ├── src/twitter_timeline_data_pipeline/
@@ -276,6 +307,8 @@ A page the parser rejects (valid JSON of an unexpected shape) is landed first an
 │       ├── process.py                 ProcessFunction handler
 │       └── media_retry.py             MediaRetryFunction handler
 └── tests/                             moto-mocked tests, no AWS account needed
+    ├── system/                        in-process simulation of the event source mapping and DLQ
+    └── integration/                   built bundle in the Lambda runtime image, with LocalStack
 ```
 
 ## Local development
@@ -301,9 +334,10 @@ uv build                     # build the sdist and wheel into dist/
 | Format | `ruff format --check` |
 | Type check | `mypy` (strict) |
 | Test | `pytest` with coverage on Python 3.14 and 3.15; 3.15 shows readiness for the next Lambda runtime. JUnit and coverage reports are uploaded as artifacts |
-| Validate template | `cfn-lint template.yaml` and `shellcheck scripts/*.sh` |
+| Validate template | `cfn-lint template.yaml`, `shellcheck scripts/*.sh`, and the offline IAM check (`scripts/check_iam.sh`; see [IAM policy validation](#iam-policy-validation)) |
 | Build | After all of the above: `uv build`, a smoke test of the wheel in an isolated environment (import, `--help`, `--version`), and the Lambda bundle zipped as `twitter_timeline_data_pipeline-<version>-lambda-arm64.zip` |
-| GitHub Release | On `v*` tags only: checks the tag, then creates the release |
+| Integration | After Build: runs the Lambda zip that Build produced in the real Lambda runtime image against LocalStack (see [Integration tests](#integration-tests)) |
+| GitHub Release | On `v*` tags only, after Build and Integration: checks the tag, then creates the release |
 
 ### Cutting a release
 
@@ -328,6 +362,66 @@ This repository is private, and publishing to PyPI would make the package public
 1. On PyPI, add a trusted publisher for this repository with workflow `ci.yml` and environment `pypi`.
 2. Create the `pypi` environment in the repository settings, ideally limited to `v*` tags with required reviewers.
 3. Set the repository variable `PUBLISH_TO_PYPI` to `true`.
+
+## Integration tests
+
+The unit tests and the in-process simulation in `tests/system/` import the source tree. The integration tests run the **built Lambda bundle** (`build/lambda/`, the same files as the release zip) in the real Lambda runtime image, so a missing dependency, a wrong-platform wheel or a bad handler path fails before a deploy does.
+
+**What runs where**
+
+- Each of the three functions runs the unzipped bundle in `public.ecr.aws/lambda/python:3.14` for `linux/arm64`, through the image's built-in Runtime Interface Emulator, and is invoked over its HTTP API. On an amd64 host (the CI runner) the image runs under QEMU.
+- [LocalStack](https://github.com/localstack/localstack) (pinned to `4.14.0`) provides SQS, S3, DynamoDB and Secrets Manager. The functions reach it through `AWS_ENDPOINT_URL`.
+- `tests/integration/stub_server.py` (standard library only) stands in for the X API and the media CDN. It needs the bearer token, so the fetch function really reads it from Secrets Manager.
+- The tests (`tests/integration/`) assert that fetched Tweets land in DynamoDB and their media in S3 (and that a media file that is gone at the source is recorded as `unavailable`), that a second fetch uses the saved checkpoint, that a poison message is received `maxReceiveCount` times and then sits in the dead-letter queue, and that in a mixed batch only the failing record is redelivered (the partial batch response).
+
+**What is emulated, and how it differs from a deployment**
+
+- The tables, bucket, queues and secret are created from the properties in `template.yaml` (key schemas, indexes, versioning, message sizes, and each function's `Environment` block with every `!Ref` resolved), not by deploying the template: LocalStack's community edition has no Python 3.14 Lambda runtime. If a function gains an environment variable that the harness cannot resolve, the run fails instead of silently going without it.
+- Queue visibility timeouts are 2 seconds and `maxReceiveCount` is 3, so the poison-message test takes seconds. The poller in `tests/integration/esm.py` plays the Lambda event source mapping: it receives a batch, invokes the function with the SQS event shape, and deletes only the records not listed in `batchItemFailures`. The visibility timeout, receive counts and the move to the dead-letter queue are LocalStack's SQS. What the real mapping adds (scaling, batching window, `MaximumConcurrency`) is not emulated.
+- Encryption, point-in-time recovery, lifecycle rules, IAM, alarms, tracing and the schedule are not emulated. The media-retry function is checked only for starting and handling an empty batch here; its behaviour is covered by `tests/system/`.
+- The process function may download only from `pbs.twimg.com` and `video.twimg.com`. The stub is on another host, so the tests set the test-only variable `MEDIA_ALLOWED_HOSTS_OVERRIDE` (comma-separated bare hostnames, also allowed over plain http). The functions log a `WARNING` when it is active, and a template test fails if any function sets it. Never set it on a real deployment.
+
+**Running locally**
+
+You need Docker, `curl`, `python3` and uv. On a non-arm64 host, enable arm64 emulation once: `docker run --privileged --rm tonistiigi/binfmt --install arm64`.
+
+```bash
+scripts/build_lambda.sh             # or unzip a CI "lambda" artifact into build/lambda/
+scripts/integration_test.sh         # start everything, run the tests, clean up; logs print on failure
+
+# or step by step, to iterate on the tests against a running stack:
+scripts/integration_test.sh up
+scripts/integration_test.sh test
+scripts/integration_test.sh logs
+scripts/integration_test.sh down
+```
+
+The first run pulls two images, and the arm64 image under emulation starts slowly. The integration tests are not collected by a plain `uv run pytest`; the script sets `RUN_INTEGRATION=1` and the `IT_*` variables the fixtures read. LocalStack releases after `4.14.0` require an account auth token: set `LOCALSTACK_AUTH_TOKEN` (the CI job passes the repository secret of that name through when it exists) and change `LOCALSTACK_IMAGE` if you move to a newer release.
+
+**In CI**
+
+The `integration` job downloads the `lambda` artifact that the Build job uploaded, unzips it, sets up QEMU, and runs `scripts/integration_test.sh up`, then `test`, then (on failure) `logs`, and always `down`. Each is a separate step, so a failure names the stage. The arm64 hosted runners are not assumed to exist for a private repository; if they are available, the QEMU step can be dropped.
+
+### IAM policy validation
+
+IAM Access Analyzer's `validate-policy` is the authoritative check, but it needs AWS credentials, which CI does not have. CI instead runs `scripts/check_iam.sh` in the template job: it expands the SAM transform offline (so the `Policies` shorthand becomes real IAM roles) and runs [checkov](https://www.checkov.io/)'s IAM checks on the result (wildcard actions and resources, admin access, privilege escalation, data exfiltration, credentials exposure, permissions management, trust policies). Any finding fails the job. To accept one, add its ID to `WAIVED` in the script with the reason beside it; there are none today.
+
+To run Access Analyzer by hand, with credentials, against a deployed stack (the policies then have literal ARNs, which the template's `!Sub` and `!GetAtt` values are not):
+
+```bash
+STACK=twitter-timeline-pipeline
+for role in $(aws cloudformation describe-stack-resources --stack-name "$STACK" \
+    --query "StackResources[?ResourceType=='AWS::IAM::Role'].PhysicalResourceId" --output text); do
+  for policy in $(aws iam list-role-policies --role-name "$role" --query PolicyNames --output text); do
+    echo "== $role / $policy"
+    aws iam get-role-policy --role-name "$role" --policy-name "$policy" \
+      --query PolicyDocument --output json > "/tmp/$policy.json"
+    aws accessanalyzer validate-policy --policy-type IDENTITY_POLICY \
+      --policy-document "file:///tmp/$policy.json" \
+      --query 'findings[].[findingType,issueCode,findingDetails]' --output text
+  done
+done
+```
 
 ## Running locally
 
@@ -365,13 +459,15 @@ uv run twitter-pipeline replay --raw "s3://$(out MediaBucketName)/raw/1000000001
 | `MEDIA_BUCKET` | fetch, process, media-retry, CLI fetch | none | Name of the media bucket. The fetch needs it to land raw pages and fails without it. A non-dry CLI fetch also requires it (exit 2) unless `--no-raw` is given: the fetch moves the shared cursor, so skipping raw pages loses them for good |
 | `MAX_RESULTS` | fetch | `100` | Tweets per API page, 5 to 100 |
 | `MAX_PAGES` | fetch | `5` | Maximum pages per run, at least 1 |
+| `USER_ID_TTL_HOURS` | fetch | `24` | Hours a stored user ID is reused before the handle is looked up again; 0 looks it up on every run, at most 8760. Set from the `UserIdTtlHours` parameter |
 | `X_API_BASE_URL` | fetch | `https://api.x.com/2` | API base URL, for testing against a stub |
 | `HTTP_TIMEOUT_SECONDS` | both | `10` | Timeout for API and media HTTP requests, must be above 0 |
+| `MEDIA_ALLOWED_HOSTS_OVERRIDE` | process, media-retry | none | Test only: extra media hosts (comma-separated bare hostnames, http allowed). Logs a warning; the template never sets it |
 | `MAX_MEDIA_BYTES` | process, media-retry | `536870912` (512 MiB) | Largest media file stored, must be above 0 |
 | `MAX_RECEIVE_COUNT` | process | none | The queue's `maxReceiveCount`; on a message's last receive its failing media are recorded as `retrying` and queued for the media-retry function instead of failing the record. Unset disables this. At least 1 |
 | `MEDIA_RETRY_QUEUE_URL` | process | none | URL of the media-retry queue |
 
-Blank values count as unset. The template sets everything except `TWITTER_BEARER_TOKEN`, `X_API_BASE_URL` and `HTTP_TIMEOUT_SECONDS`. It sets `MAX_MEDIA_BYTES` and `MAX_RECEIVE_COUNT` from the `MaxMediaBytes` and `MaxReceiveCount` parameters.
+Blank values count as unset. The template sets everything except `TWITTER_BEARER_TOKEN`, `X_API_BASE_URL`, `HTTP_TIMEOUT_SECONDS` and `MEDIA_ALLOWED_HOSTS_OVERRIDE`. It sets `MAX_MEDIA_BYTES` and `MAX_RECEIVE_COUNT` from the `MaxMediaBytes` and `MaxReceiveCount` parameters.
 
 ## Deploying
 
@@ -594,7 +690,7 @@ The script reads the table and bucket names from the stack outputs, runs `sam de
 - Metrics (`public_metrics`) are a snapshot at fetch time and are not refreshed.
 - Videos that only have HLS variants (no `video/mp4`) are recorded with status `skipped` and nothing is downloaded.
 - Media whose download returns a 4xx other than 429, or a redirect, is recorded as `unavailable`; the Tweet is still stored. Media at a non-https URL or a host other than the two X CDN hosts is recorded as `skipped`. 429 and 5xx responses and timeouts are retried.
-- One account is fetched per stack through `TwitterUsername`. The fetch event can override the username; names are normalized to lower case, with each account keeping its own cursor.
+- One account is fetched per stack through `TwitterUsername`. The fetch event can override the username (and may carry `user_id`); names are normalized to lower case, with each account keeping its own cursor.
 - The bearer token is app-only, so protected accounts and private data are not available.
 
 ## Python 3.14 features used

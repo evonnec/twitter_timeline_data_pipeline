@@ -238,6 +238,12 @@ class XClient:
             body = self._request(endpoint, params)
             if errors := body.get("errors"):
                 if not body.get("data"):
+                    if _is_not_found(errors):
+                        raise NotFoundError(
+                            f"timeline page {page_number}: user {user_id} not found: "
+                            f"{_first_error_text(body) or 'no detail'}",
+                            status_code=200,
+                        )
                     # e.g. a protected account: 200 with only an Authorization Error.
                     # Treating that as "no more Tweets" would drop unfetched ranges.
                     raise XApiError(
@@ -357,6 +363,17 @@ def _first_error_text(body: Mapping[str, Any]) -> str | None:
     errors = body.get("errors")
     first = errors[0] if isinstance(errors, list) and errors else None
     return _describe(first) if isinstance(first, Mapping) else None
+
+
+def _is_not_found(errors: Any) -> bool:
+    """Whether the first entry of an ``errors`` array is a resource-not-found."""
+    first = errors[0] if isinstance(errors, list) and errors else None
+    return (
+        isinstance(first, Mapping)
+        and first.get("title") == "Not Found Error"
+        and first.get("resource_type") == "user"
+        and first.get("parameter") == "id"
+    )
 
 
 def _describe(info: Mapping[str, Any]) -> str | None:

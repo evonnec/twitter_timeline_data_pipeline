@@ -7,6 +7,7 @@ import sys
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import asdict
+from datetime import timedelta
 
 from botocore.exceptions import BotoCoreError, ClientError
 
@@ -20,6 +21,7 @@ from twitter_timeline_data_pipeline.credentials import (
 from twitter_timeline_data_pipeline.handlers import quiet_library_loggers
 from twitter_timeline_data_pipeline.handlers.fetch import (
     EnqueueError,
+    IdentityChangedError,
     checkpoint_store,
     run_fetch,
     send_messages,
@@ -179,6 +181,7 @@ def _fetch(args: argparse.Namespace) -> int:
             max_pages=max_pages,
             since_id=args.since_id,
             raw_pages=raw_pages,
+            user_id_ttl=timedelta(hours=settings.user_id_ttl_hours),
         )
         print(json.dumps(asdict(result)))
     return EXIT_OK
@@ -239,6 +242,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         CredentialsError,
         EnqueueError,
         RawPageError,
+        IdentityChangedError,
         ClientError,
         BotoCoreError,
         ValueError,  # malformed upstream data; bad arguments were rejected above

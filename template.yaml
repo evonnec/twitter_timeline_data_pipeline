@@ -25,6 +25,12 @@ Parameters:
     Default: 5
     MinValue: 1
     Description: Maximum timeline pages per fetch run.
+  UserIdTtlHours:
+    Type: Number
+    Default: 24
+    MinValue: 0
+    MaxValue: 8760
+    Description: Hours a resolved user ID is reused before the handle is looked up again (0 looks it up on every run).
   MaxResults:
     Type: Number
     Default: 100
@@ -288,6 +294,7 @@ Resources:
           MEDIA_BUCKET: !Ref MediaBucket
           MAX_PAGES: !Ref MaxPages
           MAX_RESULTS: !Ref MaxResults
+          USER_ID_TTL_HOURS: !Ref UserIdTtlHours
       Policies:
         - SQSSendMessagePolicy:
             QueueName: !GetAtt TweetsQueue.QueueName

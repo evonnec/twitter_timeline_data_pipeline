@@ -769,3 +769,31 @@ def test_unparseable_page_raises_an_error_carrying_the_raw_page() -> None:
     assert info.value.raw.endpoint == f"/users/{USER_ID}/tweets"
     assert info.value.status_code == 200
     assert isinstance(info.value, XApiError)
+
+
+def _not_found(**overrides: str) -> dict[str, Any]:
+    error = {"title": "Not Found Error", "resource_type": "user", "parameter": "id"}
+    return {"errors": [{**error, **overrides}], "meta": {"result_count": 0}}
+
+
+def test_iter_timeline_user_not_found_raises_not_found() -> None:
+    with (
+        x_client(script(ok(_not_found()))) as client,
+        pytest.raises(NotFoundError, match="not found"),
+    ):
+        list(client.iter_timeline(USER_ID))
+
+
+@pytest.mark.parametrize(
+    "overrides", [{"resource_type": "tweet"}, {"parameter": "ids"}]
+)
+def test_iter_timeline_other_not_found_errors_are_not_a_missing_user(
+    overrides: dict[str, str],
+) -> None:
+    with (
+        x_client(script(ok(_not_found(**overrides)))) as client,
+        pytest.raises(XApiError) as e,
+    ):
+        list(client.iter_timeline(USER_ID))
+
+    assert not isinstance(e.value, NotFoundError)
