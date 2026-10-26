@@ -18,7 +18,7 @@ from typing import Any, Self
 
 import httpx
 
-from twitter_timeline_data_pipeline import __version__
+from twitter_timeline_data_pipeline import USER_AGENT
 from twitter_timeline_data_pipeline.config import DEFAULT_X_API_BASE_URL
 from twitter_timeline_data_pipeline.models import (
     JSONObject,
@@ -112,7 +112,7 @@ class XClient:
         self._http = http_client or httpx.Client(
             base_url=base_url,
             timeout=timeout,
-            headers={"User-Agent": f"twitter-timeline-data-pipeline/{__version__}"},
+            headers={"User-Agent": USER_AGENT},
         )
 
     def __repr__(self) -> str:

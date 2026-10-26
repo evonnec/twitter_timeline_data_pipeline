@@ -2,7 +2,9 @@
 
 ``run_fetch`` is the testable core; ``handler`` wires it to AWS. The checkpoint moves
 only after every message of the run is enqueued, so a failure can cause duplicates on
-the next run (processing is idempotent) but never lost Tweets.
+the next run (processing is idempotent). The one known loss is the page-cap gap: when a
+run hits ``max_pages`` with a checkpoint set, Tweets between the checkpoint and the
+oldest Tweet fetched are skipped (logged as a warning).
 """
 
 import dataclasses
@@ -47,7 +49,7 @@ class FetchResult:
     tweets: int
     enqueued: int
     truncated: bool
-    """The last page still had a ``next_token``: the page cap cut the run short."""
+    """The page cap cut the run short: the last page still had a ``next_token``."""
 
 
 def _send_batch(
@@ -92,15 +94,18 @@ def run_fetch(
 ) -> FetchResult:
     """Enqueue every new Tweet of ``username``, then advance the checkpoint.
 
-    ``since_id`` overrides the stored checkpoint (the checkpoint is still advanced).
+    ``username`` is normalized (no ``@``, lower case; X handles are case-insensitive)
+    and used for the lookup, the messages and the checkpoint. ``since_id`` overrides the
+    stored checkpoint (the checkpoint is still advanced). Duplicates are possible after
+    a failed run; with ``truncated`` set, older Tweets in the page-cap gap are skipped.
     """
+    username = username.removeprefix("@").lower()
     user_id = x_client.get_user_id(username)
     since_id = since_id or checkpoints.get(username)
 
     pages = tweets = enqueued = 0
     newest_id: TweetId | None = None
     oldest_id: TweetId | None = None
-    truncated = False
     for page in x_client.iter_timeline(
         user_id, since_id=since_id, max_results=max_results, max_pages=max_pages
     ):
@@ -115,10 +120,15 @@ def run_fetch(
                 newest_id = tweet.id
             if oldest_id is None or not is_newer(tweet.id, oldest_id):
                 oldest_id = tweet.id
-        truncated = page.next_token is not None
 
-    if newest_id is not None:
-        checkpoints.advance(username, newest_id)
+    # The client stops with a token outstanding only when it hits the page cap; a
+    # trailing empty page yields nothing, so `page` is the last one with data.
+    truncated = pages == max_pages and page.next_token is not None
+    if newest_id is not None and not checkpoints.advance(username, newest_id):
+        logger.info(
+            "checkpoint for %s not moved: another run already stored a newer mark",
+            username,
+        )
     if truncated and since_id is not None:
         logger.warning(
             "page cap reached for %s: Tweets between since_id %s and the oldest "
