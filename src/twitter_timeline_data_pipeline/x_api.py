@@ -68,6 +68,15 @@ class XApiError(RuntimeError):
         self.status_code = status_code
 
 
+class PageParseError(XApiError):
+    """A 200 response that ``parse_timeline_page`` could not read. ``raw`` is the page
+    as received, so the caller can keep it before failing."""
+
+    def __init__(self, message: str, *, raw: RawPage) -> None:
+        super().__init__(message, status_code=200)
+        self.raw = raw
+
+
 class InvalidUsernameError(ValueError):
     """The username is not a valid X handle (a caller mistake, not an API fault)."""
 
@@ -291,9 +300,16 @@ class XClient:
                     len(errors),
                     _first_error_text(body) or "no detail",
                 )
-            page = parse_timeline_page(
-                body, raw=RawPage(endpoint=endpoint, params=dict(params), body=body)
-            )
+            raw = RawPage(endpoint=endpoint, params=dict(params), body=body)
+            try:
+                page = parse_timeline_page(body, raw=raw)
+            except Exception as exc:
+                # Page-level shape errors (a non-list ``data``): the caller lands the
+                # raw page before failing the run.
+                raise PageParseError(
+                    f"timeline page {page_number} could not be parsed: {exc!r}",
+                    raw=raw,
+                ) from exc
             if not page.tweets and not page.quarantined and not page.next_token:
                 # a clean empty response ends the walk without a page; a page whose
                 # Tweets all failed to parse is not empty, it has items to quarantine

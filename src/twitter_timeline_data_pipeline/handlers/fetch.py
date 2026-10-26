@@ -39,7 +39,12 @@ from twitter_timeline_data_pipeline.storage import (
     Gap,
     merge_gaps,
 )
-from twitter_timeline_data_pipeline.x_api import AuthError, RateLimitError, XClient
+from twitter_timeline_data_pipeline.x_api import (
+    AuthError,
+    PageParseError,
+    RateLimitError,
+    XClient,
+)
 
 if TYPE_CHECKING:
     from mypy_boto3_sqs import SQSClient
@@ -268,6 +273,21 @@ class _Run:
                 self.pages += 1
                 last = page
                 yield page
+        except PageParseError as exc:
+            self.requests += 1
+            # The response is valid JSON the parser rejects: keep it before failing,
+            # so the data can be replayed once the parser is fixed. Nothing is
+            # enqueued and the cursor stays.
+            if self.raw_pages is not None:
+                key = self.raw_pages.put(
+                    username=self.username,
+                    user_id=self.user_id,
+                    fetched_at=utc_now_iso(),
+                    page_no=self.pages + 1,
+                    page=exc.raw,
+                )
+                logger.error("unparseable page kept at %s: %s", key, exc)
+            raise
         except Exception:
             self.requests += 1
             raise

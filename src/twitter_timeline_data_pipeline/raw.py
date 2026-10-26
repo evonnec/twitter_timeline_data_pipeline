@@ -18,6 +18,7 @@ object keys are unique per page and never overwritten.
 import functools
 import gzip
 import json
+import logging
 import uuid
 import zlib
 from collections.abc import Iterator, Mapping
@@ -26,12 +27,15 @@ from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
 import boto3
+from botocore.exceptions import ClientError
 
 from twitter_timeline_data_pipeline.config import ConfigError
 from twitter_timeline_data_pipeline.models import JSONObject, RawPage
 
 if TYPE_CHECKING:
     from mypy_boto3_s3 import S3Client
+
+logger = logging.getLogger(__name__)
 
 RAW_PREFIX = "raw/"
 ENVELOPE_VERSION = 1
@@ -64,9 +68,12 @@ class Envelope:
     fetched_at: str
     request: Mapping[str, Any]
     response: JSONObject
+    redactions: tuple[str, ...] = ()
+    """IDs of Tweets removed from ``response`` or to be ignored (a deletion request);
+    replay skips them. Written only by the compliance job; omitted when empty."""
 
     def to_dict(self) -> JSONObject:
-        return {
+        data: JSONObject = {
             "schema_version": ENVELOPE_VERSION,
             "username": self.username,
             "user_id": self.user_id,
@@ -74,6 +81,9 @@ class Envelope:
             "request": dict(self.request),
             "response": self.response,
         }
+        if self.redactions:
+            data["redactions"] = list(self.redactions)
+        return data
 
     def to_bytes(self) -> bytes:
         # ASCII-only JSON: a lone surrogate in the response (valid JSON escape) can't
@@ -101,12 +111,18 @@ class Envelope:
             request = parsed["request"]
             if not isinstance(response, dict) or not isinstance(request, dict):
                 raise TypeError("request and response must be objects")
+            redactions = parsed.get("redactions", [])
+            if not isinstance(redactions, list) or not all(
+                isinstance(r, str) for r in redactions
+            ):
+                raise TypeError("redactions must be a list of Tweet IDs")
             return cls(
                 username=str(parsed["username"]),
                 user_id=str(parsed["user_id"]),
                 fetched_at=str(parsed["fetched_at"]),
                 request=request,
                 response=response,
+                redactions=tuple(redactions),
             )
         except (KeyError, TypeError) as exc:
             raise RawPageError(f"malformed envelope: {exc!r}") from exc
@@ -131,6 +147,8 @@ class RawPageStore:
     ) -> str:
         """Upload one page and return its key. Raises if the upload fails: the caller
         must not enqueue the page's messages then."""
+        # Written once: the key holds the run's ID, so an existing object is this same
+        # page from an earlier attempt, and is left as it is.
         key = raw_key(user_id, fetched_at, self.run_id, page_no)
         envelope = Envelope(
             username=username,
@@ -139,35 +157,58 @@ class RawPageStore:
             request={"endpoint": page.endpoint, "params": dict(page.params)},
             response=page.body,
         )
-        self.s3.put_object(
-            Bucket=self.bucket,
-            Key=key,
-            Body=envelope.to_bytes(),
-            ContentType="application/json",
-            ContentEncoding="gzip",
-        )
+        try:
+            self.s3.put_object(
+                Bucket=self.bucket,
+                Key=key,
+                Body=envelope.to_bytes(),
+                ContentType="application/json",
+                ContentEncoding="gzip",
+                IfNoneMatch="*",
+            )
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") != "PreconditionFailed":
+                raise
+            logger.info("raw page %s already landed", key)
         return key
 
 
 def parse_s3_uri(uri: str) -> tuple[str, str]:
     """``s3://bucket/raw/prefix`` -> ``(bucket, prefix)``. ``ConfigError`` unless the
-    prefix is under ``raw/``."""
+    prefix is under ``raw/``. The prefix always ends in ``/``, so it matches whole path
+    segments (``raw/1`` does not select ``raw/10/...``)."""
     parsed = urlparse(uri)
     prefix = parsed.path.removeprefix("/")
     if parsed.scheme != "s3" or not parsed.netloc or not prefix.startswith(RAW_PREFIX):
         raise ConfigError(f"expected s3://<bucket>/{RAW_PREFIX}<prefix>, got {uri!r}")
-    return parsed.netloc, prefix
+    return parsed.netloc, prefix if prefix.endswith("/") else prefix + "/"
 
 
 def iter_raw_objects(
-    s3: S3Client, bucket: str, prefix: str, *, page_size: int = 1000
+    s3: S3Client,
+    bucket: str,
+    prefix: str,
+    *,
+    start_after: str | None = None,
+    skipped: list[str] | None = None,
+    page_size: int = 1000,
 ) -> Iterator[tuple[str, bytes]]:
-    """``(key, body)`` of every object under ``prefix``, in key order (paginated)."""
+    """``(key, body)`` of every object under ``prefix``, in key order (paginated),
+    after ``start_after`` if given. Zero-byte keys ending in ``/`` (console "folders")
+    are not pages: they are skipped and appended to ``skipped``."""
     paginator = s3.get_paginator("list_objects_v2")
+    options: dict[str, Any] = {"StartAfter": start_after} if start_after else {}
     for listing in paginator.paginate(
-        Bucket=bucket, Prefix=prefix, PaginationConfig={"PageSize": page_size}
+        Bucket=bucket,
+        Prefix=prefix,
+        PaginationConfig={"PageSize": page_size},
+        **options,
     ):
         for entry in listing.get("Contents", ()):
             key = entry["Key"]
+            if key.endswith("/") and entry.get("Size", 0) == 0:
+                if skipped is not None:
+                    skipped.append(key)
+                continue
             body = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
             yield key, body

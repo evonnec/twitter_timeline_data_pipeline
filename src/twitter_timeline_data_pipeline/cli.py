@@ -95,6 +95,12 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     fetch.add_argument("--since-id", help="only Tweets newer than this ID")
     fetch.add_argument(
+        "--no-raw",
+        action="store_true",
+        help="do not land raw API pages in S3 (otherwise MEDIA_BUCKET is required); "
+        "the fetch still moves the shared cursor, so those Tweets' raw pages are lost",
+    )
+    fetch.add_argument(
         "--dry-run",
         action="store_true",
         help="print messages to stdout; no queue, table or checkpoint access "
@@ -112,6 +118,12 @@ def _build_parser() -> argparse.ArgumentParser:
         required=True,
         metavar="S3_URI",
         help="s3://<bucket>/raw/<prefix> of the pages to replay",
+    )
+    replay.add_argument(
+        "--start-after",
+        metavar="KEY",
+        help="resume: skip objects up to and including this key (the last "
+        "'replayed' key in the log of a stopped replay)",
     )
     replay.add_argument(
         "--dry-run",
@@ -134,6 +146,8 @@ def _fetch(args: argparse.Namespace) -> int:
     max_results = args.max_results or settings.max_results
     if not args.dry_run:
         settings.require("queue_url", "state_table")
+        if not args.no_raw:
+            settings.require("media_bucket")
 
     token = get_bearer_token(settings)
     with XClient(
@@ -154,14 +168,20 @@ def _fetch(args: argparse.Namespace) -> int:
 
         assert settings.queue_url and settings.state_table  # narrowed by require()
         raw_pages = quarantine = None
-        if settings.media_bucket:
-            raw_pages = RawPageStore(s3_client(), settings.media_bucket)
-            quarantine = QuarantineStore(
-                s3_client(), settings.media_bucket, run_id=raw_pages.run_id
+        if args.no_raw:
+            logger.warning(
+                "--no-raw: raw API pages will not be landed in S3. A page with an "
+                "unparseable Tweet then fails the run unless MEDIA_BUCKET is set for "
+                "quarantine"
             )
         else:
-            logger.warning(
-                "MEDIA_BUCKET is not set: raw API pages will not be landed in S3"
+            assert settings.media_bucket  # narrowed by require()
+            raw_pages = RawPageStore(s3_client(), settings.media_bucket)
+        if settings.media_bucket:
+            quarantine = QuarantineStore(
+                s3_client(),
+                settings.media_bucket,
+                run_id=raw_pages.run_id if raw_pages else None,
             )
         result = run_fetch(
             username=args.username,
@@ -216,9 +236,21 @@ def _replay(args: argparse.Namespace) -> int:
             return send_messages(sqs, queue_url, messages, time.sleep, reject)
 
     result = run_replay(
-        s3=s3_client(), bucket=bucket, prefix=prefix, send=send, quarantine=quarantine
+        s3=s3_client(),
+        bucket=bucket,
+        prefix=prefix,
+        send=send,
+        quarantine=quarantine,
+        start_after=args.start_after,
     )
     print(json.dumps(asdict(result)), file=sys.stderr if args.dry_run else sys.stdout)
+    if result.skipped:
+        logger.warning("skipped non-page keys: %s", ", ".join(result.skipped))
+    if result.objects == 0:
+        print(
+            f"error: no raw pages found under s3://{bucket}/{prefix}", file=sys.stderr
+        )
+        return EXIT_FAILURE
     return EXIT_OK
 
 

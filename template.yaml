@@ -155,8 +155,15 @@ Resources:
             Status: Enabled
             AbortIncompleteMultipartUpload:
               DaysAfterInitiation: 7
+          # Per prefix, never bucket-wide: raw/ versions are never expired.
           - Id: expire-noncurrent-versions
             Status: Enabled
+            Prefix: media/
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+          - Id: expire-noncurrent-text-versions
+            Status: Enabled
+            Prefix: text/
             NoncurrentVersionExpiration:
               NoncurrentDays: 30
           - Id: tier-media
@@ -165,14 +172,9 @@ Resources:
             Transitions:
               - StorageClass: INTELLIGENT_TIERING
                 TransitionInDays: 0
-          # Raw API pages are the only copy of fields the processor doesn't keep, and
-          # the API can't serve old posts again: archive them, never expire them.
-          - Id: archive-raw-pages
-            Status: Enabled
-            Prefix: raw/
-            Transitions:
-              - StorageClass: GLACIER_IR
-                TransitionInDays: 90
+          # No rule for raw/ on purpose: those pages are the only copy of fields the
+          # processor doesn't keep, so they are never expired or tiered (gzipped pages
+          # are far below the 128 KB S3 minimum for lifecycle transitions anyway).
 
   MediaBucketPolicy:
     Type: AWS::S3::BucketPolicy
@@ -339,7 +341,10 @@ Resources:
           Statement:
             - Effect: Allow
               Action: [s3:PutObject, s3:GetObject, s3:AbortMultipartUpload]
-              Resource: !Sub "${MediaBucket.Arn}/*"
+              # media/ and text/ only: the processor can't touch raw/ pages.
+              Resource:
+                - !Sub "${MediaBucket.Arn}/media/*"
+                - !Sub "${MediaBucket.Arn}/text/*"
             # ListBucket makes HeadObject return 404 instead of 403 for missing keys.
             - Effect: Allow
               Action: s3:ListBucket

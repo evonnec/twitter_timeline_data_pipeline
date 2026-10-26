@@ -197,7 +197,7 @@ If a Tweet has no `author_id`, the lower-cased username is used instead. The key
 
 The same bucket also holds the full text of oversized long posts at `text/<author_id>/<tweet_id>.json` (a JSON string, `application/json`, user metadata `tweet-id`); see the Tweets table. These objects are not tiered.
 
-Each object has the `Content-Type` of the source and user metadata `tweet-id`, `media-key` and `source-url`. The bucket is encrypted (SSE-S3), blocks all public access, refuses non-TLS requests, and aborts incomplete multipart uploads after 7 days. Versioning is on, so a deleted or overwritten object can be recovered for 30 days (noncurrent versions then expire). Objects under `media/` move to S3 Intelligent-Tiering on day 0, so cold video stops costing Standard rates; the trade-off is a small per-object monitoring fee, and objects under 128 KB are never tiered.
+Each object has the `Content-Type` of the source and user metadata `tweet-id`, `media-key` and `source-url`. The bucket is encrypted (SSE-S3), blocks all public access, refuses non-TLS requests, and aborts incomplete multipart uploads after 7 days. Versioning is on, so a deleted or overwritten object can be recovered for 30 days (noncurrent versions under `media/` and `text/` then expire; `raw/` versions never do). Objects under `media/` move to S3 Intelligent-Tiering on day 0, so cold video stops costing Standard rates; the trade-off is a small per-object monitoring fee, and objects under 128 KB are never tiered.
 
 ## Design decisions
 
@@ -237,9 +237,11 @@ raw/<user_id>/dt=YYYY-MM-DD/<run_id>-<page_no>.json.gz
 
 `request.params` holds the query parameters (the bearer token is a header and is never stored); `response` is the body as received. `fetched_at` is the same value the page's messages carry. Each message has an optional `raw_key` (additive, `schema_version` stays 1) and the Tweet item stores it as `raw_key`, so any item can be traced to the page it came from.
 
-The `FetchFunction` role may only `s3:PutObject` under `raw/*`. A lifecycle rule moves `raw/` objects to S3 Glacier Instant Retrieval after 90 days (still readable in milliseconds) and never expires them. They are encrypted and, with the bucket, private and versioned like the media.
+Pages are written once (`If-None-Match: *`; an existing key is the same page from an earlier attempt and is left alone). The `FetchFunction` role may only `s3:PutObject` under `raw/*`, and `ProcessFunction` is limited to `media/*` and `text/*`, so no function can overwrite or delete a raw page. No lifecycle rule touches `raw/`: nothing is expired, and noncurrent versions are expired only under `media/` and `text/`. There is no storage-class transition either: gzipped pages are far below the 128 KB minimum S3 applies to lifecycle transitions, so one would do nothing. The pages are encrypted, private and versioned like the media.
 
-**Retention and deletion.** A raw page holds up to 100 Tweets, so it cannot be deleted for one Tweet. It is kept indefinitely. A job that honours deletion requests (issue #21) must treat `raw/` separately: removing a Tweet from the table does not remove it from the raw pages that contain it, and `replay` would restore it. Decide that policy (for example, rewriting or deleting the affected pages) before relying on `replay` after such deletions.
+A page the parser rejects (valid JSON of an unexpected shape) is landed first and then fails the run with the cursor unmoved, so the data is kept and can be replayed once the parser is fixed.
+
+**Retention and deletion.** A raw page holds up to 100 Tweets, so it cannot be deleted for one Tweet. It is kept indefinitely. Deletions in `raw/` belong to the compliance job of issue #21: it rewrites the affected pages to remove deleted Tweets and records their IDs in an optional envelope field `redactions` (a list of Tweet IDs). `replay` never replays a Tweet listed in `redactions`, nor media used only by it.
 
 ### Quarantine
 
@@ -251,7 +253,7 @@ quarantine/<user_id>/dt=YYYY-MM-DD/<run_id>-<page_no>-<index>.json
 
 Each object is plain JSON (`application/json`): `{"kind": "tweet" | "media" | "message", "raw_key": "<the raw page>", "error": "...", "item": <the JSON as received>}`. `run_id` and `page_no` match the raw page's key (`index` counts the page's quarantined items from 000). A `message` is an SQS message body that SQS rejected with `SenderFault` (for example an oversized one): such an entry would fail the same way again, so it isn't retried, it is quarantined and the run goes on. Entries that failed for other reasons are still retried, and `EnqueueError` is raised if they keep failing.
 
-If a quarantine write fails (or there is no media bucket to write to), the page fails like a failed raw upload: nothing is enqueued, the cursor stays and the next run fetches it again. The `FetchFunction` role may `s3:PutObject` under `quarantine/*` only.
+If a quarantine write fails (or there is no media bucket to write to: `fetch --no-raw` without `MEDIA_BUCKET` is unsafe for malformed pages, they fail the run), the page fails like a failed raw upload: nothing is enqueued, the cursor stays and the next run fetches it again. The `FetchFunction` role may `s3:PutObject` under `quarantine/*` only.
 
 Every quarantined item logs a stable line: `unparseable <kind> quarantined: id=... error=...` (ERROR, when parsed) and `quarantined <kind>: key=... raw_key=... error=...` (WARNING, when written). Errors alongside data log `timeline page N has K partial error(s); first: ...` (WARNING). Alarms on these come with issue #19.
 
@@ -355,7 +357,7 @@ export TWITTER_BEARER_TOKEN='<your bearer token>'
 uv run twitter-pipeline fetch --username NASA --dry-run
 ```
 
-It resolves the username, pages through the timeline, and prints one SQS message body per Tweet to stdout, as compact JSON on one line each. Logs go to stderr. Nothing is sent to SQS and no checkpoint is read or written. Without `--dry-run` it does the real fetch (needs `QUEUE_URL`, `STATE_TABLE` and AWS credentials) and prints a JSON summary of the run. A real CLI fetch lands raw pages in S3 like the Lambda does when `MEDIA_BUCKET` is set (and warns if it is not); a dry run never writes anything.
+It resolves the username, pages through the timeline, and prints one SQS message body per Tweet to stdout, as compact JSON on one line each. Logs go to stderr. Nothing is sent to SQS and no checkpoint is read or written. Without `--dry-run` it does the real fetch (needs `QUEUE_URL`, `STATE_TABLE` and AWS credentials) and prints a JSON summary of the run. A real CLI fetch lands raw pages in S3 like the Lambda and so needs `MEDIA_BUCKET` (exit 2 without it) unless you pass `--no-raw`; a dry run never writes anything.
 
 Other options: `--max-pages`, `--max-results` (5 to 100), `--since-id` and `--log-level`; see `uv run twitter-pipeline fetch --help`. Exit codes: 0 success; 1 an upstream or runtime failure (X API, malformed API data, an unreadable secret, enqueue, or an AWS SDK error such as SQS or DynamoDB access denied; the one-line message goes to stderr and the traceback shows with `--log-level DEBUG`); 2 bad arguments or configuration (invalid username, out-of-range option, missing `QUEUE_URL` or `STATE_TABLE`, or no bearer token configured).
 
@@ -367,7 +369,7 @@ uv run twitter-pipeline replay --raw "s3://$(out MediaBucketName)/raw/1000000001
 uv run twitter-pipeline replay --raw "s3://$(out MediaBucketName)/raw/1000000001/"
 ```
 
-`replay` lists every object under the prefix (it must start with `raw/`; any prefix of a key works, from a whole user down to one run), reads the envelopes, re-parses each response with the same code the fetch uses and enqueues the messages to `QUEUE_URL`, in key order. It calls no API and never reads or changes the fetch cursor. Messages are rebuilt with the envelope's `username`, its original `fetched_at` and the object's key as `raw_key`: for an unchanged parser the bodies are identical to what the fetch sent. Because `fetched_at` is the original one, the processor's conditional write keeps a replay from overwriting an item fetched later; it rewrites items of the same fetch. Items that fail to parse, and messages SQS rejects with `SenderFault`, are quarantined in the same bucket as in a fetch (see [Quarantine](#quarantine)); a dry run only logs them. `--dry-run` prints the bodies to stdout and makes no queue calls. An object that can't be read stops the replay with its key in the error (exit 1); a bad URI or a missing `QUEUE_URL` exits 2. Replay is safe to repeat. It is the way to reprocess after a parser change or to restore a wiped table; use the DLQ redrive below for messages that merely failed.
+`replay` lists every object under the prefix (it must start with `raw/`; a trailing `/` is added, so the prefix matches whole path segments: `raw/1` selects `raw/1/...`, not `raw/10/...`; from a whole user down to one `dt=` day), reads the envelopes, re-parses each response with the same code the fetch uses and enqueues the messages to `QUEUE_URL`, in key order. It calls no API and never reads or changes the fetch cursor. Messages are rebuilt with the envelope's `username`, its original `fetched_at` and the object's key as `raw_key`: for an unchanged parser the bodies are identical to what the fetch sent. Because `fetched_at` is the original one, the processor's conditional write keeps a replay from overwriting an item fetched later; it rewrites items of the same fetch. Items that fail to parse, and messages SQS rejects with `SenderFault`, are quarantined in the same bucket as in a fetch (see [Quarantine](#quarantine)); a dry run only logs them. `--dry-run` prints the bodies to stdout and makes no queue calls. Zero-byte keys ending in `/` (console folders) are skipped and listed in the summary. An object that can't be read (not gzip, wrong envelope, an invalid `fetched_at`) stops the replay with its key in the error (exit 1), and so does a prefix with no pages (zero objects); the log has a `replayed <key>` line per object, and `--start-after <key>` resumes after the last one. Needed permissions: `s3:ListBucket` on the bucket (prefix `raw/`), `s3:GetObject` on `raw/*` and, unless `--dry-run`, `sqs:SendMessage` on the queue. a bad URI or a missing `QUEUE_URL` exits 2. Replay is safe to repeat. It is the way to reprocess after a parser change or to restore a wiped table; use the DLQ redrive below for messages that merely failed.
 
 ### Environment variables
 
@@ -379,7 +381,7 @@ uv run twitter-pipeline replay --raw "s3://$(out MediaBucketName)/raw/1000000001
 | `QUEUE_URL` | fetch | none | URL of the tweets queue |
 | `STATE_TABLE` | fetch | none | Name of the checkpoint table |
 | `TWEETS_TABLE` | process, media-retry | none | Name of the tweets table |
-| `MEDIA_BUCKET` | fetch, process, media-retry, `replay`, CLI fetch | none | Name of the media bucket. The fetch needs it to land raw pages and fails without it; the CLI fetch warns and skips raw pages when it is unset |
+| `MEDIA_BUCKET` | fetch, process, media-retry, CLI fetch | none | Name of the media bucket. The fetch needs it to land raw pages and fails without it. A non-dry CLI fetch also requires it (exit 2) unless `--no-raw` is given: the fetch moves the shared cursor, so skipping raw pages loses them for good |
 | `MAX_RESULTS` | fetch | `100` | Tweets per API page, 5 to 100 |
 | `MAX_PAGES` | fetch | `5` | Maximum pages per run, at least 1 |
 | `X_API_BASE_URL` | fetch | `https://api.x.com/2` | API base URL, for testing against a stub |

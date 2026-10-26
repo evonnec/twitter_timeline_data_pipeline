@@ -505,7 +505,7 @@ def test_cli_fetch_quarantines_with_the_bucket(
     assert len(quarantined(pipeline_env)) == 1
 
 
-def test_cli_fetch_without_a_bucket_fails_on_a_bad_tweet(
+def test_cli_fetch_no_raw_without_a_bucket_fails_on_a_bad_tweet(
     pipeline_env: Aws,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -513,7 +513,7 @@ def test_cli_fetch_without_a_bucket_fails_on_a_bad_tweet(
     install_x_api(monkeypatch, cli, serving(body_of([bad_tweet()])))
     monkeypatch.delenv("MEDIA_BUCKET")
 
-    assert main(["fetch", "--username", USERNAME]) == cli.EXIT_FAILURE
+    assert main(["fetch", "--username", USERNAME, "--no-raw"]) == cli.EXIT_FAILURE
 
     assert "needs quarantining" in capsys.readouterr().err
 

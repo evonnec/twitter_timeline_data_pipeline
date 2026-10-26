@@ -7,15 +7,20 @@ builds the same messages the fetch built, with the envelope's ``username``, its
 original ``fetched_at`` and the object's key as ``raw_key``. Keeping the original
 ``fetched_at`` makes a replay safe to run at any time: the processor's conditional
 write never lets it overwrite an item fetched later, and replaying twice rewrites the
-same data. It never touches the fetch cursor.
+same data. It never touches the fetch cursor. Tweets listed in an envelope's
+``redactions`` (deletion requests) are never replayed.
 """
 
 import logging
 from collections.abc import Callable, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
-from twitter_timeline_data_pipeline.models import TweetMessage
+from twitter_timeline_data_pipeline.models import (
+    TimelinePage,
+    TweetMessage,
+    normalize_fetched_at,
+)
 from twitter_timeline_data_pipeline.quarantine import QuarantineStore
 from twitter_timeline_data_pipeline.raw import Envelope, RawPageError, iter_raw_objects
 from twitter_timeline_data_pipeline.x_api import parse_timeline_page
@@ -32,6 +37,22 @@ class ReplayResult:
     tweets: int
     enqueued: int
     """Messages sent; 0 for a dry run."""
+    skipped: tuple[str, ...] = ()
+    """Keys that are not pages (zero-byte ``/`` markers)."""
+    last_key: str | None = None
+    """The last object fully handled: pass it as ``--start-after`` to resume."""
+
+
+def without_redactions(page: TimelinePage, redactions: tuple[str, ...]) -> TimelinePage:
+    """``page`` minus the redacted Tweets and the media only they used."""
+    if not redactions:
+        return page
+    gone = set(redactions)
+    kept = tuple(t for t in page.tweets if t.id not in gone)
+    used = {key for t in kept for key in t.media_keys}
+    dropped = {key for t in page.tweets if t.id in gone for key in t.media_keys}
+    media = {k: m for k, m in page.media.items() if k in used or k not in dropped}
+    return replace(page, tweets=kept, media=media)
 
 
 def messages_from_raw(
@@ -40,22 +61,36 @@ def messages_from_raw(
     prefix: str,
     *,
     quarantine: QuarantineStore | None = None,
+    start_after: str | None = None,
+    skipped: list[str] | None = None,
     page_size: int = 1000,
 ) -> Iterator[tuple[str, list[TweetMessage]]]:
     """``(key, messages)`` for each raw object under ``prefix``, in key order.
 
     Items that fail to parse are written to ``quarantine`` (none: only logged, as in a
     dry run) and the rest of the page is replayed. Raises ``RawPageError`` (naming the
-    key) for an object that can't be read back.
+    key) for an object that can't be read back, including one whose ``fetched_at`` is
+    not a valid time.
     """
     for page_no, (key, body) in enumerate(
-        iter_raw_objects(s3, bucket, prefix, page_size=page_size), start=1
+        iter_raw_objects(
+            s3,
+            bucket,
+            prefix,
+            start_after=start_after,
+            skipped=skipped,
+            page_size=page_size,
+        ),
+        start=1,
     ):
         try:
             envelope = Envelope.from_bytes(body)
-            page = parse_timeline_page(envelope.response)
+            fetched_at = normalize_fetched_at(envelope.fetched_at)
+            page = without_redactions(
+                parse_timeline_page(envelope.response), envelope.redactions
+            )
             messages = page.messages(
-                envelope.username, fetched_at=envelope.fetched_at, raw_key=key
+                envelope.username, fetched_at=fetched_at, raw_key=key
             )
         except (RawPageError, ValueError, KeyError, TypeError, AttributeError) as exc:
             raise RawPageError(f"{key}: {exc}") from exc
@@ -80,13 +115,30 @@ def run_replay(
     prefix: str,
     send: Callable[[list[TweetMessage]], int],
     quarantine: QuarantineStore | None = None,
+    start_after: str | None = None,
 ) -> ReplayResult:
     """Hand the messages of every raw page under ``prefix`` to ``send`` (which returns
     how many it sent; a dry run prints them and returns 0)."""
     objects = tweets = enqueued = 0
-    for key, messages in messages_from_raw(s3, bucket, prefix, quarantine=quarantine):
+    last_key = None
+    skipped: list[str] = []
+    for key, messages in messages_from_raw(
+        s3,
+        bucket,
+        prefix,
+        quarantine=quarantine,
+        start_after=start_after,
+        skipped=skipped,
+    ):
         objects += 1
         tweets += len(messages)
         enqueued += send(messages)
+        last_key = key
         logger.info("replayed %s: %d tweets", key, len(messages))
-    return ReplayResult(objects=objects, tweets=tweets, enqueued=enqueued)
+    return ReplayResult(
+        objects=objects,
+        tweets=tweets,
+        enqueued=enqueued,
+        skipped=tuple(skipped),
+        last_key=last_key,
+    )
