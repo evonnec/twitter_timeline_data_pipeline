@@ -38,8 +38,11 @@ from twitter_timeline_data_pipeline.models import (
 from twitter_timeline_data_pipeline.storage import (
     ALLOWED_MEDIA_HOSTS,
     ITEM_LIMIT_BYTES,
+    MAX_GAPS,
     TEXT_PREVIEW_CHARS,
+    CheckpointState,
     CheckpointStore,
+    Gap,
     MediaRetryQueue,
     MediaStore,
     PutResult,
@@ -51,6 +54,7 @@ from twitter_timeline_data_pipeline.storage import (
     _MediaTooLarge,
     _original_size_url,
     estimate_item_size,
+    merge_gaps,
 )
 
 TWEET_ID = "1700000000000000005"
@@ -991,78 +995,234 @@ def test_any_delivery_order_ends_with_the_greatest_fetched_at(
 # ---- CheckpointStore ---------------------------------------------------------
 
 
-def test_checkpoint_get_missing_is_none(aws: Aws) -> None:
-    assert CheckpointStore(aws.state_table).get("example_user") is None
+def test_load_missing_item_is_the_empty_state(aws: Aws) -> None:
+    assert CheckpointStore(aws.state_table).load("example_user") == CheckpointState()
 
 
-def test_checkpoint_first_advance_writes_a_number(aws: Aws) -> None:
+def test_first_save_writes_numbers_and_version_one(aws: Aws) -> None:
     store = CheckpointStore(aws.state_table)
+    state = CheckpointState(newest_id=TWEET_ID, gaps=(Gap(until_id="9", since_id="3"),))
 
-    assert store.advance("example_user", TWEET_ID) is True
+    assert store.save("example_user", state, expected_version=0) is True
 
     item = ddb_get(aws.state_table, username="example_user")
     assert int(item["newest_id"]) == int(TWEET_ID)
+    assert item["gaps"] == [{"until_id": 9, "since_id": 3}]
+    assert item["version"] == 1
     assert str(item["updated_at"]).endswith("Z")
-    assert store.get("example_user") == TWEET_ID
+    assert store.load("example_user") == CheckpointState(
+        newest_id=TWEET_ID, gaps=state.gaps, version=1
+    )
 
 
-@pytest.mark.parametrize(
-    ("stored", "new", "expected_changed", "expected_value"),
-    [
-        ("100", "200", True, "200"),
-        ("200", "200", False, "200"),
-        ("200", "100", False, "200"),
-        ("999", "1000", True, "1000"),  # numeric, not lexicographic
-        ("1000", "999", False, "1000"),
-        ("1700000000000000001", "1700000000000000002", True, "1700000000000000002"),
-    ],
-)
-def test_checkpoint_advance_only_moves_forward(
-    aws: Aws,
-    stored: str,
-    new: str,
-    expected_changed: bool,
-    expected_value: str,
-) -> None:
+def test_open_ended_gap_round_trips_without_missing_bounds(aws: Aws) -> None:
     store = CheckpointStore(aws.state_table)
-    store.advance("example_user", stored)
+    gaps = (Gap(until_id="50"), Gap(since_id="7"), Gap())
 
-    assert store.advance("example_user", new) is expected_changed
-    assert store.get("example_user") == expected_value
+    store.save("example_user", CheckpointState(gaps=gaps), expected_version=0)
+
+    item = ddb_get(aws.state_table, username="example_user")
+    assert "newest_id" not in item
+    assert item["gaps"] == [{"until_id": 50}, {"since_id": 7}, {}]
+    assert store.load("example_user").gaps == gaps
+
+
+def test_save_requires_the_expected_version(aws: Aws) -> None:
+    store = CheckpointStore(aws.state_table)
+    store.save("example_user", CheckpointState(newest_id="10"), expected_version=0)
+
+    assert (
+        store.save("example_user", CheckpointState("99"), expected_version=0) is False
+    )
+    assert (
+        store.save("example_user", CheckpointState("99"), expected_version=2) is False
+    )
+    assert store.load("example_user").newest_id == "10"
+
+    assert store.save("example_user", CheckpointState("20"), expected_version=1) is True
+    assert store.load("example_user") == CheckpointState("20", (), 2)
+
+
+def test_legacy_item_without_version_loads_as_version_zero_and_upgrades(
+    aws: Aws,
+) -> None:
+    aws.state_table.put_item(
+        Item={"username": "example_user", "newest_id": 500, "updated_at": "x"}
+    )
+    store = CheckpointStore(aws.state_table)
+
+    state = store.load("example_user")
+
+    assert state == CheckpointState(newest_id="500", gaps=(), version=0)
+    assert store.save("example_user", state, expected_version=0) is True
+    assert store.load("example_user").version == 1
+    assert store.save("example_user", state, expected_version=0) is False
 
 
 def test_checkpoint_preserves_snowflake_precision(aws: Aws) -> None:
     store = CheckpointStore(aws.state_table)
-    store.advance("example_user", "1999999999999999999")
+    state = CheckpointState("1999999999999999999", (Gap("1999999999999999998"),))
+    store.save("example_user", state, expected_version=0)
 
-    assert store.get("example_user") == "1999999999999999999"
+    loaded = store.load("example_user")
+    assert loaded.newest_id == "1999999999999999999"
+    assert loaded.gaps == (Gap("1999999999999999998"),)
 
 
 def test_checkpoint_username_is_case_insensitive(aws: Aws) -> None:
     store = CheckpointStore(aws.state_table)
 
-    store.advance("Example_User", "500")
+    store.save("Example_User", CheckpointState("500"), expected_version=0)
 
-    assert store.get("EXAMPLE_USER") == "500"
-    assert store.get("example_user") == "500"
-    assert store.advance("EXAMPLE_user", "400") is False
+    assert store.load("EXAMPLE_USER").newest_id == "500"
+    assert store.load("example_user").newest_id == "500"
+    assert store.save("EXAMPLE_user", CheckpointState("1"), expected_version=0) is False
     assert aws.state_table.scan()["Count"] == 1
-    assert aws.state_table.get_item(Key={"username": "example_user"}).get("Item")
 
 
 def test_checkpoints_are_per_user(aws: Aws) -> None:
     store = CheckpointStore(aws.state_table)
-    store.advance("alice", "10")
+    store.save("alice", CheckpointState("10"), expected_version=0)
 
-    assert store.get("bob") is None
-    assert store.advance("bob", "5") is True
+    assert store.load("bob") == CheckpointState()
+    assert store.save("bob", CheckpointState("5"), expected_version=0) is True
 
 
-def test_checkpoint_advance_reraises_other_dynamodb_errors(aws: Aws) -> None:
+def test_save_reraises_other_dynamodb_errors(aws: Aws) -> None:
     store = CheckpointStore(aws.dynamodb.Table(f"{STATE_TABLE}-missing"))
 
     with pytest.raises(ClientError):
-        store.advance("example_user", "1")
+        store.save("example_user", CheckpointState("1"), expected_version=0)
+
+
+@pytest.mark.parametrize("bad", ["", "abc", "12a", "-5", "1.5", "١٢"])
+def test_gap_rejects_non_numeric_ids(bad: str) -> None:
+    with pytest.raises(ValueError, match="numeric"):
+        Gap(until_id=bad)
+    with pytest.raises(ValueError, match="numeric"):
+        Gap(since_id=bad)
+
+
+def test_gaps_sort_by_upper_bound_with_an_open_top_first() -> None:
+    gaps = [Gap("9"), Gap(None), Gap("100"), Gap("20")]
+
+    ordered = sorted(gaps, key=lambda g: g.sort_key, reverse=True)
+
+    assert [g.until_id for g in ordered] == [None, "100", "20", "9"]
+
+
+def test_gap_normalizes_ids_and_rejects_inverted_ranges() -> None:
+    assert Gap(until_id="0012", since_id="007") == Gap(until_id="12", since_id="7")
+    for since, until in [("20", "10"), ("5", "5"), ("010", "10")]:
+        with pytest.raises(ValueError, match="below until_id"):
+            Gap(until_id=until, since_id=since)
+
+
+def test_empty_runs_round_trip_through_the_item(aws: Aws) -> None:
+    store = CheckpointStore(aws.state_table)
+    gap = Gap(
+        until_id="9", since_id="3", empty_runs=2, first_empty_at="2026-01-01T00:00:00Z"
+    )
+
+    store.save("example_user", CheckpointState(gaps=(gap,)), expected_version=0)
+
+    assert ddb_get(aws.state_table, username="example_user")["gaps"] == [
+        {
+            "until_id": 9,
+            "since_id": 3,
+            "empty_runs": 2,
+            "first_empty_at": "2026-01-01T00:00:00Z",
+        }
+    ]
+    assert store.load("example_user").gaps == (gap,)
+
+
+def test_a_legacy_gap_item_without_first_empty_at_loads_as_none(aws: Aws) -> None:
+    aws.state_table.put_item(
+        Item={
+            "username": "example_user",
+            "gaps": [{"until_id": 9, "since_id": 3, "empty_runs": 2}],
+        }
+    )
+
+    gap = CheckpointStore(aws.state_table).load("example_user").gaps[0]
+
+    assert (gap.empty_runs, gap.first_empty_at) == (2, None)
+
+
+@pytest.mark.parametrize(
+    ("gaps", "expected"),
+    [
+        ([], ()),
+        ([Gap("10", "5"), Gap("20", "15")], (Gap("20", "15"), Gap("10", "5"))),
+        ([Gap("10", "5"), Gap("12", "8")], (Gap("12", "5"),)),  # overlap
+        (
+            [Gap("10", "5"), Gap("15", "9")],
+            (Gap("15", "5"),),
+        ),  # adjacent (6..9, 10..14)
+        ([Gap("10", "5"), Gap("10", "5")], (Gap("10", "5"),)),  # duplicate
+        ([Gap("10", "5"), Gap(None, "8")], (Gap(None, "5"),)),
+        ([Gap("10", None), Gap("4", "2")], (Gap("10", None),)),
+        ([Gap("6", "5"), Gap("3", "2")], ()),  # no IDs inside
+        ([Gap("10", "5", 2), Gap("10", "5", 1)], (Gap("10", "5", 1),)),
+        ([Gap("10", "5", 2), Gap("12", "8", 2)], (Gap("12", "5", 0),)),
+        # Same range: fewer runs and the later first-empty time, so a drop is never
+        # sooner than either input's.
+        (
+            [
+                Gap("10", "5", 3, "2026-01-01T00:00:00Z"),
+                Gap("10", "5", 2, "2026-01-02T00:00:00Z"),
+            ],
+            (Gap("10", "5", 2, "2026-01-02T00:00:00Z"),),
+        ),
+        (
+            [
+                Gap("10", "5", 3, "2026-01-02T00:00:00Z"),
+                Gap("10", "5", 4, "2026-01-01T00:00:00Z"),
+            ],
+            (Gap("10", "5", 3, "2026-01-02T00:00:00Z"),),
+        ),
+        (
+            [Gap("10", "5", 3, "2026-01-01T00:00:00Z"), Gap("10", "5")],
+            (Gap("10", "5"),),
+        ),
+        (
+            [Gap("10", "5", 3), Gap("10", "5", 3, "2026-01-01T00:00:00Z")],
+            (Gap("10", "5", 3, "2026-01-01T00:00:00Z"),),
+        ),
+        (
+            [
+                Gap("10", "5", 3, "2026-01-01T00:00:00Z"),
+                Gap("12", "8", 3, "2026-01-01T00:00:00Z"),
+            ],
+            (Gap("12", "5"),),
+        ),
+    ],
+)
+def test_merge_gaps(gaps: list[Gap], expected: tuple[Gap, ...]) -> None:
+    assert merge_gaps(gaps) == expected
+
+
+def test_merge_gaps_past_the_limit_joins_the_closest_neighbours() -> None:
+    gaps = [Gap("15", "10"), Gap("25", "20"), Gap("32", "28"), Gap("55", "50")]
+
+    # Distances between neighbours: 7, 5, 18. The closest pair is joined.
+    assert merge_gaps(gaps, limit=3) == (
+        Gap("55", "50"),
+        Gap("32", "20"),
+        Gap("15", "10"),
+    )
+
+
+def test_more_gaps_than_the_cap_are_capped_without_losing_coverage() -> None:
+    gaps = [Gap(str(i * 10 + 5), str(i * 10)) for i in range(MAX_GAPS + 50)]
+
+    merged = merge_gaps(gaps)
+
+    assert len(merged) == MAX_GAPS == 1500
+    assert all(
+        any(m.first <= g.first and g.last <= m.last for m in merged) for g in gaps
+    )
 
 
 # ---- size cap and time budget ------------------------------------------------
@@ -1333,6 +1493,32 @@ def test_store_with_no_time_left_makes_no_request(aws: Aws) -> None:
         media_store(aws, cdn).store(make_message(media=(PHOTO,)), PHOTO, budget_s=0)
 
     assert cdn.requests == []
+
+
+@given(
+    data=st.lists(
+        st.tuples(
+            st.integers(0, 6),
+            st.integers(0, 6),  # runs
+            st.integers(0, 5),  # hours since the epoch of the first empty response
+        ),
+        min_size=2,
+        max_size=2,
+    )
+)
+def test_merging_never_makes_a_drop_sooner(data: list[tuple[int, int, int]]) -> None:
+    def gap(runs: int, hour: int) -> Gap:
+        stamp = f"2026-01-01T{hour:02d}:00:00Z" if runs else None
+        return Gap("10", "5", runs, stamp)
+
+    gaps = [gap(r, h) for _, r, h in data]
+    (merged,) = merge_gaps(gaps)
+
+    assert merged.empty_runs <= min(g.empty_runs for g in gaps)
+    assert (merged.first_empty_at is None) == (merged.empty_runs == 0)
+    stamps = [g.first_empty_at for g in gaps if g.first_empty_at]
+    if merged.first_empty_at:
+        assert merged.first_empty_at == max(stamps)
 
 
 # ---- precheck, media updates and the retry queue ------------------------------------

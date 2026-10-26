@@ -2,16 +2,10 @@
 
 from collections import Counter
 
-import pytest
-
 from system.checks import assert_quiet, assert_stored_once, enqueued_tweet_ids
 from system.conftest import MakeSim
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="#11: a capped run moves the checkpoint past Tweets it never fetched",
-)
 def test_backlog_over_the_page_cap_is_fetched_by_later_runs(make_sim: MakeSim) -> None:
     """With ``MaxPages=2`` and ``MaxResults=5`` (10 Tweets a run), the account posts 25
     Tweets between two runs after the checkpoint was set.
@@ -31,10 +25,6 @@ def test_backlog_over_the_page_cap_is_fetched_by_later_runs(make_sim: MakeSim) -
     assert_quiet(sim)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="#11: the first run backfills at most MaxPages x MaxResults Tweets",
-)
 def test_first_run_backfill_of_a_long_timeline_completes_over_runs(
     make_sim: MakeSim,
 ) -> None:
@@ -56,10 +46,6 @@ def test_first_run_backfill_of_a_long_timeline_completes_over_runs(
     assert_quiet(sim)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="#11: a failed run saves no progress, so the next run re-sends its pages",
-)
 def test_run_failing_on_a_late_page_resumes_without_resending(
     make_sim: MakeSim,
 ) -> None:

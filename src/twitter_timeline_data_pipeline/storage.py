@@ -24,7 +24,7 @@ import mimetypes
 import posixpath
 import re
 import time
-from collections.abc import Buffer, Callable, Iterator, Mapping, Sequence
+from collections.abc import Buffer, Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, Any, Literal, cast, override
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -697,37 +697,198 @@ class MediaRetryQueue:
         )
 
 
+def _check_id(value: str | None) -> None:
+    if value is not None and not (value.isascii() and value.isdecimal()):
+        raise ValueError(f"Tweet ID must be numeric, got {value!r}")
+
+
+MAX_GAPS = 1500
+"""Upper bound on the gap list. A trailing ``next_token`` leaves one empty gap per run,
+and each waits 24 h before it can drop, so a 1-minute schedule (the EventBridge
+minimum) needs 1,440. At about 110 bytes a gap that is roughly 165 KB, under
+DynamoDB's 400 KB item limit. Within the cap nothing is merged away, so waiting
+gaps are never joined to (and never delay) gaps that have work to do."""
+
+
+@dataclass(frozen=True, slots=True)
+class Gap:
+    """An exclusive range of Tweet IDs, ``since_id < id < until_id``, not fetched yet.
+
+    A missing ``since_id`` means "down to the end of what the API serves"; a missing
+    ``until_id`` means "up from the newest Tweet". ``empty_runs`` counts consecutive
+    runs in which no page for this gap carried data and the walk ended on a clean
+    empty response, and
+    ``first_empty_at`` (ISO-8601 UTC, ``...Z``) is when the first of them happened;
+    the gap is only dropped after several runs *and* a minimum age (see
+    ``handlers.fetch``). Both are unset while ``empty_runs`` is 0. IDs are
+    normalized to plain decimal strings.
+    """
+
+    until_id: TweetId | None = None
+    since_id: TweetId | None = None
+    empty_runs: int = 0
+    first_empty_at: str | None = None
+
+    def __post_init__(self) -> None:
+        for name in ("until_id", "since_id"):
+            value = getattr(self, name)
+            _check_id(value)
+            if value is not None:
+                object.__setattr__(self, name, str(int(value)))
+        if (
+            self.until_id is not None
+            and self.since_id is not None
+            and int(self.since_id) >= int(self.until_id)
+        ):
+            raise ValueError(
+                f"since_id {self.since_id} must be below until_id {self.until_id}"
+            )
+
+    @property
+    def sort_key(self) -> float:
+        """Upper bound as a number; an open top sorts above every ID."""
+        return float("inf") if self.until_id is None else int(self.until_id)
+
+    @property
+    def first(self) -> int:
+        """Lowest ID in the range."""
+        return 1 if self.since_id is None else int(self.since_id) + 1
+
+    @property
+    def last(self) -> float:
+        """Highest ID in the range (infinite when open at the top)."""
+        return float("inf") if self.until_id is None else int(self.until_id) - 1
+
+    def to_item(self) -> dict[str, int | str]:
+        # Numbers, not strings: IDs compare as integers.
+        item: dict[str, int | str] = {
+            name: int(value)
+            for name, value in (
+                ("until_id", self.until_id),
+                ("since_id", self.since_id),
+            )
+            if value is not None
+        }
+        if self.empty_runs:
+            item["empty_runs"] = self.empty_runs
+            if self.first_empty_at:
+                item["first_empty_at"] = self.first_empty_at
+        return item
+
+    @classmethod
+    def from_item(cls, item: Any) -> Gap:
+        def tweet_id(name: str) -> TweetId | None:
+            value = item.get(name)
+            return None if value is None else str(int(value))
+
+        return cls(
+            until_id=tweet_id("until_id"),
+            since_id=tweet_id("since_id"),
+            empty_runs=int(item.get("empty_runs", 0)),
+            first_empty_at=item.get("first_empty_at"),  # absent on legacy items
+        )
+
+
+def _union(a: Gap, b: Gap) -> Gap:
+    """The smallest gap covering both; only ever adds IDs to re-fetch."""
+    same = (a.since_id, a.until_id) == (b.since_id, b.until_id)
+    # Merging must never make a drop happen sooner: keep the smaller run count and
+    # the later first-empty time (a missing time is unknown, so the known one wins).
+    runs = min(a.empty_runs, b.empty_runs) if same else 0
+    stamps = [t for t in (a.first_empty_at, b.first_empty_at) if t]
+    return Gap(
+        until_id=None
+        if a.until_id is None or b.until_id is None
+        else str(max(int(a.until_id), int(b.until_id))),
+        since_id=None
+        if a.since_id is None or b.since_id is None
+        else str(min(int(a.since_id), int(b.since_id))),
+        # Empty responses for part of a range say nothing about the whole.
+        empty_runs=runs,
+        first_empty_at=max(stamps) if runs and stamps else None,
+    )
+
+
+def merge_gaps(gaps: Iterable[Gap], limit: int = MAX_GAPS) -> tuple[Gap, ...]:
+    """Normalize a gap list: drop ranges with no IDs in them, merge overlapping or
+    adjacent ones, and, past ``limit``, merge the closest neighbours. A union only
+    adds IDs to fetch, so none of this can lose data; at worst it causes duplicates.
+    Newest gap first.
+    """
+    merged: list[Gap] = []
+    for gap in sorted((g for g in gaps if g.last >= g.first), key=lambda g: g.first):
+        if merged and gap.first <= merged[-1].last + 1:
+            merged[-1] = _union(merged[-1], gap)
+        else:
+            merged.append(gap)
+    while len(merged) > limit:
+        i = min(
+            range(len(merged) - 1), key=lambda i: merged[i + 1].first - merged[i].last
+        )
+        merged[i : i + 2] = [_union(merged[i], merged[i + 1])]
+    return tuple(sorted(merged, key=lambda g: g.sort_key, reverse=True))
+
+
+@dataclass(frozen=True, slots=True)
+class CheckpointState:
+    """What one account's state item says.
+
+    ``newest_id`` is the highest Tweet ID enqueued. ``gaps`` are ranges below it (or
+    manual backfills) still to fetch. ``version`` is the optimistic-lock counter; items
+    written before gaps existed have none and count as version 0.
+    """
+
+    newest_id: TweetId | None = None
+    gaps: tuple[Gap, ...] = ()
+    version: int = 0
+
+
 class CheckpointStore:
-    """Per-username high-water mark (newest Tweet ID enqueued) in the state table."""
+    """Per-username fetch cursor in the state table, written with an optimistic lock."""
 
     def __init__(self, table: Table) -> None:
         self._table = table
 
-    def get(self, username: str) -> TweetId | None:
+    def load(self, username: str) -> CheckpointState:
         response = self._table.get_item(
             Key={"username": username.lower()}, ConsistentRead=True
         )
-        item = response.get("Item")
-        return None if item is None else str(int(cast(Any, item["newest_id"])))
+        item = cast("dict[str, Any] | None", response.get("Item"))
+        if item is None:
+            return CheckpointState()
+        newest = item.get("newest_id")
+        return CheckpointState(
+            newest_id=None if newest is None else str(int(newest)),
+            gaps=tuple(Gap.from_item(g) for g in item.get("gaps", ())),
+            version=int(item.get("version", 0)),
+        )
 
-    def advance(self, username: str, newest_id: TweetId) -> bool:
-        """Store ``newest_id`` only if it's newer than what's stored.
+    def save(
+        self, username: str, state: CheckpointState, *, expected_version: int
+    ) -> bool:
+        """Write ``state`` as version ``expected_version + 1``.
 
-        Uses a conditional write so a slower, older run can't move the mark backwards.
-        Returns whether the item changed.
+        Succeeds only if the stored item is still at ``expected_version`` (or absent,
+        for 0), so a slower run can't overwrite a newer cursor. Returns whether it was
+        written; ``False`` means another run moved the state.
         """
+        item: dict[str, Any] = {
+            "username": username.lower(),
+            "gaps": [g.to_item() for g in state.gaps],
+            "version": expected_version + 1,
+            "updated_at": utc_now_iso(),
+        }
+        if state.newest_id is not None:
+            item["newest_id"] = int(state.newest_id)
+        # A missing version is 0: a new item or one from before versions existed.
+        condition = "version = :expected"
+        if expected_version == 0:
+            condition = f"attribute_not_exists(version) OR {condition}"
         try:
             self._table.put_item(
-                # A Number, not a string: IDs compare as integers.
-                Item={
-                    "username": username.lower(),
-                    "newest_id": int(newest_id),
-                    "updated_at": utc_now_iso(),
-                },
-                ConditionExpression=(
-                    "attribute_not_exists(username) OR newest_id < :new"
-                ),
-                ExpressionAttributeValues={":new": int(newest_id)},
+                Item=item,
+                ConditionExpression=condition,
+                ExpressionAttributeValues={":expected": expected_version},
             )
         except ClientError as exc:
             if exc.response.get("Error", {}).get("Code") == (

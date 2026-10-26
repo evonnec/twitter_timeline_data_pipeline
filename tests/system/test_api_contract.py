@@ -39,10 +39,6 @@ def test_handle_taken_over_by_another_account_is_not_ingested(
     assert run.outcome == "error"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="#16: a 200 response with only `errors` reads as an empty timeline",
-)
 def test_errors_only_timeline_fails_the_run(make_sim: MakeSim) -> None:
     """The account turns protected: the timeline answers HTTP 200 with an ``errors``
     array (Authorization Error) and no ``data``, on every run.

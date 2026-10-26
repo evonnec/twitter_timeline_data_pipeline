@@ -161,23 +161,32 @@ class XClient:
         user_id: str,
         *,
         since_id: str | None = None,
+        until_id: str | None = None,
         max_results: int = 100,
         max_pages: int = 5,
     ) -> Iterator[TimelinePage]:
         """Yield timeline pages, newest first, following ``meta.next_token``.
 
         Stops when there is no ``next_token`` or after ``max_pages`` pages. With
-        ``since_id`` only Tweets newer than it are returned. A page with
-        ``meta.result_count == 0`` yields nothing.
+        ``since_id`` only Tweets newer than it are returned, with ``until_id`` only
+        Tweets older than it (both bounds are exclusive). A clean empty response (no
+        data, no ``next_token``) ends the walk without yielding; an empty one that has a
+        ``next_token`` is yielded as an empty page; one with ``errors`` and no data
+        raises ``XApiError``.
         """
         if not 5 <= max_results <= 100:
             raise ValueError(f"max_results must be 5..100, got {max_results}")
         if max_pages < 1:
             raise ValueError(f"max_pages must be >= 1, got {max_pages}")
-        return self._iter_timeline(user_id, since_id, max_results, max_pages)
+        return self._iter_timeline(user_id, since_id, until_id, max_results, max_pages)
 
     def _iter_timeline(
-        self, user_id: str, since_id: str | None, max_results: int, max_pages: int
+        self,
+        user_id: str,
+        since_id: str | None,
+        until_id: str | None,
+        max_results: int,
+        max_pages: int,
     ) -> Iterator[TimelinePage]:
         params: dict[str, str | int] = {
             "max_results": max_results,
@@ -187,25 +196,42 @@ class XClient:
         }
         if since_id:
             params["since_id"] = since_id
+        if until_id:
+            params["until_id"] = until_id
         for page_number in range(1, max_pages + 1):
             body = self._request(f"/users/{user_id}/tweets", params)
             meta: Mapping[str, Any] = body.get("meta") or {}
+            data = body.get("data")
             if errors := body.get("errors"):
+                if not data:
+                    # e.g. a protected account: 200 with only an Authorization Error.
+                    # Treating that as "no more Tweets" would drop unfetched ranges.
+                    raise XApiError(
+                        f"timeline page {page_number} has errors and no data: "
+                        f"{_first_error_text(body) or 'no detail'}",
+                        status_code=200,
+                    )
                 logger.warning(
                     "timeline page %d has %d partial error(s); first: %s",
                     page_number,
                     len(errors),
                     _first_error_text(body) or "no detail",
                 )
-            if meta.get("result_count") == 0 or not body.get("data"):
-                return
+            next_token = meta.get("next_token")
+            if not data:
+                if not next_token:
+                    return
+                # An empty page that still points onward is not the end: yield it
+                # (it cost a request) and keep following the token.
+                yield TimelinePage(tweets=(), media={}, next_token=next_token)
+                params["pagination_token"] = next_token
+                continue
             media = (
                 Media.from_dict(m)
                 for m in (body.get("includes") or {}).get("media", ())
             )
-            next_token = meta.get("next_token")
             yield TimelinePage(
-                tweets=tuple(Tweet.from_api(t) for t in body["data"]),
+                tweets=tuple(Tweet.from_api(t) for t in data),
                 media={m.media_key: m for m in media},
                 newest_id=meta.get("newest_id"),
                 oldest_id=meta.get("oldest_id"),

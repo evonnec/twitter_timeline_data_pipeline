@@ -41,7 +41,9 @@ from twitter_timeline_data_pipeline.handlers.fetch import (
 )
 from twitter_timeline_data_pipeline.models import Media, Tweet, TweetMessage
 from twitter_timeline_data_pipeline.storage import (
+    CheckpointState,
     CheckpointStore,
+    Gap,
     TweetStore,
     estimate_item_size,
 )
@@ -77,7 +79,14 @@ def run(
 
 
 def checkpoint(aws: Aws) -> str | None:
-    return CheckpointStore(aws.state_table).get(USERNAME)
+    return CheckpointStore(aws.state_table).load(USERNAME).newest_id
+
+
+def seed(aws: Aws, newest_id: str) -> None:
+    """A state item as an earlier run would have left it."""
+    CheckpointStore(aws.state_table).save(
+        USERNAME, CheckpointState(newest_id=newest_id), expected_version=0
+    )
 
 
 def sent_ids(sqs: FakeSqs) -> list[str]:
@@ -133,7 +142,8 @@ def test_multiple_pages_are_batched_per_page(aws: Aws) -> None:
 
     assert sqs.sizes == [5, 2]
     assert (result.pages, result.tweets, result.enqueued) == (2, 7, 7)
-    assert result.truncated is False
+    assert result.gaps_open == 0
+    assert result.stopped_reason is None
     assert result.user_id == USER_ID
     assert result.username == USERNAME
     assert result.since_id is None
@@ -185,7 +195,7 @@ def test_user_not_found_sends_nothing(aws: Aws) -> None:
 
 
 def test_stored_checkpoint_is_sent_as_since_id(aws: Aws) -> None:
-    CheckpointStore(aws.state_table).advance(USERNAME, "1700000000000000005")
+    seed(aws, "1700000000000000005")
     api = XApiStub()
     sqs = FakeSqs()
 
@@ -200,7 +210,7 @@ def test_stored_checkpoint_is_sent_as_since_id(aws: Aws) -> None:
 def test_since_id_argument_overrides_checkpoint_which_still_advances(
     aws: Aws,
 ) -> None:
-    CheckpointStore(aws.state_table).advance(USERNAME, "5")
+    seed(aws, "5")
     api = XApiStub()
 
     result = run(aws, api, since_id="1")
@@ -211,7 +221,7 @@ def test_since_id_argument_overrides_checkpoint_which_still_advances(
 
 
 def test_since_id_override_cannot_move_checkpoint_backwards(aws: Aws) -> None:
-    CheckpointStore(aws.state_table).advance(USERNAME, "9" * 19)
+    seed(aws, "9" * 19)
 
     run(aws, synthetic_timeline(ids(3)), since_id="1")
 
@@ -279,7 +289,7 @@ def test_persistent_failure_raises_and_leaves_checkpoint_untouched(
 def test_failure_in_a_later_batch_keeps_checkpoint_unmoved_but_earlier_batch_sent(
     aws: Aws,
 ) -> None:
-    CheckpointStore(aws.state_table).advance(USERNAME, "5")
+    seed(aws, "5")
     sqs = FakeSqs(lambda call, _ids: {"0"} if call >= 1 else set())
 
     with pytest.raises(EnqueueError):
@@ -289,7 +299,7 @@ def test_failure_in_a_later_batch_keeps_checkpoint_unmoved_but_earlier_batch_sen
     assert checkpoint(aws) == "5"
 
 
-def test_fetch_error_midway_leaves_checkpoint_untouched(aws: Aws) -> None:
+def test_fetch_error_midway_keeps_the_progress_of_full_pages(aws: Aws) -> None:
     stub = XApiStub()
 
     def second_page_fails(request: httpx.Request) -> httpx.Response:
@@ -300,52 +310,42 @@ def test_fetch_error_midway_leaves_checkpoint_untouched(aws: Aws) -> None:
     with pytest.raises(XApiError, match="bad token"):
         run(aws, second_page_fails)
 
-    assert checkpoint(aws) is None
+    state = CheckpointStore(aws.state_table).load(USERNAME)
+    assert state.newest_id == NEWEST
+    assert state.gaps == (Gap(until_id="1700000000000000001"),)
 
 
-# ---- run_fetch: truncation ----------------------------------------------------
+# ---- run_fetch: page cap -------------------------------------------------------
 
 
-def test_truncated_run_with_since_id_warns_about_the_gap(
-    aws: Aws, caplog: pytest.LogCaptureFixture
-) -> None:
+def test_page_cap_leaves_a_gap_and_says_so(aws: Aws) -> None:
     api = synthetic_timeline(ids(6), next_token="MORE")
 
-    with caplog.at_level(logging.WARNING):
-        result = run(aws, api, since_id="100", max_pages=1)
+    result = run(aws, api, since_id="100", max_pages=1)
 
-    assert result.truncated is True
-    warning = [m for m in caplog.messages if "page cap reached" in m]
-    assert warning == [
-        f"page cap reached for {USERNAME}: Tweets between since_id 100 and the "
-        f"oldest fetched ({ids(6)[-1]}) were skipped"
-    ]
+    assert (result.gaps_open, result.stopped_reason) == (1, "page_cap")
+    assert CheckpointStore(aws.state_table).load(USERNAME).gaps == (
+        Gap(until_id=ids(6)[-1], since_id="100"),
+    )
 
 
-def test_truncated_first_run_flags_truncation_without_gap_warning(
-    aws: Aws, caplog: pytest.LogCaptureFixture
-) -> None:
-    api = synthetic_timeline(ids(6), next_token="MORE")
+def test_first_run_cap_leaves_an_open_ended_gap(aws: Aws) -> None:
+    result = run(aws, synthetic_timeline(ids(6), next_token="MORE"), max_pages=1)
 
-    with caplog.at_level(logging.WARNING):
-        result = run(aws, api, max_pages=1)
-
-    assert result.truncated is True
-    assert not any("page cap reached" in m for m in caplog.messages)
+    assert result.stopped_reason == "page_cap"
+    assert CheckpointStore(aws.state_table).load(USERNAME).gaps == (
+        Gap(until_id=ids(6)[-1]),
+    )
 
 
-def test_not_truncated_when_last_page_has_no_next_token(
-    aws: Aws, caplog: pytest.LogCaptureFixture
-) -> None:
-    with caplog.at_level(logging.WARNING):
-        result = run(aws, XApiStub(), since_id="1", max_pages=2)
+def test_no_gap_when_the_last_page_has_no_next_token(aws: Aws) -> None:
+    result = run(aws, XApiStub(), since_id="1", max_pages=2)
 
-    assert result.truncated is False
-    assert not any("page cap reached" in m for m in caplog.messages)
+    assert (result.gaps_open, result.stopped_reason) == (0, None)
 
 
-def test_next_token_followed_by_an_empty_page_is_not_truncated(
-    aws: Aws, caplog: pytest.LogCaptureFixture
+def test_next_token_followed_by_an_empty_page_keeps_the_gap_for_the_gap_phase(
+    aws: Aws,
 ) -> None:
     stub = XApiStub()
     first = load_fixture("timeline_page1.json")
@@ -358,15 +358,21 @@ def test_next_token_followed_by_an_empty_page_is_not_truncated(
             return httpx.Response(200, json=first)
         return stub(request)
 
-    with caplog.at_level(logging.WARNING):
-        result = run(aws, api, since_id="1", max_pages=2)
+    result = run(aws, api, since_id="1", max_pages=2)
 
     assert result.pages == 1
-    assert result.truncated is False
-    assert not any("page cap reached" in m for m in caplog.messages)
+    # The empty answer is the gap's first empty observation, so nothing is pending.
+    assert (result.gaps_open, result.stopped_reason) == (1, None)
+    (gap,) = CheckpointStore(aws.state_table).load(USERNAME).gaps
+    assert (gap.until_id, gap.since_id, gap.empty_runs) == (
+        "1700000000000000001",
+        "1",
+        1,
+    )
+    assert gap.first_empty_at
 
 
-def test_empty_string_next_token_is_not_truncated(aws: Aws) -> None:
+def test_empty_string_next_token_leaves_no_gap(aws: Aws) -> None:
     def api(request: httpx.Request) -> httpx.Response:
         if request.url.path.endswith("/tweets"):
             body = {
@@ -376,13 +382,13 @@ def test_empty_string_next_token_is_not_truncated(aws: Aws) -> None:
             return httpx.Response(200, json=body)
         return XApiStub()(request)
 
-    assert run(aws, api, max_pages=1).truncated is False
+    assert run(aws, api, max_pages=1).gaps_open == 0
 
 
-def test_hitting_the_cap_exactly_on_the_last_page_is_not_truncated(aws: Aws) -> None:
+def test_hitting_the_cap_exactly_on_the_last_page_leaves_no_gap(aws: Aws) -> None:
     result = run(aws, XApiStub(), max_pages=2)
 
-    assert (result.pages, result.truncated) == (2, False)
+    assert (result.pages, result.gaps_open, result.stopped_reason) == (2, 0, None)
 
 
 # ---- run_fetch: username normalisation ---------------------------------------
@@ -413,32 +419,6 @@ def test_username_is_normalised_once_for_lookup_messages_and_checkpoint(
     assert {TweetMessage.from_json(b).username for b in bodies} == {"example_user"}
     assert ddb_get(aws.state_table, username="example_user")["newest_id"] == int(NEWEST)
     assert aws.state_table.scan()["Count"] == 1
-
-
-# ---- run_fetch: checkpoint races ---------------------------------------------
-
-
-def test_unmoved_checkpoint_is_logged_at_info(
-    aws: Aws, caplog: pytest.LogCaptureFixture
-) -> None:
-    CheckpointStore(aws.state_table).advance(USERNAME, "9" * 19)
-
-    with caplog.at_level(logging.INFO, logger=fetch.logger.name):
-        run(aws, synthetic_timeline(ids(2)), since_id="1")
-
-    assert (
-        f"checkpoint for {USERNAME} not moved: the stored mark is the same or newer"
-        in caplog.messages
-    )
-
-
-def test_moved_checkpoint_logs_nothing(
-    aws: Aws, caplog: pytest.LogCaptureFixture
-) -> None:
-    with caplog.at_level(logging.INFO, logger=fetch.logger.name):
-        run(aws, synthetic_timeline(ids(2)))
-
-    assert not any("not moved" in m for m in caplog.messages)
 
 
 # ---- handler ------------------------------------------------------------------
@@ -479,10 +459,11 @@ def test_handler_end_to_end(pipeline_env: Aws, monkeypatch: pytest.MonkeyPatch) 
         "pages": 2,
         "tweets": 7,
         "enqueued": 7,
-        "truncated": False,
+        "gaps_open": 0,
+        "stopped_reason": None,
     }
     assert len(received(pipeline_env)) == 7
-    assert CheckpointStore(pipeline_env.state_table).get(USERNAME) == NEWEST
+    assert CheckpointStore(pipeline_env.state_table).load(USERNAME).newest_id == NEWEST
     assert constructed[0]["token"] == TOKEN
     assert constructed[0]["base_url"] == "https://api.x.com/2"
     assert constructed[0]["timeout"] == 10.0
@@ -517,7 +498,8 @@ def test_handler_applies_env_settings(
     result = handler({"username": USERNAME}, None)
 
     assert result["pages"] == 1
-    assert result["truncated"] is True
+    assert result["gaps_open"] == 1
+    assert result["stopped_reason"] == "page_cap"
     assert api.timeline_requests[0].url.params["max_results"] == "20"
     assert constructed[0]["base_url"] == "http://localhost:9/2"
     assert constructed[0]["timeout"] == 3.5
@@ -673,7 +655,7 @@ def test_handler_logs_a_summary(
 
     assert (
         f"fetched {USERNAME}: 2 pages, 7 tweets enqueued, newest_id={NEWEST}, "
-        "truncated=False"
+        "gaps_open=0, stopped_reason=None"
     ) in caplog.messages
 
 
@@ -795,7 +777,8 @@ def test_an_oversized_message_fails_the_run_and_loses_nothing(
         run(aws, synthetic_timeline([big, small]), sqs)
 
     assert sqs.calls == []  # nothing sent, nothing silently dropped
-    assert CheckpointStore(aws.state_table).get(USERNAME) is None
+    # The cursor didn't move, so the next run fetches the same page again.
+    assert CheckpointStore(aws.state_table).load(USERNAME) == CheckpointState()
     assert issubclass(MessageTooLargeError, EnqueueError)
 
 

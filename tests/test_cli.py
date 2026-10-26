@@ -372,7 +372,9 @@ def test_enqueue_failure_exits_one_and_leaves_checkpoint(
 
     assert code == EXIT_FAILURE
     assert "still failing after retries" in capsys.readouterr().err
-    assert CheckpointStore(pipeline_env.state_table).get("example_user") is None
+    assert (
+        CheckpointStore(pipeline_env.state_table).load("example_user").newest_id is None
+    )
 
 
 # ---- real run against moto ------------------------------------------------------
@@ -397,13 +399,17 @@ def test_fetch_enqueues_and_checkpoints_against_aws(
         "pages": 2,
         "tweets": 7,
         "enqueued": 7,
-        "truncated": False,
+        "gaps_open": 0,
+        "stopped_reason": None,
     }
     attrs = pipeline_env.sqs.get_queue_attributes(
         QueueUrl=pipeline_env.queue_url, AttributeNames=["ApproximateNumberOfMessages"]
     )["Attributes"]
     assert attrs["ApproximateNumberOfMessages"] == "7"
-    assert CheckpointStore(pipeline_env.state_table).get("example_user") == NEWEST
+    assert (
+        CheckpointStore(pipeline_env.state_table).load("example_user").newest_id
+        == NEWEST
+    )
 
 
 def test_second_fetch_is_incremental_and_since_id_flag_overrides(
