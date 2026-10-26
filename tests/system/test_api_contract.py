@@ -1,5 +1,6 @@
 """What the X API can answer that the fetch function must not misread."""
 
+import json
 import logging
 
 import pytest
@@ -84,14 +85,12 @@ def test_errors_only_timeline_fails_the_run(make_sim: MakeSim) -> None:
     assert run.outcome == "error"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="#16: one Tweet that fails to parse fails its whole page, on every run",
-)
 def test_one_malformed_tweet_does_not_block_the_rest(make_sim: MakeSim) -> None:
     """One Tweet on the page has ``public_metrics.like_count: null``.
 
-    Expected: the other Tweets, and those posted later, keep flowing into the table.
+    Expected: the other Tweets, and those posted later, keep flowing into the table,
+    and the bad one is quarantined (once: later runs start above it) next to its raw
+    page.
     """
     sim = make_sim()
     x, user = sim.x, sim.username
@@ -106,6 +105,13 @@ def test_one_malformed_tweet_does_not_block_the_rest(make_sim: MakeSim) -> None:
 
     assert_stored(sim, good)
     assert_quiet(sim)
+    listing = sim.s3.list_objects_v2(Bucket=sim.bucket, Prefix="quarantine/")
+    (key,) = [o["Key"] for o in listing["Contents"]]
+    stored = json.loads(sim.object_bytes(key))
+    assert stored["kind"] == "tweet"
+    assert stored["item"]["id"] == bad.id
+    assert stored["item"]["public_metrics"]["like_count"] is None
+    assert stored["raw_key"] in sim.raw_objects()
 
 
 @pytest.mark.xfail(

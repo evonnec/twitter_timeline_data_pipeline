@@ -757,7 +757,7 @@ def test_long_post_is_parsed_with_its_full_text() -> None:
 
 
 def test_unparseable_page_raises_an_error_carrying_the_raw_page() -> None:
-    body = {"data": [{"text": "no id"}], "meta": {"result_count": 1}}
+    body = {"data": {"text": "not a list"}, "meta": {"result_count": 1}}
 
     def api(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json=body)
@@ -772,7 +772,12 @@ def test_unparseable_page_raises_an_error_carrying_the_raw_page() -> None:
 
 
 def _not_found(**overrides: str) -> dict[str, Any]:
-    error = {"title": "Not Found Error", "resource_type": "user", "parameter": "id"}
+    error = {
+        "title": "Not Found Error",
+        "resource_type": "user",
+        "parameter": "id",
+        "type": "https://api.twitter.com/2/problems/resource-not-found",
+    }
     return {"errors": [{**error, **overrides}], "meta": {"result_count": 0}}
 
 

@@ -9,6 +9,7 @@ price is duplicates (at most the page in flight), which processing absorbs.
 
 import dataclasses
 import functools
+import json
 import logging
 import time
 from collections.abc import Callable, Iterable, Iterator, Sequence
@@ -27,6 +28,10 @@ from twitter_timeline_data_pipeline.models import (
     normalize_username,
     utc_now_iso,
 )
+from twitter_timeline_data_pipeline.quarantine import (
+    QuarantineStore,
+    QuarantineUnavailableError,
+)
 from twitter_timeline_data_pipeline.raw import RawPageStore, s3_client
 from twitter_timeline_data_pipeline.storage import (
     CheckpointState,
@@ -35,6 +40,7 @@ from twitter_timeline_data_pipeline.storage import (
     merge_gaps,
 )
 from twitter_timeline_data_pipeline.x_api import (
+    AccessError,
     AuthError,
     NotFoundError,
     PageParseError,
@@ -113,17 +119,40 @@ def _send_batch(
     queue_url: str,
     bodies: Sequence[str],
     sleep: Callable[[float], None],
-) -> None:
-    """Send up to 10 bodies, retrying only the entries SQS reports as Failed."""
+    reject: Callable[[str, str], None] | None = None,
+) -> int:
+    """Send up to 10 bodies, retrying only the entries SQS reports as Failed; returns
+    how many were sent (``reject``ed ones don't count).
+
+    An entry failed with ``SenderFault`` would fail the same way again, so it is not
+    retried: ``reject(body, error)`` quarantines it and the rest carry on. Without a
+    ``reject`` callback it raises ``EnqueueError`` straight away, so nothing is
+    dropped.
+    """
     pending: list[SendMessageBatchRequestEntryTypeDef] = [
         {"Id": str(i), "MessageBody": body} for i, body in enumerate(bodies)
     ]
+    rejected = 0
     for attempt in range(SEND_RETRIES + 1):
         response = sqs.send_message_batch(QueueUrl=queue_url, Entries=pending)
         failed = {f["Id"]: f for f in response.get("Failed", [])}
         if not failed:
-            return
-        pending = [e for e in pending if e["Id"] in failed]
+            return len(bodies) - rejected
+        faulty = [
+            e
+            for e in pending
+            if e["Id"] in failed and failed[e["Id"]].get("SenderFault")
+        ]
+        for entry in faulty:
+            error = failed[entry["Id"]]
+            detail = f"{error.get('Code', 'SenderFault')}: {error.get('Message', '')}"
+            if reject is None:
+                raise EnqueueError(f"SQS rejected a message as unsendable: {detail}")
+            reject(entry["MessageBody"], detail)
+            rejected += 1
+        pending = [e for e in pending if e["Id"] in failed and e not in faulty]
+        if not pending:
+            return len(bodies) - rejected
         if attempt < SEND_RETRIES:
             logger.warning(
                 "%d of %d messages failed to enqueue (attempt %d): %s",
@@ -156,14 +185,14 @@ def send_messages(
     queue_url: str,
     messages: Sequence[TweetMessage],
     sleep: Callable[[float], None],
+    reject: Callable[[str, str], None] | None = None,
 ) -> int:
     """Encode (and size-check) every message, then send them in batches; returns the
-    number sent. Nothing is sent if any message is over the limit. Shared by the fetch
-    run and ``replay``."""
+    number sent (``reject``ed ones, see ``_send_batch``, are not counted). Nothing is
+    sent if any message is over the limit. Shared by the fetch run and ``replay``."""
     sent = 0
     for chunk in _chunk_bodies(_encode(messages)):
-        _send_batch(sqs, queue_url, chunk, sleep)
-        sent += len(chunk)
+        sent += _send_batch(sqs, queue_url, chunk, sleep, reject)
     return sent
 
 
@@ -227,6 +256,8 @@ class _Run:
     now: Callable[[], datetime]
     raw_pages: RawPageStore | None = None
     """Where raw pages are landed before their messages are enqueued; None skips it."""
+    quarantine: QuarantineStore | None = None
+    """Where unparseable items and unsendable messages go; None fails such pages."""
     pages: int = 0
     requests: int = 0
     tweets: int = 0
@@ -305,12 +336,51 @@ class _Run:
                 page_no=self.pages,
                 page=page.raw,
             )
+        self.quarantine_items(page, key, stamp)
         messages = page.messages(self.username, fetched_at=stamp, raw_key=key)
         self.tweets += len(messages)
+
+        def reject(body: str, error: str) -> None:
+            self.put_quarantine("message", json.loads(body), error, key, stamp)
+
         # Every body is encoded (and size-checked) before anything is sent, so an
         # over-limit Tweet fails the page with nothing enqueued and the cursor unmoved.
-        self.enqueued += send_messages(self.sqs, self.queue_url, messages, self.sleep)
-        return [int(t.id) for t in page.tweets]
+        self.enqueued += send_messages(
+            self.sqs,
+            self.queue_url,
+            messages,
+            self.sleep,
+            reject if self.quarantine is not None else None,
+        )
+        # A quarantined Tweet's ID counts as seen: it is preserved, so the cursor
+        # may move past it and later runs don't fetch it again.
+        return page.cursor_ids()
+
+    def put_quarantine(
+        self, kind: str, item: Any, error: str, raw_key: str | None, stamp: str
+    ) -> None:
+        if self.quarantine is None:
+            raise QuarantineUnavailableError(
+                f"a {kind} needs quarantining ({error}) but no quarantine bucket is "
+                "configured; the page is left unfetched"
+            )
+        self.quarantine.put(
+            kind=kind,
+            item=item,
+            error=error,
+            raw_key=raw_key,
+            user_id=self.user_id,
+            fetched_at=stamp,
+            page_no=self.pages,
+        )
+
+    def quarantine_items(
+        self, page: TimelinePage, raw_key: str | None, stamp: str
+    ) -> None:
+        """Write the page's unparseable items to quarantine. A failed write fails the
+        page (nothing enqueued, cursor unmoved): an item is never dropped."""
+        for q in page.quarantined:
+            self.put_quarantine(q.kind, q.item, q.error, raw_key, stamp)
 
     def commit(self, seen: Sequence[int], gaps: Iterable[Gap]) -> None:
         """Persist the cursor: ``newest_id`` never drops, ``gaps`` replace the list
@@ -462,7 +532,13 @@ class _Run:
                 continue
             try:
                 self.fill_gap(gap, budget)
-            except RateLimitError, AuthError, _StateConflict:
+            except (
+                RateLimitError,
+                AuthError,
+                AccessError,
+                NotFoundError,
+                _StateConflict,
+            ):
                 raise  # every other gap would fail the same way
             except Exception as exc:
                 logger.warning(
@@ -482,6 +558,12 @@ class _Run:
             since_id=gap.since_id, until_id=gap.until_id, budget=budget
         ):
             ids = self.enqueue(page)
+            if page.quarantined and not ids and not page.next_token:
+                # Only Tweets without a usable ID, on the last page: they are kept in
+                # raw/ and quarantine/, so the range is done (else it never closes).
+                data = True
+                self.commit([], others)
+                continue
             if not ids:  # an empty page pointing onward: nothing learned
                 continue
             # Data came back, so the range is alive: reset the empty-response count.
@@ -583,6 +665,7 @@ def run_fetch(
     since_id: str | None = None,
     backfill: Gap | None = None,
     raw_pages: RawPageStore | None = None,
+    quarantine: QuarantineStore | None = None,
     user_id: str | None = None,
     user_id_ttl: timedelta = DEFAULT_USER_ID_TTL,
     sleep: Callable[[float], None] = time.sleep,
@@ -601,7 +684,9 @@ def run_fetch(
     ``now`` is the clock used to age out empty gaps and the stored user ID. With
     ``raw_pages`` every page (empty ones that point onward included) is written to
     S3 before its messages are enqueued, and each message carries the object's key
-    as ``raw_key``.
+    as ``raw_key``. With ``quarantine`` a Tweet or media object that fails to parse
+    (and a message SQS rejects with ``SenderFault``) is written there and the rest of
+    the page goes on; without it such a page fails, so nothing is dropped.
 
     The user ID is stored with the state and reused for ``user_id_ttl``; it is looked
     up again when missing, expired, or when the timeline reports the user not found.
@@ -642,6 +727,7 @@ def run_fetch(
         sleep=sleep,
         now=now,
         raw_pages=raw_pages,
+        quarantine=quarantine,
     )
     since_id = since_id or run.state.newest_id
     stopped_reason: str | None = None
@@ -751,6 +837,7 @@ def handler(event: Any, context: Any) -> dict[str, Any]:
     if remaining_ms := getattr(context, "get_remaining_time_in_millis", None):
         max_rate_limit_wait = max(0.0, min(60.0, remaining_ms() / 1000 - 15))
 
+    raw_pages = RawPageStore(s3_client(), settings.media_bucket)
     try:
         with XClient(
             token,
@@ -767,7 +854,10 @@ def handler(event: Any, context: Any) -> dict[str, Any]:
                 max_results=settings.max_results,
                 max_pages=settings.max_pages,
                 backfill=backfill,
-                raw_pages=RawPageStore(s3_client(), settings.media_bucket),
+                raw_pages=raw_pages,
+                quarantine=QuarantineStore(
+                    s3_client(), settings.media_bucket, run_id=raw_pages.run_id
+                ),
                 user_id=user_id,
                 user_id_ttl=timedelta(hours=settings.user_id_ttl_hours),
             )

@@ -585,18 +585,23 @@ def test_media_retry_function_has_an_errors_alarm(template: Template) -> None:
     )
 
 
-def test_fetch_function_writes_only_under_raw(template: Template) -> None:
+def test_fetch_function_writes_only_under_raw_and_quarantine(
+    template: Template,
+) -> None:
     statements = policy_statements(template, "FetchFunction")
-    (put,) = (s for s in statements if "s3:PutObject" in _as_list(s["Action"]))
+    puts = [s for s in statements if "s3:PutObject" in _as_list(s["Action"])]
 
-    assert put["Effect"] == "Allow"
-    assert put["Action"] == "s3:PutObject"
-    assert put["Resource"] == {"Fn::Sub": "${MediaBucket.Arn}/raw/*"}
+    assert all(s["Effect"] == "Allow" and s["Action"] == "s3:PutObject" for s in puts)
+    # one statement per prefix, each scoped to exactly that prefix
+    assert [s["Resource"] for s in puts] == [
+        {"Fn::Sub": "${MediaBucket.Arn}/raw/*"},
+        {"Fn::Sub": "${MediaBucket.Arn}/quarantine/*"},
+    ]
     # nothing else of S3: no reads, no listing, no other prefix
     other = [
         s
         for s in statements
-        if s is not put and any(a.startswith("s3:") for a in _as_list(s["Action"]))
+        if s not in puts and any(a.startswith("s3:") for a in _as_list(s["Action"]))
     ]
     assert other == []
 

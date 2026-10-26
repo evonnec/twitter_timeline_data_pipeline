@@ -35,6 +35,7 @@ NOT_FOUND = {
     "detail": "gone",
     "resource_type": "user",
     "parameter": "id",
+    "type": "https://api.twitter.com/2/problems/resource-not-found",
 }
 
 

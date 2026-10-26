@@ -353,6 +353,7 @@ class Simulation:
         """``twitter-pipeline replay``: re-enqueue the messages of the raw pages under
         ``prefix`` (from the operator's own clients, as the CLI would)."""
         from twitter_timeline_data_pipeline.handlers.fetch import send_messages
+        from twitter_timeline_data_pipeline.quarantine import QuarantineStore
         from twitter_timeline_data_pipeline.replay import run_replay
 
         url = self.queue.url
@@ -361,6 +362,7 @@ class Simulation:
             bucket=self.bucket,
             prefix=prefix,
             send=lambda ms: send_messages(self.sqs, url, ms, self.clock.sleep),
+            quarantine=QuarantineStore(self.s3, self.bucket),
         ).enqueued
 
     def wipe_tweets(self) -> int:

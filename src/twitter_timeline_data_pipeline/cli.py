@@ -28,6 +28,10 @@ from twitter_timeline_data_pipeline.handlers.fetch import (
     sqs_client,
 )
 from twitter_timeline_data_pipeline.models import TweetMessage, normalize_username
+from twitter_timeline_data_pipeline.quarantine import (
+    QuarantineStore,
+    QuarantineUnavailableError,
+)
 from twitter_timeline_data_pipeline.raw import (
     RawPageError,
     RawPageStore,
@@ -165,12 +169,22 @@ def _fetch(args: argparse.Namespace) -> int:
             return EXIT_OK
 
         assert settings.queue_url and settings.state_table  # narrowed by require()
-        raw_pages = None
+        raw_pages = quarantine = None
         if args.no_raw:
-            logger.warning("--no-raw: raw API pages will not be landed in S3")
+            logger.warning(
+                "--no-raw: raw API pages will not be landed in S3. A page with an "
+                "unparseable Tweet then fails the run unless MEDIA_BUCKET is set for "
+                "quarantine"
+            )
         else:
             assert settings.media_bucket  # narrowed by require()
             raw_pages = RawPageStore(s3_client(), settings.media_bucket)
+        if settings.media_bucket:
+            quarantine = QuarantineStore(
+                s3_client(),
+                settings.media_bucket,
+                run_id=raw_pages.run_id if raw_pages else None,
+            )
         result = run_fetch(
             username=args.username,
             x_client=x_client,
@@ -181,6 +195,7 @@ def _fetch(args: argparse.Namespace) -> int:
             max_pages=max_pages,
             since_id=args.since_id,
             raw_pages=raw_pages,
+            quarantine=quarantine,
             user_id_ttl=timedelta(hours=settings.user_id_ttl_hours),
         )
         print(json.dumps(asdict(result)))
@@ -191,6 +206,7 @@ def _replay(args: argparse.Namespace) -> int:
     bucket, prefix = parse_s3_uri(args.raw)
     settings = Settings.from_env()
     send: Callable[[list[TweetMessage]], int]
+    quarantine = None
     if args.dry_run:
 
         def send(messages: list[TweetMessage]) -> int:
@@ -202,15 +218,32 @@ def _replay(args: argparse.Namespace) -> int:
         settings.require("queue_url")
         assert settings.queue_url  # narrowed by require()
         sqs, queue_url = sqs_client(), settings.queue_url
+        quarantine = QuarantineStore(s3_client(), bucket)
+
+        def reject(body: str, error: str) -> None:
+            # The message carries its raw page's key (raw/<user_id>/...) and time.
+            data = json.loads(body)
+            raw_key = data.get("raw_key")
+            assert quarantine is not None
+            quarantine.put(
+                kind="message",
+                item=data,
+                error=error,
+                raw_key=raw_key,
+                user_id=str(raw_key).split("/")[1] if raw_key else "unknown",
+                fetched_at=str(data.get("fetched_at", "")),
+                page_no=0,
+            )
 
         def send(messages: list[TweetMessage]) -> int:
-            return send_messages(sqs, queue_url, messages, time.sleep)
+            return send_messages(sqs, queue_url, messages, time.sleep, reject)
 
     result = run_replay(
         s3=s3_client(),
         bucket=bucket,
         prefix=prefix,
         send=send,
+        quarantine=quarantine,
         start_after=args.start_after,
     )
     print(json.dumps(asdict(result)), file=sys.stderr if args.dry_run else sys.stdout)
@@ -241,6 +274,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         XApiError,
         CredentialsError,
         EnqueueError,
+        QuarantineUnavailableError,
         RawPageError,
         IdentityChangedError,
         ClientError,

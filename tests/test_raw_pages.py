@@ -331,6 +331,7 @@ def test_replay_rebuilds_identical_messages_without_calling_the_api(
     replayed = FakeSqs()
 
     result = run_replay(
+        quarantine=None,
         s3=aws.s3,
         bucket=BUCKET,
         prefix=f"raw/{USER_ID}/",
@@ -348,7 +349,7 @@ def test_replay_leaves_the_cursor_alone(aws: Aws) -> None:
     run(aws, XApiStub(), FakeSqs(), store(aws))
     before = CheckpointStore(aws.state_table).load(USERNAME)
 
-    run_replay(s3=aws.s3, bucket=BUCKET, prefix="raw/", send=len)
+    run_replay(quarantine=None, s3=aws.s3, bucket=BUCKET, prefix="raw/", send=len)
 
     assert CheckpointStore(aws.state_table).load(USERNAME) == before
 
@@ -357,6 +358,7 @@ def test_replay_of_a_prefix_selects_only_matching_objects(aws: Aws) -> None:
     run(aws, XApiStub(), FakeSqs(), store(aws))
 
     result = run_replay(
+        quarantine=None,
         s3=aws.s3,
         bucket=BUCKET,
         prefix=f"raw/{USER_ID}/dt=1999-01-01/",
@@ -370,7 +372,7 @@ def test_replay_names_the_object_it_cannot_read(aws: Aws) -> None:
     aws.s3.put_object(Bucket=BUCKET, Key="raw/1/bad.json.gz", Body=b"junk")
 
     with pytest.raises(RawPageError, match=r"raw/1/bad\.json\.gz"):
-        run_replay(s3=aws.s3, bucket=BUCKET, prefix="raw/", send=len)
+        run_replay(quarantine=None, s3=aws.s3, bucket=BUCKET, prefix="raw/", send=len)
 
 
 def test_replay_of_a_response_that_cannot_be_parsed_names_the_key(aws: Aws) -> None:
@@ -379,12 +381,12 @@ def test_replay_of_a_response_that_cannot_be_parsed_names_the_key(aws: Aws) -> N
         user_id="1",
         fetched_at=STAMP,
         request={},
-        response={"data": [{"no": "id"}]},
+        response={"data": "oops"},
     )
     aws.s3.put_object(Bucket=BUCKET, Key="raw/1/x.json.gz", Body=envelope.to_bytes())
 
     with pytest.raises(RawPageError, match=r"raw/1/x\.json\.gz"):
-        run_replay(s3=aws.s3, bucket=BUCKET, prefix="raw/", send=len)
+        run_replay(quarantine=None, s3=aws.s3, bucket=BUCKET, prefix="raw/", send=len)
 
 
 # ---- hardening ---------------------------------------------------------------------
@@ -497,6 +499,7 @@ def test_enqueue_failure_then_refetch_leaves_duplicate_pages_and_replay_is_newes
 
     replayed = FakeSqs()
     run_replay(
+        quarantine=None,
         s3=aws.s3,
         bucket=BUCKET,
         prefix="raw/",
@@ -568,7 +571,7 @@ def test_replay_skips_redacted_tweets_and_their_media(aws: Aws) -> None:
         seen.append(messages)
         return 0
 
-    run_replay(s3=aws.s3, bucket=BUCKET, prefix="raw/", send=collect)
+    run_replay(quarantine=None, s3=aws.s3, bucket=BUCKET, prefix="raw/", send=collect)
 
     ids = {m.tweet.id for m in seen[0]}
     assert with_media["id"] not in ids

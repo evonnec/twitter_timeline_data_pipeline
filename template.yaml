@@ -309,6 +309,10 @@ Resources:
             - Effect: Allow
               Action: s3:PutObject
               Resource: !Sub "${MediaBucket.Arn}/raw/*"
+            # Unparseable Tweets and unsendable messages, kept for a fix and replay.
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub "${MediaBucket.Arn}/quarantine/*"
       EventInvokeConfig:
         # The next scheduled run retries; a retry would only burn API rate limit.
         MaximumRetryAttempts: 0
