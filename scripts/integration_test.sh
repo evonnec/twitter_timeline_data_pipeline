@@ -37,8 +37,10 @@ export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-test}"
 export AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-test}"
 export AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-us-east-1}"
 
-BUNDLE_DIR="${BUNDLE_DIR:-build/lambda}"
-LOCALSTACK_IMAGE="${LOCALSTACK_IMAGE:-localstack/localstack:4.14.0}" # last release that needs no auth token
+# Absolute, once: the docker -v mount below must not depend on the caller's cwd.
+BUNDLE_DIR="$(cd "${BUNDLE_DIR:-build/lambda}" 2>/dev/null && pwd || true)"
+# 4.14.0 is the last release that needs no auth token; pinned by digest.
+LOCALSTACK_IMAGE="${LOCALSTACK_IMAGE:-localstack/localstack:4.14.0@sha256:3ebc37595918b8accb852f8048fef2aff047d465167edd655528065b07bc364a}"
 LAMBDA_IMAGE="${LAMBDA_IMAGE:-public.ecr.aws/lambda/python:3.14}"
 OUT_DIR="$ROOT/build/integration"
 NETWORK="it-net"
@@ -95,8 +97,8 @@ localstack_ready() {
 port_open() { curl -sS -o /dev/null "http://127.0.0.1:$1/"; }
 
 cmd_up() {
-  [[ -d "$BUNDLE_DIR" && -f "$BUNDLE_DIR/twitter_timeline_data_pipeline/__init__.py" ]] || {
-    echo "::error::no Lambda bundle in $BUNDLE_DIR; run scripts/build_lambda.sh (or unzip the CI artifact there)"
+  [[ -n "$BUNDLE_DIR" && -f "$BUNDLE_DIR/twitter_timeline_data_pipeline/__init__.py" ]] || {
+    echo "::error::no Lambda bundle (BUNDLE_DIR, default build/lambda); run scripts/build_lambda.sh (or unzip the CI artifact there)"
     return 1
   }
   cmd_down
@@ -112,7 +114,7 @@ cmd_up() {
   wait_for "LocalStack to be ready" 180 localstack_ready
 
   step "Stub X API and media CDN on :$STUB_PORT"
-  nohup python3 tests/integration/stub_server.py --port "$STUB_PORT" \
+  nohup uv run --locked python tests/integration/stub_server.py --port "$STUB_PORT" \
     --public-url "http://host.docker.internal:$STUB_PORT" >"$OUT_DIR/stub.log" 2>&1 &
   echo $! >"$OUT_DIR/stub.pid"
   wait_for "the stub server" 30 curl -fsS "http://127.0.0.1:$STUB_PORT/__health"
@@ -138,7 +140,7 @@ cmd_up() {
       --env-file "$OUT_DIR/$(logical_of "$name").env" \
       -e AWS_CONFIG_FILE=/etc/aws-config \
       -v "$OUT_DIR/aws-config:/etc/aws-config:ro" \
-      -v "$ROOT/$BUNDLE_DIR:/var/task:ro" \
+      -v "$BUNDLE_DIR:/var/task:ro" \
       "$LAMBDA_IMAGE" "$(handler_of "$name")" >/dev/null
     wait_for "$name to listen" 120 port_open "$(port_of "$name")"
   done
@@ -150,6 +152,7 @@ cmd_test() {
     IT_OUT_DIR="$OUT_DIR" \
     IT_AWS_ENDPOINT_URL=http://127.0.0.1:4566 \
     IT_STUB_URL="http://127.0.0.1:$STUB_PORT" \
+    IT_STUB_URL_INTERNAL="http://host.docker.internal:$STUB_PORT" \
     IT_FETCH_URL="http://127.0.0.1:$(port_of it-fetch)" \
     IT_PROCESS_URL="http://127.0.0.1:$(port_of it-process)" \
     IT_MEDIA_RETRY_URL="http://127.0.0.1:$(port_of it-media-retry)" \
@@ -171,6 +174,8 @@ cmd_down() {
   docker network rm "$NETWORK" >/dev/null 2>&1 || true
   if [[ -f "$OUT_DIR/stub.pid" ]]; then
     kill "$(cat "$OUT_DIR/stub.pid")" >/dev/null 2>&1 || true
+    # `uv run` may leave its child behind; stop the stub by name too.
+    pkill -f "tests/integration/stub_server.py" >/dev/null 2>&1 || true
     rm -f "$OUT_DIR/stub.pid"
   fi
 }
