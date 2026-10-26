@@ -20,6 +20,7 @@ from twitter_timeline_data_pipeline.handlers.fetch import (
     run_fetch,
     sqs_client,
 )
+from twitter_timeline_data_pipeline.models import normalize_username
 from twitter_timeline_data_pipeline.x_api import XApiError, XClient
 
 logger = logging.getLogger(__name__)
@@ -96,14 +97,15 @@ def _fetch(args: argparse.Namespace) -> int:
         token, base_url=settings.x_api_base_url, timeout=settings.http_timeout
     ) as x_client:
         if args.dry_run:
-            user_id = x_client.get_user_id(args.username)
+            username = normalize_username(args.username)
+            user_id = x_client.get_user_id(username)
             for page in x_client.iter_timeline(
                 user_id,
                 since_id=args.since_id,
                 max_results=max_results,
                 max_pages=max_pages,
             ):
-                for message in page.messages(args.username):
+                for message in page.messages(username):
                     print(message.to_json())
             return EXIT_OK
 

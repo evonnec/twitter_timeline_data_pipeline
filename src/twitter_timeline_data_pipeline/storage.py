@@ -145,13 +145,17 @@ class MediaStore:
                 media_key=media.media_key, type=media.type, status="skipped"
             )
         raw_url, known_type = source
-        url = _original_size_url(raw_url)
-        parts = urlsplit(url)
-        if parts.scheme != "https" or parts.hostname not in ALLOWED_MEDIA_HOSTS:
+        try:
+            url = _original_size_url(raw_url)
+            parts = urlsplit(url)
+            host = parts.hostname
+        except ValueError:  # malformed URL, e.g. an unclosed IPv6 bracket
+            parts, host = None, None
+        if parts is None or parts.scheme != "https" or host not in ALLOWED_MEDIA_HOSTS:
             logger.warning(
                 "media %s skipped: host %r is not an allowed media host",
                 media.media_key,
-                parts.hostname,
+                host,
             )
             return StoredMedia(
                 media_key=media.media_key, type=media.type, status="skipped"

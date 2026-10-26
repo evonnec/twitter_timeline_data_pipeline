@@ -355,6 +355,20 @@ def test_store_skips_urls_outside_the_media_hosts(
     assert "Contents" not in aws.s3.list_objects_v2(Bucket=aws.bucket)
 
 
+def test_store_skips_a_malformed_url_instead_of_raising(
+    aws: Aws, caplog: pytest.LogCaptureFixture
+) -> None:
+    cdn = CdnStub()
+    item = photo(url="https://[pbs.twimg.com/media/Abc.jpg")
+
+    with caplog.at_level("WARNING"):
+        stored = media_store(aws, cdn).store(make_message(media=(item,)), item)
+
+    assert stored.status == "skipped"
+    assert cdn.requests == []
+    assert "not an allowed media host" in caplog.text
+
+
 @pytest.mark.parametrize("host", sorted(ALLOWED_MEDIA_HOSTS))
 def test_store_allows_both_x_media_hosts(aws: Aws, host: str) -> None:
     url = f"https://{host}/ext/file.mp4"

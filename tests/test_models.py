@@ -16,6 +16,7 @@ from twitter_timeline_data_pipeline.models import (
     Tweet,
     TweetMessage,
     is_newer,
+    normalize_username,
     utc_now_iso,
 )
 
@@ -490,3 +491,18 @@ def test_timeline_page_messages_stamp_defaults_to_now() -> None:
 def test_timeline_page_messages_every_message_round_trips() -> None:
     for message in page_from_fixture().messages("example_user"):
         assert TweetMessage.from_json(message.to_json()) == message
+
+
+@pytest.mark.parametrize(
+    ("given", "expected"),
+    [
+        ("NASA", "nasa"),
+        ("@NASA", "nasa"),
+        ("@@x", "@x"),
+        ("already_lower", "already_lower"),
+    ],
+)
+def test_normalize_username_strips_one_at_and_lowercases(
+    given: str, expected: str
+) -> None:
+    assert normalize_username(given) == expected
