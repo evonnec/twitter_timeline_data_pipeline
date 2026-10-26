@@ -32,6 +32,7 @@ from twitter_timeline_data_pipeline.handlers.process import (
 )
 from twitter_timeline_data_pipeline.models import Media, MediaRetry, TweetMessage
 from twitter_timeline_data_pipeline.storage import (
+    MAX_SIZE_ESTIMATE,
     MEDIA_RETRY_DELAY_SECONDS,
     MediaRetryQueue,
     MediaStore,
@@ -867,7 +868,7 @@ def test_cheapest_records_run_first_and_unknown_size_videos_last(
     ]
 
 
-def test_a_bit_rate_that_overflows_the_ordering_estimate_does_not_fail_the_batch(
+def test_a_huge_bit_rate_is_capped_so_the_tweet_is_stored_as_too_large(
     aws: Aws, cdn: CdnStub
 ) -> None:
     huge = video_message(
@@ -879,17 +880,21 @@ def test_a_bit_rate_that_overflows_the_ordering_estimate_does_not_fail_the_batch
     )
     record = sqs_record("huge", body(huge))
 
-    assert process._download_cost(record) == 0
+    # The estimate is capped, so ordering doesn't overflow and the record sorts last.
+    assert process._download_cost(record) == float(MAX_SIZE_ESTIMATE)
     failed = process_records(
         [record, sqs_record("ok", body(photo_message(GOOD)))],
         media_store=MediaStore(aws.s3, aws.bucket, cdn.client(), max_bytes=1_000_000),
         tweet_store=TweetStore(aws.tweets_table, aws.s3, aws.bucket),
     )
 
-    # Ordering no longer raises. The huge estimate can't be stored as a DynamoDB
-    # number, so that record alone fails (it ends in the DLQ, with its alarm).
-    assert failed == ["huge"]
-    assert stored_tweet_ids(aws) == {GOOD}
+    # The capped size fits a DynamoDB number, so the Tweet is stored with the video
+    # recorded as too_large instead of the record failing.
+    assert failed == []
+    assert stored_tweet_ids(aws) == {GOOD, TRANSIENT}
+    (entry,) = ddb_get(aws.tweets_table, tweet_id=TRANSIENT)["media"]
+    assert entry["status"] == "too_large"
+    assert entry["size_bytes"] == MAX_SIZE_ESTIMATE
 
 
 def test_a_slow_video_first_does_not_starve_its_siblings_on_the_last_receive(

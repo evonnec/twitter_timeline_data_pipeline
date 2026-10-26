@@ -167,13 +167,23 @@ def _extension(content_type: str | None, url: str) -> str:
     return suffix if suffix in _KNOWN_EXTENSIONS else ""
 
 
+# Cap for a size estimate: any real file is far smaller, and DynamoDB can't store a
+# number like the 10**400 a malformed bit_rate would produce (the write would fail).
+MAX_SIZE_ESTIMATE = 2**63 - 1
+
+
 def estimated_size(media: Media, url: str) -> int | None:
-    """Bytes implied by the chosen variant's ``bit_rate`` and the media's duration."""
+    """Bytes implied by the chosen variant's ``bit_rate`` and the media's duration.
+
+    None when there is no usable estimate (including a non-positive one); capped at
+    ``MAX_SIZE_ESTIMATE`` so it can always be stored.
+    """
     if media.type not in ("video", "animated_gif") or not media.duration_ms:
         return None
     for variant in media.variants:
         if variant.url == url and variant.bit_rate:
-            return variant.bit_rate * media.duration_ms // 8000
+            estimate = variant.bit_rate * media.duration_ms // 8000
+            return min(estimate, MAX_SIZE_ESTIMATE) if estimate > 0 else None
     return None
 
 
