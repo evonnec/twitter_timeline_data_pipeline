@@ -26,6 +26,7 @@ import re
 import time
 from collections.abc import Buffer, Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass
+from datetime import datetime
 from typing import TYPE_CHECKING, Any, Literal, cast, override
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -462,10 +463,18 @@ def estimate_item_size(value: Any) -> int:
 class TweetStore:
     """Writes Tweet metadata to the tweets table (partition key ``tweet_id``)."""
 
-    def __init__(self, table: Table, s3_client: S3Client, bucket: str) -> None:
+    def __init__(
+        self,
+        table: Table,
+        s3_client: S3Client,
+        bucket: str,
+        *,
+        retention_days: int = 0,
+    ) -> None:
         self._table = table
         self._s3 = s3_client
         self._bucket = bucket
+        self._retention_days = retention_days
 
     @staticmethod
     def text_key(message: TweetMessage, field: str = "text") -> str:
@@ -523,6 +532,10 @@ class TweetStore:
             )
             if over or _LONE_SURROGATE.search(item[field]):
                 self._offload(message, item, field)
+        if self._retention_days > 0:
+            # DynamoDB's TTL (attribute expires_at) removes the item after this epoch.
+            stored = datetime.fromisoformat(item["stored_at"]).timestamp()
+            item["expires_at"] = int(stored) + self._retention_days * 86_400
         return item
 
     @staticmethod

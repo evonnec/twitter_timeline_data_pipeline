@@ -57,6 +57,12 @@ def required_env_vars(module_file: str) -> set[str]:
     return {ENV_VARS[a] for a in attrs}
 
 
+def lifecycle_rules(bucket: dict[str, Any]) -> list[dict[str, Any]]:
+    """The always-on rules (the retention ones sit behind a condition)."""
+    rules = bucket["LifecycleConfiguration"]["Rules"]
+    return [r for r in rules if "Fn::If" not in r]
+
+
 def functions(template: Template) -> dict[str, dict[str, Any]]:
     return {
         name: res["Properties"]
@@ -86,6 +92,7 @@ def test_there_are_exactly_three_functions(template: Template) -> None:
         "FetchFunction",
         "ProcessFunction",
         "MediaRetryFunction",
+        "ComplianceFunction",
     }
 
 
@@ -95,6 +102,7 @@ def test_there_are_exactly_three_functions(template: Template) -> None:
         ("FetchFunction", "twitter_timeline_data_pipeline.handlers.fetch"),
         ("ProcessFunction", "twitter_timeline_data_pipeline.handlers.process"),
         ("MediaRetryFunction", "twitter_timeline_data_pipeline.handlers.media_retry"),
+        ("ComplianceFunction", "twitter_timeline_data_pipeline.handlers.compliance"),
     ],
 )
 def test_handler_path_resolves_to_a_callable(
@@ -136,7 +144,7 @@ def test_media_bucket_is_versioned_and_expires_old_versions(
     template: Template,
 ) -> None:
     bucket = properties(template, "MediaBucket")
-    rules = {r["Id"]: r for r in bucket["LifecycleConfiguration"]["Rules"]}
+    rules = {r["Id"]: r for r in lifecycle_rules(bucket)}
 
     assert bucket["VersioningConfiguration"]["Status"] == "Enabled"
     expire = rules["expire-noncurrent-versions"]
@@ -145,7 +153,7 @@ def test_media_bucket_is_versioned_and_expires_old_versions(
 
 
 def test_media_moves_to_intelligent_tiering(template: Template) -> None:
-    rules = properties(template, "MediaBucket")["LifecycleConfiguration"]["Rules"]
+    rules = lifecycle_rules(properties(template, "MediaBucket"))
     (rule,) = (r for r in rules if r["Id"] == "tier-media")
 
     assert rule["Prefix"] == "media/"
@@ -153,7 +161,8 @@ def test_media_moves_to_intelligent_tiering(template: Template) -> None:
 
 
 def test_username_index_projects_only_listing_attributes(template: Template) -> None:
-    (index,) = properties(template, "TweetsTable")["GlobalSecondaryIndexes"]
+    indexes = properties(template, "TweetsTable")["GlobalSecondaryIndexes"]
+    (index,) = (i for i in indexes if i["IndexName"] == "username-created_at-index")
 
     assert index["Projection"] == {
         "ProjectionType": "INCLUDE",
@@ -252,6 +261,7 @@ def test_fetch_function_runs_on_a_schedule(template: Template) -> None:
         ("FetchFunction", "fetch.py"),
         ("ProcessFunction", "process.py"),
         ("MediaRetryFunction", "media_retry.py"),
+        ("ComplianceFunction", "compliance.py"),
     ],
 )
 def test_every_required_env_var_is_set_on_its_function(
@@ -272,7 +282,8 @@ def test_fetch_function_has_a_token_source(template: Template) -> None:
 
 
 @pytest.mark.parametrize(
-    "function", ["FetchFunction", "ProcessFunction", "MediaRetryFunction"]
+    "function",
+    ["FetchFunction", "ProcessFunction", "MediaRetryFunction", "ComplianceFunction"],
 )
 def test_env_vars_are_all_known_to_settings(template: Template, function: str) -> None:
     assert set(env_of(template, function)) <= set(ENV_VARS.values())
@@ -307,8 +318,11 @@ def test_tweets_table_schema_matches_the_code(template: Template) -> None:
     props = properties(template, "TweetsTable")
 
     assert props["KeySchema"] == [{"AttributeName": "tweet_id", "KeyType": "HASH"}]
-    (gsi,) = props["GlobalSecondaryIndexes"]
-    assert gsi["IndexName"] == "username-created_at-index"
+    gsi = next(
+        i
+        for i in props["GlobalSecondaryIndexes"]
+        if i["IndexName"] == "username-created_at-index"
+    )
     assert [(k["AttributeName"], k["KeyType"]) for k in gsi["KeySchema"]] == [
         ("username", "HASH"),
         ("created_at", "RANGE"),
@@ -319,6 +333,8 @@ def test_tweets_table_schema_matches_the_code(template: Template) -> None:
         "tweet_id": "S",
         "username": "S",
         "created_at": "S",
+        "tombstone": "S",
+        "deleted_at": "S",
     }
 
 
@@ -582,3 +598,145 @@ def test_media_retry_function_has_an_errors_alarm(template: Template) -> None:
         alarm["AlarmActions"]
         == properties(template, "ProcessFunctionErrorsAlarm")["AlarmActions"]
     )
+
+
+# --- deletions and retention (#21) ----------------------------------------------
+
+
+def test_tweets_table_has_ttl_on_expires_at(template: Template) -> None:
+    assert properties(template, "TweetsTable")["TimeToLiveSpecification"] == {
+        "AttributeName": "expires_at",
+        "Enabled": True,
+    }
+
+
+def test_retention_is_off_by_default_and_feeds_the_process_function(
+    template: Template,
+) -> None:
+    parameter = template["Parameters"]["RetentionDays"]
+
+    assert parameter["Default"] == 0
+    assert parameter["MinValue"] == 0
+    assert env_of(template, "ProcessFunction")["RETENTION_DAYS"] == {
+        "Ref": "RetentionDays"
+    }
+    assert template["Conditions"]["HasRetention"] == {
+        "Fn::Not": [{"Fn::Equals": [{"Ref": "RetentionDays"}, "0"]}]
+    }
+
+
+def test_retention_lifecycle_rules_exist_only_with_retention(
+    template: Template,
+) -> None:
+    rules = properties(template, "MediaBucket")["LifecycleConfiguration"]["Rules"]
+    conditional = [r["Fn::If"] for r in rules if "Fn::If" in r]
+
+    assert len(conditional) == 2
+    prefixes = set()
+    for name, enabled, disabled in conditional:
+        assert name == "HasRetention"
+        assert disabled == {"Ref": "AWS::NoValue"}
+        assert enabled["Status"] == "Enabled"
+        assert enabled["ExpirationInDays"] == {"Ref": "RetentionDays"}
+        prefixes.add(enabled["Prefix"])
+    assert prefixes == {"media/", "text/"}
+
+
+def test_tombstone_index_is_sparse_and_keys_only(template: Template) -> None:
+    props = properties(template, "TweetsTable")
+    (index,) = (
+        i
+        for i in props["GlobalSecondaryIndexes"]
+        if i["IndexName"] == "tombstone-deleted_at-index"
+    )
+
+    assert [(k["AttributeName"], k["KeyType"]) for k in index["KeySchema"]] == [
+        ("tombstone", "HASH"),
+        ("deleted_at", "RANGE"),
+    ]
+    assert index["Projection"] == {"ProjectionType": "KEYS_ONLY"}
+
+
+def test_compliance_function_has_its_own_schedule_and_settings(
+    template: Template,
+) -> None:
+    props = properties(template, "ComplianceFunction")
+    parameters = template["Parameters"]
+
+    assert parameters["ComplianceSchedule"]["Default"] == "rate(1 day)"
+    assert parameters["ComplianceMaxLookups"]["Default"] == 1000
+    assert parameters["DeletionGraceHours"]["Default"] == 24
+    assert props["Timeout"] == 300
+    (event,) = props["Events"].values()
+    assert event["Type"] == "Schedule"
+    assert event["Properties"]["Schedule"] == {"Ref": "ComplianceSchedule"}
+    assert props["EventInvokeConfig"]["MaximumRetryAttempts"] == 0
+    env = env_of(template, "ComplianceFunction")
+    assert env["COMPLIANCE_MAX_LOOKUPS"] == {"Ref": "ComplianceMaxLookups"}
+    assert env["DELETION_GRACE_HOURS"] == {"Ref": "DeletionGraceHours"}
+    assert env["MEDIA_BUCKET"] == {"Ref": "MediaBucket"}
+    log_group = resource(template, "ComplianceFunctionLogGroup")
+    assert props["LoggingConfig"]["LogGroup"] == {"Ref": "ComplianceFunctionLogGroup"}
+    assert log_group["Properties"]["RetentionInDays"] == 30
+
+
+def test_compliance_function_permissions(template: Template) -> None:
+    statements = policy_statements(template, "ComplianceFunction")
+    by_actions = {frozenset(_as_list(s["Action"])): s for s in statements}
+
+    assert set(by_actions) == {
+        frozenset({"dynamodb:Query"}),
+        frozenset({"dynamodb:GetItem", "dynamodb:UpdateItem", "dynamodb:DeleteItem"}),
+        frozenset({"dynamodb:GetItem", "dynamodb:PutItem"}),
+        frozenset({"s3:ListBucketVersions", "s3:ListBucket"}),
+        frozenset({"s3:DeleteObject", "s3:DeleteObjectVersion"}),
+    }
+    assert all(s["Effect"] == "Allow" for s in statements)
+    state = by_actions[frozenset({"dynamodb:GetItem", "dynamodb:PutItem"})]
+    assert state["Resource"] == {"Fn::GetAtt": ["StateTable", "Arn"]}
+    assert state["Condition"] == {
+        "ForAllValues:StringLike": {"dynamodb:LeadingKeys": ["compliance#*"]}
+    }
+    deletes = by_actions[frozenset({"s3:DeleteObject", "s3:DeleteObjectVersion"})]
+    assert [json_key(r) for r in deletes["Resource"]] == [
+        json_key({"Fn::Sub": "${MediaBucket.Arn}/media/*"}),
+        json_key({"Fn::Sub": "${MediaBucket.Arn}/text/*"}),
+    ]
+    listing = by_actions[frozenset({"s3:ListBucketVersions", "s3:ListBucket"})]
+    assert listing["Condition"]["StringLike"]["s3:prefix"] == ["media/*", "text/*"]
+    query = by_actions[frozenset({"dynamodb:Query"})]
+    assert query["Resource"] == {"Fn::Sub": "${TweetsTable.Arn}/index/*"}
+
+
+def test_only_the_compliance_function_can_delete(template: Template) -> None:
+    deleting = {"dynamodb:DeleteItem", "dynamodb:BatchWriteItem", "s3:DeleteObject"}
+    deleting_prefixes = ("s3:DeleteObject", "dynamodb:DeleteItem", "s3:PutLifecycle")
+    for name in functions(template):
+        statements = policy_statements(template, name)
+        actions = {a for s in statements for a in _as_list(s["Action"])}
+        managed = [
+            p
+            for p in properties(template, name)["Policies"]
+            if isinstance(p, dict) and "Statement" not in p
+        ]
+        has_delete = any(a.startswith(deleting_prefixes) for a in actions)
+        assert has_delete == (name == "ComplianceFunction"), name
+        assert not actions & deleting or name == "ComplianceFunction"
+        # SAM policy templates in use: Write (DynamoDB put/update/delete) is allowed
+        # for the process function only through DynamoDBWritePolicy, which cannot
+        # delete.
+        for policy in managed:
+            assert set(policy) <= {
+                "SQSSendMessagePolicy",
+                "AWSSecretsManagerGetSecretValuePolicy",
+                "DynamoDBWritePolicy",
+            }
+
+
+def test_compliance_function_has_an_errors_alarm(template: Template) -> None:
+    props = properties(template, "ComplianceFunctionErrorsAlarm")
+
+    assert props["Dimensions"] == [
+        {"Name": "FunctionName", "Value": {"Ref": "ComplianceFunction"}}
+    ]
+    assert props["MetricName"] == "Errors"

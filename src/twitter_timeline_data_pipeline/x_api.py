@@ -12,7 +12,8 @@ import logging
 import random
 import re
 import time
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Collection, Iterator, Mapping
+from dataclasses import dataclass, field
 from types import TracebackType
 from typing import Any, Self
 
@@ -56,6 +57,47 @@ MEDIA_FIELDS = (
     "variants",
     "width",
 )
+
+
+MAX_LOOKUP_IDS = 100
+
+type UnavailableReason = str
+"""Why a Tweet is gone: ``deleted``, ``protected``, ``suspended`` or ``withheld``."""
+
+
+@dataclass(frozen=True, slots=True)
+class TweetLookup:
+    """Result of ``XClient.lookup_tweets``: every requested ID is in exactly one set.
+
+    ``unavailable`` maps an ID to its reason. ``unknown`` holds IDs the response said
+    nothing usable about (absent from both ``data`` and ``errors``, or an error this
+    client does not recognize). Callers must treat those as still present.
+    """
+
+    present: frozenset[str] = frozenset()
+    unavailable: Mapping[str, UnavailableReason] = field(default_factory=dict)
+    unknown: frozenset[str] = frozenset()
+
+
+def _unavailable_reason(error: Mapping[str, Any]) -> UnavailableReason | None:
+    """Map one per-ID error of ``GET /2/tweets`` to a reason, None if unrecognized.
+
+    ``resource-not-found`` is a deleted Tweet (or an account that no longer exists);
+    ``not-authorized-for-resource`` is a protected account's Tweet. Text naming a
+    suspended author or withheld content takes precedence, since the API reports those
+    under the same two problem types or a plain ``Forbidden``. Anything else is None.
+    """
+    kind = str(error.get("type") or "").rsplit("/", 1)[-1]
+    text = " ".join(str(error.get(k) or "") for k in ("title", "detail")).lower()
+    if "suspended" in text:
+        return "suspended"
+    if "withheld" in text or kind == "forbidden-withheld":
+        return "withheld"
+    if kind == "resource-not-found":
+        return "deleted"
+    if kind == "not-authorized-for-resource":
+        return "protected"
+    return None
 
 
 class XApiError(RuntimeError):
@@ -155,6 +197,46 @@ class XClient:
                 status_code=200,
             )
         return str(data["id"])
+
+    def lookup_tweets(self, ids: Collection[str]) -> TweetLookup:
+        """Check which of ``ids`` (at most 100) still exist, via ``GET /2/tweets``.
+
+        Only the ID is requested. An ID in ``data`` is present; one with a recognized
+        per-ID error is unavailable with a reason (see ``_unavailable_reason``); every
+        other ID, including one the response doesn't mention, is ``unknown``: the API
+        gave no proof either way, so it is never reported as gone.
+        """
+        wanted = list(dict.fromkeys(ids))
+        if not wanted:
+            return TweetLookup()
+        if len(wanted) > MAX_LOOKUP_IDS:
+            raise ValueError(
+                f"at most {MAX_LOOKUP_IDS} ids per lookup, got {len(wanted)}"
+            )
+        for tweet_id in wanted:
+            if not tweet_id.isascii() or not tweet_id.isdigit():
+                raise ValueError(f"invalid Tweet ID: {tweet_id!r}")
+        body = self._request("/tweets", {"ids": ",".join(wanted), "tweet.fields": "id"})
+        found = {
+            str(t["id"])
+            for t in body.get("data") or ()
+            if isinstance(t, Mapping) and "id" in t
+        }
+        gone: dict[str, UnavailableReason] = {}
+        for error in body.get("errors") or ():
+            if not isinstance(error, Mapping):
+                continue
+            tweet_id = str(error.get("resource_id") or error.get("value") or "")
+            reason = _unavailable_reason(error)
+            if tweet_id in wanted and reason is not None:
+                gone.setdefault(tweet_id, reason)
+        present = frozenset(i for i in wanted if i in found)
+        unavailable = {i: r for i, r in gone.items() if i not in found}
+        return TweetLookup(
+            present=present,
+            unavailable=unavailable,
+            unknown=frozenset(i for i in wanted if i not in found and i not in gone),
+        )
 
     def iter_timeline(
         self,

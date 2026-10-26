@@ -78,6 +78,8 @@ def aws() -> Iterator[Aws]:
                 {"AttributeName": "tweet_id", "AttributeType": "S"},
                 {"AttributeName": "username", "AttributeType": "S"},
                 {"AttributeName": "created_at", "AttributeType": "S"},
+                {"AttributeName": "tombstone", "AttributeType": "S"},
+                {"AttributeName": "deleted_at", "AttributeType": "S"},
             ],
             GlobalSecondaryIndexes=[
                 {
@@ -87,7 +89,15 @@ def aws() -> Iterator[Aws]:
                         {"AttributeName": "created_at", "KeyType": "RANGE"},
                     ],
                     "Projection": {"ProjectionType": "ALL"},
-                }
+                },
+                {
+                    "IndexName": "tombstone-deleted_at-index",
+                    "KeySchema": [
+                        {"AttributeName": "tombstone", "KeyType": "HASH"},
+                        {"AttributeName": "deleted_at", "KeyType": "RANGE"},
+                    ],
+                    "Projection": {"ProjectionType": "KEYS_ONLY"},
+                },
             ],
         )
         state = dynamodb.create_table(

@@ -20,6 +20,9 @@ def test_defaults_with_empty_environment() -> None:
     assert settings.http_timeout == 10.0
     assert settings.max_media_bytes == 512 * 1024 * 1024
     assert settings.max_receive_count is None
+    assert settings.retention_days == 0  # keep forever
+    assert settings.compliance_max_lookups == 1000
+    assert settings.deletion_grace_hours == 24.0
 
 
 def test_from_env_reads_every_variable() -> None:
@@ -38,6 +41,9 @@ def test_from_env_reads_every_variable() -> None:
             "HTTP_TIMEOUT_SECONDS": "2.5",
             "MAX_MEDIA_BYTES": "1048576",
             "MAX_RECEIVE_COUNT": "3",
+            "RETENTION_DAYS": "365",
+            "COMPLIANCE_MAX_LOOKUPS": "200",
+            "DELETION_GRACE_HOURS": "0.5",
         }
     )
 
@@ -55,6 +61,9 @@ def test_from_env_reads_every_variable() -> None:
         http_timeout=2.5,
         max_media_bytes=1048576,
         max_receive_count=3,
+        retention_days=365,
+        compliance_max_lookups=200,
+        deletion_grace_hours=0.5,
     )
 
 
@@ -101,6 +110,8 @@ def test_values_are_stripped() -> None:
         ("HTTP_TIMEOUT_SECONDS", "soon", "float"),
         ("MAX_MEDIA_BYTES", "512MiB", "int"),
         ("MAX_RECEIVE_COUNT", "3.5", "int"),
+        ("RETENTION_DAYS", "forever", "int"),
+        ("DELETION_GRACE_HOURS", "a day", "float"),
     ],
 )
 def test_unparseable_numbers_raise_config_error(
@@ -121,6 +132,9 @@ def test_unparseable_numbers_raise_config_error(
         ({"max_pages": -1}, "MAX_PAGES"),
         ({"http_timeout": 0.0}, "HTTP_TIMEOUT_SECONDS"),
         ({"http_timeout": -1.0}, "HTTP_TIMEOUT_SECONDS"),
+        ({"retention_days": -1}, "RETENTION_DAYS"),
+        ({"compliance_max_lookups": 0}, "COMPLIANCE_MAX_LOOKUPS"),
+        ({"deletion_grace_hours": -1.0}, "DELETION_GRACE_HOURS"),
         ({"max_media_bytes": 0}, "MAX_MEDIA_BYTES"),
         ({"max_media_bytes": -5}, "MAX_MEDIA_BYTES"),
         ({"max_receive_count": 0}, "MAX_RECEIVE_COUNT"),

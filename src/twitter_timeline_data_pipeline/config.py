@@ -24,6 +24,9 @@ ENV_VARS: Mapping[str, str] = {
     "max_media_bytes": "MAX_MEDIA_BYTES",
     "max_receive_count": "MAX_RECEIVE_COUNT",
     "media_retry_queue_url": "MEDIA_RETRY_QUEUE_URL",
+    "retention_days": "RETENTION_DAYS",
+    "compliance_max_lookups": "COMPLIANCE_MAX_LOOKUPS",
+    "deletion_grace_hours": "DELETION_GRACE_HOURS",
 }
 
 
@@ -59,6 +62,13 @@ class Settings:
     instead of failing the record. None disables that."""
     media_retry_queue_url: str | None = None
     """Queue the process function sends media-retry messages to."""
+    retention_days: int = 0
+    """Days a stored Tweet is kept before DynamoDB's TTL removes it (``expires_at``,
+    written only when this is above 0). 0 keeps data forever."""
+    compliance_max_lookups: int = 1000
+    """Most stored Tweet IDs one compliance run checks against the X API."""
+    deletion_grace_hours: float = 24.0
+    """Hours between tombstoning an unavailable Tweet and removing its content."""
 
     def __post_init__(self) -> None:
         if not 5 <= self.max_results <= 100:
@@ -81,6 +91,21 @@ class Settings:
             raise ConfigError(
                 f"{ENV_VARS['max_receive_count']} must be >= 1, "
                 f"got {self.max_receive_count}"
+            )
+
+        if self.retention_days < 0:
+            raise ConfigError(
+                f"{ENV_VARS['retention_days']} must be >= 0, got {self.retention_days}"
+            )
+        if self.compliance_max_lookups < 1:
+            raise ConfigError(
+                f"{ENV_VARS['compliance_max_lookups']} must be >= 1, "
+                f"got {self.compliance_max_lookups}"
+            )
+        if self.deletion_grace_hours < 0:
+            raise ConfigError(
+                f"{ENV_VARS['deletion_grace_hours']} must be >= 0, "
+                f"got {self.deletion_grace_hours}"
             )
 
     @classmethod
@@ -125,6 +150,9 @@ class Settings:
                 else get_number("max_receive_count", int, 1)
             ),
             media_retry_queue_url=get("media_retry_queue_url"),
+            retention_days=get_number("retention_days", int, 0),
+            compliance_max_lookups=get_number("compliance_max_lookups", int, 1000),
+            deletion_grace_hours=get_number("deletion_grace_hours", float, 24.0),
         )
 
     def require(self, *attrs: str) -> None:

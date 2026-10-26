@@ -101,9 +101,10 @@ VALID_EXPANSIONS = frozenset(
     }
 )
 
-type Endpoint = Literal["user", "timeline", "other"]
+type Endpoint = Literal["user", "timeline", "lookup", "other"]
 
 _USER_PATH = re.compile(r"/2/users/by/username/(?P<handle>[^/]+)")
+_LOOKUP_PATH = re.compile(r"/2/tweets")
 _TIMELINE_PATH = re.compile(r"/2/users/(?P<user_id>[0-9]+)/tweets")
 _HANDLE = re.compile(r"[A-Za-z0-9_]{1,15}")
 
@@ -198,6 +199,7 @@ class FakeXApi:
         self._users: dict[str, _User] = {}
         self._timelines: dict[str, list[FakeTweet]] = {}
         self._cursors: dict[str, tuple[int, int]] = {}
+        self._gone: dict[str, str] = {}
         self._faults: list[Fault] = []
         self._last_id = 0
         self._serial = itertools.count(1)
@@ -301,6 +303,19 @@ class FakeXApi:
         self._timelines[user.id].append(tweet)
         return tweet
 
+    def remove(self, tweet_id: str, *, reason: str = "deleted") -> None:
+        """Take a post off the platform: ``deleted`` (the author removed it),
+        ``protected`` (the account went private) or ``suspended``. It leaves the
+        timeline and ``GET /2/tweets`` reports it as the real API does."""
+        for tweets in self._timelines.values():
+            tweets[:] = [t for t in tweets if t.id != tweet_id]
+        self._gone[tweet_id] = reason
+
+    def restore(self, tweet: FakeTweet) -> None:
+        """Put a removed post back (a protected account made public again)."""
+        self._gone.pop(tweet.id, None)
+        self._timelines[tweet.author_id].append(tweet)
+
     def timeline(self, username: str) -> list[FakeTweet]:
         """Every post of the account, newest first."""
         tweets = self._timelines[self.user_id(username)]
@@ -396,6 +411,8 @@ class FakeXApi:
         page = 1
         if _USER_PATH.fullmatch(path):
             endpoint = "user"
+        elif _LOOKUP_PATH.fullmatch(path):
+            endpoint = "lookup"
         elif _TIMELINE_PATH.fullmatch(path):
             endpoint = "timeline"
             token = params.get("pagination_token")
@@ -433,6 +450,8 @@ class FakeXApi:
             )
         if match := _USER_PATH.fullmatch(path):
             return self._user(call, match["handle"])
+        if _LOOKUP_PATH.fullmatch(path):
+            return self._lookup(call)
         if match := _TIMELINE_PATH.fullmatch(path):
             return self._timeline(call, match["user_id"])
         return httpx.Response(404, json={"title": "Not Found Error"})
@@ -483,6 +502,47 @@ class FakeXApi:
                 }
             }
         return httpx.Response(200, json=body, headers=self._rate_headers(call))
+
+    def _lookup(self, call: ApiCall) -> httpx.Response:
+        """``GET /2/tweets?ids=``: found posts in ``data``, the rest in ``errors``."""
+        ids = [i for i in call.params.get("ids", "").split(",") if i]
+        if not 1 <= len(ids) <= 100:
+            return _invalid_request(
+                "ids", ",".join(ids), call, self._rate_headers(call)
+            )
+        live = {t.id: t for tweets in self._timelines.values() for t in tweets}
+        fields = {f for f in call.params.get("tweet.fields", "").split(",") if f}
+        data = [_tweet_json(live[i], fields) for i in ids if i in live]
+        errors = [self._lookup_error(i) for i in ids if i not in live]
+        body: dict[str, Any] = {}
+        if data:
+            body["data"] = data
+        if errors:
+            body["errors"] = errors
+        return httpx.Response(200, json=body, headers=self._rate_headers(call))
+
+    def _lookup_error(self, tweet_id: str) -> dict[str, Any]:
+        reason = self._gone.get(tweet_id, "deleted")
+        problems = "https://api.twitter.com/2/problems/"
+        match reason:
+            case "protected":
+                title, kind = "Authorization Error", "not-authorized-for-resource"
+                detail = f"Not authorized to see the Tweet with id: [{tweet_id}]."
+            case "suspended":
+                title, kind = "Forbidden", "resource-not-found"
+                detail = "User has been suspended: [example]."
+            case _:
+                title, kind = "Not Found Error", "resource-not-found"
+                detail = f"Could not find tweet with ids: [{tweet_id}]."
+        return {
+            "value": tweet_id,
+            "detail": detail,
+            "title": title,
+            "resource_type": "tweet",
+            "parameter": "ids",
+            "resource_id": tweet_id,
+            "type": problems + kind,
+        }
 
     def _timeline(self, call: ApiCall, user_id: str) -> httpx.Response:
         headers = self._rate_headers(call)

@@ -260,9 +260,14 @@ def _http_client(timeout: float) -> httpx.Client:
 
 
 @functools.cache
-def _tweet_store(table_name: str, bucket: str) -> TweetStore:
+def _tweet_store(table_name: str, bucket: str, retention_days: int = 0) -> TweetStore:
     dynamodb = boto3.resource("dynamodb", config=_short_timeouts())
-    return TweetStore(dynamodb.Table(table_name), _s3_client(), bucket)
+    return TweetStore(
+        dynamodb.Table(table_name),
+        _s3_client(),
+        bucket,
+        retention_days=retention_days,
+    )
 
 
 def handler(event: Any, context: Any) -> dict[str, list[dict[str, str]]]:
@@ -280,7 +285,9 @@ def handler(event: Any, context: Any) -> dict[str, list[dict[str, str]]]:
             _http_client(settings.http_timeout),
             max_bytes=settings.max_media_bytes,
         ),
-        tweet_store=_tweet_store(settings.tweets_table, settings.media_bucket),
+        tweet_store=_tweet_store(
+            settings.tweets_table, settings.media_bucket, settings.retention_days
+        ),
         remaining_ms=getattr(context, "get_remaining_time_in_millis", None),
         max_receive_count=settings.max_receive_count,
         retry_queue=MediaRetryQueue(_sqs_client(), settings.media_retry_queue_url),

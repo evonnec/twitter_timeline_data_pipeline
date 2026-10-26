@@ -1,6 +1,7 @@
 import io
 import json
 from collections.abc import Iterator
+from datetime import datetime
 from typing import Any, cast
 from urllib.parse import urlsplit
 
@@ -1715,3 +1716,29 @@ def test_the_runbook_scan_finds_items_with_any_retrying_media(aws: Aws) -> None:
         "1700000000000000003",
         "1700000000000000004",
     ]
+
+
+def test_expires_at_is_written_only_when_retention_is_configured(aws: Aws) -> None:
+    message = make_message("1700000000000000001")
+    keep = TweetStore(aws.tweets_table, aws.s3, aws.bucket)
+    expire = TweetStore(aws.tweets_table, aws.s3, aws.bucket, retention_days=30)
+
+    assert "expires_at" not in keep.build_item(message, [])
+    item = expire.build_item(message, [])
+
+    stored = datetime.fromisoformat(item["stored_at"]).timestamp()
+    assert item["expires_at"] == int(stored) + 30 * 86_400
+
+
+def test_default_retention_never_writes_expires_at_to_dynamodb(aws: Aws) -> None:
+    TweetStore(aws.tweets_table, aws.s3, aws.bucket).put_tweet(
+        make_message("1700000000000000001"), []
+    )
+    TweetStore(aws.tweets_table, aws.s3, aws.bucket, retention_days=1).put_tweet(
+        make_message("1700000000000000002"), []
+    )
+
+    items = {i["tweet_id"]: i for i in aws.tweets_table.scan()["Items"]}
+
+    assert "expires_at" not in items["1700000000000000001"]
+    assert "expires_at" in items["1700000000000000002"]

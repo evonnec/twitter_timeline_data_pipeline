@@ -33,10 +33,16 @@ flowchart LR
     R -->|UpdateItem on that media entry| TT
     R -->|stream upload| S3
     R -->|download media| CDN
+    EB2[EventBridge schedule<br/>daily] -->|invoke| C[ComplianceFunction]
+    C -->|GET /2/tweets?ids=, 100 per request| X
+    C -->|tombstone, then delete item| TT
+    C -->|delete all object versions| S3
+    C <-->|cursor compliance#handle| ST
     CW[CloudWatch alarms] -.->|watch| DLQ
     CW -.->|watch| RDLQ
     CW -.->|watch| F
     CW -.->|watch| P
+    CW -.->|watch| C
 ```
 
 A run, step by step:
@@ -52,6 +58,8 @@ A run, step by step:
 9. For each message it downloads the media and uploads it to S3, then writes the Tweet item to DynamoDB. Media goes first so a stored Tweet never points at missing media.
 10. Messages that fail are reported back individually. SQS redelivers them and, after `MaxReceiveCount` receives, moves them to the dead-letter queue, which has an alarm.
 11. On a message's last receive a media item that still can't be stored does not fail the record. The Tweet is written with that media marked `retrying` (with its `source_url`), and one message per such media item goes to the media-retry queue, delayed 5 minutes. `MediaRetryFunction` downloads the file and replaces just that entry of the Tweet item. If it keeps failing, the message ends up in the media-retry dead-letter queue, which also has an alarm. If the retry message cannot be sent, the record is reported failed and goes to the main DLQ instead.
+
+12. Separately, EventBridge invokes `ComplianceFunction` on its own schedule (`rate(1 day)`). It checks stored Tweet IDs against the X API, tombstones the ones that are gone and, after a grace period, removes them. See [Data classification, retention and deletion](#data-classification-retention-and-deletion).
 
 ## Data model
 
@@ -114,6 +122,8 @@ You can regenerate it with `TweetMessage(...).to_json()` from `twitter_timeline_
 | --- | --- |
 | Partition key | `tweet_id` (S) |
 | GSI `username-created_at-index` | partition `username` (S), sort `created_at` (S), projects `text`, `text_truncated`, `text_s3_key`, `media_count` and `public_metrics` only |
+| GSI `tombstone-deleted_at-index` | sparse: partition `tombstone` (S, always `"1"`), sort `deleted_at` (S); keys only. Only tombstoned items appear in it |
+| TTL | attribute `expires_at` (epoch seconds), enabled always; written only when `RetentionDays` is above 0 |
 | Billing | on demand; point-in-time recovery and encryption on |
 
 `created_at` is stored as the API's ISO 8601 string, which sorts chronologically. The index projects `INCLUDE` rather than `ALL`: that roughly halves its write units and storage per Tweet. The trade-off is that a listing returns only those five attributes plus the keys, so read anything else (`media`, `referenced_tweets`, ...) with `GetItem` on `tweet_id`. The projected `text` is the full text for a long post (the preview is `display_text`, which the index does not project) unless the item was offloaded: then it is only a prefix, so check `text_truncated` and read the full text from `text_s3_key`. Attributes written by `TweetStore.to_item` (attributes whose value is `None` are omitted):
@@ -140,6 +150,8 @@ You can regenerate it with `TweetMessage(...).to_json()` from `twitter_timeline_
 | `fetched_at` | S | when the fetch Lambda saw the Tweet; a write is skipped if the stored value is later |
 | `stored_at` | S | when the item was written |
 | `schema_version` | N | a write is skipped if the stored value is higher |
+| `expires_at` | N | Epoch seconds after which DynamoDB's TTL removes the item. Only written when `RetentionDays` is above 0 |
+| `deleted_at`, `deletion_reason`, `tombstone` | S | Only on a tombstoned Tweet (unavailable at the source): when it was found, why (`deleted`, `protected`, `suspended` or `withheld`), and the sparse-index marker (`"1"`) |
 
 **Reading the full text.** Use `text` unless `text_truncated` is `true`; then `GetObject` the key in `text_s3_key` from the media bucket (`text/<author_id>/<tweet_id>.json`, or the lower-cased username when the Tweet has no author ID) and `json.loads` it: the object is the text as one JSON string (UTF-8, `application/json`), so any characters, a lone surrogate included, read back exactly. The object is written before the item and create-only, so a redelivery leaves it alone. Only a post whose item would pass 350 KB is offloaded (a handful of emoji-only posts at most). A message without `note_text` never replaces a stored long post, whatever its `fetched_at`.
 
@@ -179,6 +191,8 @@ One item per account: partition key `username` (S, lower case) and
 | `version` | N | Optimistic lock, incremented on every write. |
 | `updated_at` | S | UTC timestamp of the last write. |
 
+The compliance function keeps its own cursor in the same table under `username = "compliance#<handle>"` (X handles can't contain `#`, so it never collides with a checkpoint): `cursor` (S, the JSON `LastEvaluatedKey` of its walk over the Tweets GSI; absent when the next run starts from the beginning) and `updated_at`. Its IAM permissions are limited to keys starting with `compliance#`.
+
 The list is kept normalized on every save: overlapping or adjacent gaps are merged, and at most 1,500 are kept (past that, the two closest neighbours are joined; the cap covers a day of one standing empty gap per run at a 1-minute schedule, about 165 KB against DynamoDB's 400 KB item limit). A merge only adds IDs to re-fetch, so it can cause duplicates but never loss.
 
 **Empty responses never end a range by themselves.** A `200` with `errors` and no data (for example an account that turned protected) raises an error instead of reading as "no more Tweets"; an empty page that still has a `next_token` is followed. A gap is dropped only after 3 consecutive empty runs spanning at least 24 hours (`empty_runs`, `first_empty_at`), so a short API incident cannot erase a range that still holds data. A run counts as empty when no page for the gap carried data and the walk ended on a clean empty response (no data, no errors, no `next_token`; empty pages that still pointed onward don't prevent it). Both fields reset whenever data comes back. Because the API sends a `next_token` on the last page, every run's new-Tweets walk ends on such an empty response, which is recorded as the gap's first empty run without a second request. A gap that has reached its last run waits out the 24 hours without being asked again (it costs no requests and doesn't count as unfinished), then gets one request first in its next run to drop. Gaps that came back empty are checked after the ones that may still hold Tweets, so a burst isn't starved by them. If the API recovers during the wait, the Tweets in such a gap arrive at the end of it, delayed but not lost. The drop is logged at WARNING as `dropping gap for <user> (since_id=..., until_id=...): out of the API's reach`, stable text for a metric filter to match. That is how a range that has aged out of the API's window finally goes away.
@@ -197,7 +211,7 @@ If a Tweet has no `author_id`, the lower-cased username is used instead. The key
 
 The same bucket also holds the full text of oversized long posts at `text/<author_id>/<tweet_id>.json` (a JSON string, `application/json`, user metadata `tweet-id`); see the Tweets table. These objects are not tiered.
 
-Each object has the `Content-Type` of the source and user metadata `tweet-id`, `media-key` and `source-url`. The bucket is encrypted (SSE-S3), blocks all public access, refuses non-TLS requests, and aborts incomplete multipart uploads after 7 days. Versioning is on, so a deleted or overwritten object can be recovered for 30 days (noncurrent versions then expire). Objects under `media/` move to S3 Intelligent-Tiering on day 0, so cold video stops costing Standard rates; the trade-off is a small per-object monitoring fee, and objects under 128 KB are never tiered.
+Each object has the `Content-Type` of the source and user metadata `tweet-id`, `media-key` and `source-url`. The bucket is encrypted (SSE-S3), blocks all public access, refuses non-TLS requests, and aborts incomplete multipart uploads after 7 days. Versioning is on, so a deleted or overwritten object can be recovered for 30 days (noncurrent versions then expire). Objects under `media/` move to S3 Intelligent-Tiering on day 0, so cold video stops costing Standard rates; the trade-off is a small per-object monitoring fee, and objects under 128 KB are never tiered. With `RetentionDays` above 0, lifecycle rules also expire `media/` and `text/` objects after that many days. The compliance function deletes the objects of removed Tweets version by version, so nothing stays recoverable.
 
 ## Design decisions
 
@@ -243,7 +257,8 @@ Each object has the `Content-Type` of the source and user metadata `tweet-id`, `
 │   └── handlers/
 │       ├── fetch.py                   FetchFunction handler
 │       ├── process.py                 ProcessFunction handler
-│       └── media_retry.py             MediaRetryFunction handler
+│       ├── media_retry.py             MediaRetryFunction handler
+│       └── compliance.py              ComplianceFunction handler: tombstone and purge
 └── tests/                             moto-mocked tests, no AWS account needed
 ```
 
@@ -381,12 +396,16 @@ Extra arguments are passed to `sam deploy`, for example `scripts/deploy.sh --reg
 | `MaxMediaBytes` | `536870912` | Largest media file stored, in bytes; bigger ones are recorded as `too_large` |
 | `MaxReceiveCount` | `5` | Receives before a message moves to the DLQ; also tells the process function which receive is the last, when it queues unstored media for retry instead of failing the record |
 | `MediaRetryMaxReceiveCount` | `10` | Receives of a media-retry message before it moves to the media-retry DLQ (at least 5,400 s apart) |
+| `RetentionDays` | `0` | Days a Tweet and its media are kept; 0 keeps everything forever. Above 0 it turns on the `expires_at` TTL attribute and the S3 expiration rules |
+| `ComplianceSchedule` | `rate(1 day)` | EventBridge schedule for the deletion-compliance run |
+| `ComplianceMaxLookups` | `1000` | Stored Tweet IDs checked against the X API per run (100 per request) |
+| `DeletionGraceHours` | `24` | Hours between tombstoning a Tweet and removing its item and S3 objects |
 | `LogLevel` | `INFO` | Lambda application log level (`DEBUG`, `INFO`, `WARN`, `ERROR`); logs are JSON. SDK and HTTP library loggers stay at WARNING regardless |
 | `AlarmTopicArn` | empty | Optional SNS topic notified by the alarms |
 
 ### Stack outputs
 
-`QueueUrl`, `DeadLetterQueueUrl`, `TweetsTableName`, `StateTableName`, `MediaBucketName`, `BearerTokenSecretArn`, `FetchFunctionName`, `ProcessFunctionName`, `MediaRetryFunctionName`, `MediaRetryQueueUrl`, `MediaRetryDeadLetterQueueUrl`.
+`QueueUrl`, `DeadLetterQueueUrl`, `TweetsTableName`, `StateTableName`, `MediaBucketName`, `BearerTokenSecretArn`, `FetchFunctionName`, `ProcessFunctionName`, `MediaRetryFunctionName`, `ComplianceFunctionName`, `MediaRetryQueueUrl`, `MediaRetryDeadLetterQueueUrl`.
 
 ## Testing a deployment
 
@@ -465,6 +484,37 @@ sam local invoke ProcessFunction --event events/sqs.json
 ```
 
 **Automated tests.** `tests/` holds unit tests for each module, a test of the template, and an end-to-end test that runs both handlers against each other. AWS is mocked with moto and HTTP with `httpx.MockTransport`, so `uv run pytest` needs no AWS account, credentials or network.
+
+## Data classification, retention and deletion
+
+**What is stored.** Public posts (text, metadata, public metrics), public account handles and IDs, and the public media attached to those posts. No private data is collected: the token is app-only, so protected accounts are out of reach and a Tweet that later becomes protected is treated as unavailable (below). Posts are public data but still subject to the X Developer Agreement and Policy. DLQ messages hold full Tweet bodies for 14 days and logs are kept for 30 days.
+
+**Source policy.** X's Developer Policy requires that when content is no longer available through the X API you remove it from your service "as soon as reasonably possible" and "within 24 hours after the receipt of a removal request from X", and that you "delete or modify any content you have if it is deleted or modified on X". Offline storage must be kept "up to date with the current state of that content on X". Source: <https://docs.x.com/developer-terms/policy> (read 2026-10-26; check it again before relying on it). This is why `DeletionGraceHours` defaults to 24: it is the figure the policy names. Set it lower to be stricter.
+
+**Policy of this pipeline.** Apart from source deletions, data is kept forever by default; the owner's never-lose-data rule is not overridden by anything else. Deleting at the source is the one deliberate exception.
+
+- *Deleted, protected, withheld or suspended at the source.* A scheduled compliance function re-checks stored Tweet IDs with `GET /2/tweets?ids=` (100 per request). A Tweet the API reports as unavailable is **tombstoned** at once: `deleted_at`, `deletion_reason` and the index marker `tombstone` are set, and its content stays in place. If the Tweet is seen again while still inside the grace period (a protected account may come back) the tombstone is cleared. After `DeletionGraceHours` the function **purges** it: every S3 object the item points to (`media[].s3_key`, any `preview_s3_key`, `text_s3_key`, `display_text_s3_key`) is deleted with **all its versions and delete markers** (the bucket is versioned), then the item is deleted. S3 goes first, so a failed run still finds the keys on retry.
+- *Never on ambiguity.* A response that omits an ID from both `data` and `errors`, or an error it doesn't recognize, is "unknown": the Tweet is left alone and checked again next cycle. Only `resource-not-found` (deleted), `not-authorized-for-resource` (protected) and errors whose text says suspended or withheld tombstone a Tweet.
+- *Optional retention.* `RetentionDays` above 0 writes `expires_at = stored_at + days` on each item, which the table's TTL deletes (TTL runs within about 48 hours of expiry), and adds S3 expiration rules for `media/` and `text/`. TTL deletes the item but not S3 objects, so the lifecycle rules are what remove those; the two clocks start at different moments (item write and object upload) and refetching an item moves its `expires_at`. With the default 0 nothing expires.
+- *Edits.* An edited post gets a new ID; the old versions stay and are checked like any other Tweet, so they go when X reports them unavailable.
+- *Permissions.* Only `ComplianceFunction` can delete: `dynamodb:DeleteItem`/`UpdateItem` on the tweets table and `s3:DeleteObject`/`DeleteObjectVersion` on `media/*` and `text/*` (a template test enforces that no other function has any).
+
+**How often deletions are checked, and the worst-case window.** Each run walks the stored Tweets of the configured account oldest first through the GSI, checking at most `ComplianceMaxLookups` IDs (default 1,000, ten requests) and resuming where the last run stopped, wrapping around at the end. With N stored Tweets, B = `ComplianceMaxLookups`, S = the schedule period and G = `DeletionGraceHours`:
+
+- a deletion is found within ceil(N / B) runs, that is at most ceil(N / B) x S;
+- its content is removed by the first run after G more hours, so at most ceil(N / B) x S + G + S after it happened.
+
+With the defaults and up to 1,000 stored Tweets that is one day to find it, plus 24 hours of grace, plus up to one more day for the purge run: at most about 3 days. To tighten it, run more often (`ComplianceSchedule: rate(1 hour)`), raise `ComplianceMaxLookups` so that N / B stays at 1, and lower `DeletionGraceHours`. Each checked ID is a post read on the X API, so the lookups are billed like any other read: 1,000 a day is small, but an archive of 100,000 Tweets checked daily is not. The function logs `tombstoned tweet ...` and `purged tweet ...` lines (stable text for metric filters, which come with issue #19) and a per-run `compliance run for ...` summary; an alarm fires when the function fails (a failed lookup, a failed purge, an invalid token).
+
+**Open item.** Raw API pages saved under the `raw/` prefix (issue #20) can contain deleted Tweets. The compliance function does not touch that prefix (its IAM scope is `media/` and `text/` only, and it refuses other keys), so the raw-pages lifecycle must cover it, by expiry or by the same purge, before raw pages are kept long term.
+
+### Runbook: deletions and retention
+
+- *See what was tombstoned:* `aws dynamodb query --table-name "$TWEETS_TABLE" --index-name tombstone-deleted_at-index --key-condition-expression 'tombstone = :t' --expression-attribute-values '{":t":{"S":"1"}}'`.
+- *Run it now:* `sam remote invoke ComplianceFunction --stack-name "$STACK"`. The result counts `checked`, `tombstoned`, `cleared`, `purged`, `unknown` and says whether the walk `wrapped`.
+- *The alarm fired:* read the function's log group. A `purge <id>: ...` failure leaves the item in place with its keys, so the next run retries it; a refusal of a key outside `media/` and `text/` needs a manual look. A `lookup walk` failure keeps the cursor of the last good batch. An `AuthError` means the bearer token is wrong.
+- *Stop a wrongly tombstoned Tweet from being purged:* remove `deleted_at`, `deletion_reason` and `tombstone` from the item before the grace period ends (the next run clears it anyway if X reports it present). Inside the grace period nothing has been deleted.
+- *Change the policy:* update the stack parameters `RetentionDays`, `ComplianceSchedule`, `ComplianceMaxLookups` or `DeletionGraceHours`. Lowering `RetentionDays` does not retroactively set `expires_at` on stored items; it applies to items written afterwards.
 
 ## Operations
 
@@ -547,7 +597,7 @@ The script reads the table and bucket names from the stack outputs, runs `sam de
 - A media key that is missing from the response's `includes` (deleted or withheld media) is dropped with a warning, so the Tweet is stored without that media entry.
 - Tweet writes are conditional on `fetched_at` and `schema_version`, so an older delivery never replaces a newer item. Fetch runs less than a second apart can't be ordered, and there is no stale-write metric yet, only an INFO log line. A stale message still runs the media step first: usually one `HeadObject` per media item, which can leave an S3 object the stored item doesn't reference, and a transient media error on a stale message still fails it for retry. The fetch time must be a valid UTC-convertible ISO 8601 string no more than 5 minutes ahead; other messages are rejected as malformed.
 - Edited Tweets get a new ID and are stored as new items; the old ones remain. `edit_history_tweet_ids` links them.
-- Deletions are not propagated: a Tweet deleted at the source stays in the table.
+- Deletions at the source are propagated by the compliance function, with the delays described in [Data classification, retention and deletion](#data-classification-retention-and-deletion). Between a deletion and the next compliance run the Tweet is still stored.
 - Metrics (`public_metrics`) are a snapshot at fetch time and are not refreshed.
 - Videos that only have HLS variants (no `video/mp4`) are recorded with status `skipped` and nothing is downloaded.
 - Media whose download returns a 4xx other than 429, or a redirect, is recorded as `unavailable`; the Tweet is still stored. Media at a non-https URL or a host other than the two X CDN hosts is recorded as `skipped`. 429 and 5xx responses and timeouts are retried.
