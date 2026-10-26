@@ -383,3 +383,9 @@ def test_queues_accept_messages_up_to_the_size_the_fetch_guard_allows(
     from twitter_timeline_data_pipeline.handlers.fetch import SQS_MAX_MESSAGE_BYTES
 
     assert properties(template, name)["MaximumMessageSize"] == SQS_MAX_MESSAGE_BYTES
+
+
+def test_fetch_is_deployed_after_the_processor(template: Template) -> None:
+    # A fetcher that sends long posts must not go live before a processor that
+    # understands them.
+    assert resource(template, "FetchFunction")["DependsOn"] == "ProcessFunction"

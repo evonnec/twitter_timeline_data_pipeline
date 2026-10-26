@@ -58,9 +58,9 @@ NEW = "2026-10-25T12:00:00Z"
 class ExplodingTweetStore(TweetStore):
     """Fails like a DynamoDB outage for one tweet; behaves normally otherwise."""
 
-    def __init__(self, table: Any, bad_tweet_id: str) -> None:
-        super().__init__(table)
-        self._bad = bad_tweet_id
+    def __init__(self, table: Any, s3_client: Any, bucket: str, bad: str) -> None:
+        super().__init__(table, s3_client, bucket)
+        self._bad = bad
 
     def put_tweet(self, message: TweetMessage, media: Any) -> PutResult:
         if message.tweet.id == self._bad:
@@ -104,7 +104,9 @@ def test_reports_exactly_the_failing_records(
         failed = process_records(
             records,
             media_store=MediaStore(aws.s3, aws.bucket, cdn.client()),
-            tweet_store=ExplodingTweetStore(aws.tweets_table, UNEXPECTED),
+            tweet_store=ExplodingTweetStore(
+                aws.tweets_table, aws.s3, aws.bucket, UNEXPECTED
+            ),
         )
 
     assert failed == ["m-malformed", "m-transient", "m-unexpected", "m-schema"]
@@ -121,7 +123,7 @@ def test_empty_batch_has_no_failures(aws: Aws, cdn: CdnStub) -> None:
     failed = process_records(
         [],
         media_store=MediaStore(aws.s3, aws.bucket, cdn.client()),
-        tweet_store=TweetStore(aws.tweets_table),
+        tweet_store=TweetStore(aws.tweets_table, aws.s3, aws.bucket),
     )
 
     assert failed == []
@@ -137,7 +139,7 @@ def test_stale_record_is_skipped_without_failing_and_logged(
     older = make_message(
         GOOD, media=(pic,), tweet={"media_keys": [pic.media_key]}, fetched_at=OLD
     )
-    store = TweetStore(aws.tweets_table)
+    store = TweetStore(aws.tweets_table, aws.s3, aws.bucket)
     media_store = MediaStore(aws.s3, aws.bucket, cdn.client())
     process_records(
         [sqs_record("new", body(newer))], media_store=media_store, tweet_store=store
@@ -171,7 +173,7 @@ def test_all_good_batch_has_no_failures(aws: Aws, cdn: CdnStub) -> None:
     failed = process_records(
         records,
         media_store=MediaStore(aws.s3, aws.bucket, cdn.client()),
-        tweet_store=TweetStore(aws.tweets_table),
+        tweet_store=TweetStore(aws.tweets_table, aws.s3, aws.bucket),
     )
 
     assert failed == []
@@ -184,7 +186,7 @@ def test_metadata_is_not_written_when_media_fails_transiently(
     failed = process_records(
         [sqs_record("m1", body(photo_message(TRANSIENT, TRANSIENT_URL)))],
         media_store=MediaStore(aws.s3, aws.bucket, cdn.client()),
-        tweet_store=TweetStore(aws.tweets_table),
+        tweet_store=TweetStore(aws.tweets_table, aws.s3, aws.bucket),
     )
 
     assert failed == ["m1"]
@@ -200,7 +202,7 @@ def test_second_media_failing_transiently_blocks_metadata_then_redelivery_comple
     )
     record = sqs_record("m1", body(message))
     media_store = MediaStore(aws.s3, aws.bucket, cdn.client())
-    tweet_store = TweetStore(aws.tweets_table)
+    tweet_store = TweetStore(aws.tweets_table, aws.s3, aws.bucket)
 
     assert process_records(
         [record], media_store=media_store, tweet_store=tweet_store
@@ -229,7 +231,7 @@ def test_permanently_unavailable_media_still_records_the_tweet(
     failed = process_records(
         [sqs_record("m1", body(photo_message(TRANSIENT, TRANSIENT_URL)))],
         media_store=MediaStore(aws.s3, aws.bucket, cdn.client()),
-        tweet_store=TweetStore(aws.tweets_table),
+        tweet_store=TweetStore(aws.tweets_table, aws.s3, aws.bucket),
     )
 
     assert failed == []
@@ -253,7 +255,9 @@ def test_unexpected_exception_in_media_store_is_isolated_to_its_record(
     ]
 
     failed = process_records(
-        records, media_store=store, tweet_store=TweetStore(aws.tweets_table)
+        records,
+        media_store=store,
+        tweet_store=TweetStore(aws.tweets_table, aws.s3, aws.bucket),
     )
 
     assert failed == ["m-media"]
@@ -280,7 +284,7 @@ def test_malformed_bodies_fail_their_record(
         failed = process_records(
             [sqs_record("bad", bad_body)],
             media_store=MediaStore(aws.s3, aws.bucket, cdn.client()),
-            tweet_store=TweetStore(aws.tweets_table),
+            tweet_store=TweetStore(aws.tweets_table, aws.s3, aws.bucket),
         )
 
     assert failed == ["bad"]
@@ -352,7 +356,7 @@ def test_unstarted_records_are_reported_and_untouched_when_time_runs_low(
     failed = process_records(
         records,
         media_store=MediaStore(aws.s3, aws.bucket, cdn.client()),
-        tweet_store=SpyTweetStore(aws.tweets_table),
+        tweet_store=SpyTweetStore(aws.tweets_table, aws.s3, aws.bucket),
         remaining_ms=clock,
     )
 
@@ -371,7 +375,7 @@ def test_a_batch_that_starts_out_of_time_touches_nothing(
     failed = process_records(
         records,
         media_store=MediaStore(aws.s3, aws.bucket, cdn.client()),
-        tweet_store=TweetStore(aws.tweets_table),
+        tweet_store=TweetStore(aws.tweets_table, aws.s3, aws.bucket),
         remaining_ms=Countdown(SAFETY_MARGIN_MS - 1),
     )
 
@@ -387,7 +391,7 @@ def test_a_record_started_exactly_at_the_margin_is_processed(
     failed = process_records(
         [sqs_record("m1", body(make_message(NO_MEDIA)))],
         media_store=MediaStore(aws.s3, aws.bucket, cdn.client()),
-        tweet_store=TweetStore(aws.tweets_table),
+        tweet_store=TweetStore(aws.tweets_table, aws.s3, aws.bucket),
         remaining_ms=Countdown(SAFETY_MARGIN_MS),
     )
 
@@ -403,7 +407,7 @@ def test_no_time_left_for_a_download_fails_the_record_without_a_request(
     failed = process_records(
         [sqs_record("m1", body(photo_message(GOOD)))],
         media_store=MediaStore(aws.s3, aws.bucket, cdn.client()),
-        tweet_store=TweetStore(aws.tweets_table),
+        tweet_store=TweetStore(aws.tweets_table, aws.s3, aws.bucket),
         remaining_ms=lambda: next(remaining),
     )
 
@@ -439,7 +443,7 @@ def test_a_slow_download_stops_at_the_remaining_time_and_the_record_is_retried(
         media_store=MediaStore(
             aws.s3, aws.bucket, cdn.client(), clock=lambda: clock[0]
         ),
-        tweet_store=TweetStore(aws.tweets_table),
+        tweet_store=TweetStore(aws.tweets_table, aws.s3, aws.bucket),
         remaining_ms=lambda: SAFETY_MARGIN_MS + 30_000,  # 30 s of download budget
     )
 
@@ -464,7 +468,7 @@ def test_final_receive_after_a_slow_download_writes_the_tweet_with_failed_media(
             media_store=MediaStore(
                 aws.s3, aws.bucket, cdn.client(), clock=lambda: clock[0]
             ),
-            tweet_store=TweetStore(aws.tweets_table),
+            tweet_store=TweetStore(aws.tweets_table, aws.s3, aws.bucket),
             remaining_ms=lambda: SAFETY_MARGIN_MS + 30_000,
             max_receive_count=5,
         )
@@ -489,7 +493,7 @@ def test_final_receive_with_transient_media_failure_still_writes_the_tweet(
     failed = process_records(
         [receives(sqs_record("m1", body(message)), "5")],
         media_store=MediaStore(aws.s3, aws.bucket, cdn.client()),
-        tweet_store=TweetStore(aws.tweets_table),
+        tweet_store=TweetStore(aws.tweets_table, aws.s3, aws.bucket),
         max_receive_count=5,
     )
 
@@ -515,7 +519,7 @@ def test_before_the_final_receive_a_media_failure_still_fails_the_record(
     failed = process_records(
         [record],
         media_store=MediaStore(aws.s3, aws.bucket, cdn.client()),
-        tweet_store=TweetStore(aws.tweets_table),
+        tweet_store=TweetStore(aws.tweets_table, aws.s3, aws.bucket),
         max_receive_count=max_receive_count,
     )
 
@@ -529,7 +533,7 @@ def test_a_record_without_attributes_counts_as_not_final(
     failed = process_records(
         [sqs_record("m1", body(photo_message(TRANSIENT, TRANSIENT_URL)))],
         media_store=MediaStore(aws.s3, aws.bucket, cdn.client()),
-        tweet_store=TweetStore(aws.tweets_table),
+        tweet_store=TweetStore(aws.tweets_table, aws.s3, aws.bucket),
         max_receive_count=1,
     )
 
@@ -547,7 +551,9 @@ def test_the_final_receive_does_not_rescue_malformed_or_unexpected_failures(
     failed = process_records(
         records,
         media_store=MediaStore(aws.s3, aws.bucket, cdn.client()),
-        tweet_store=ExplodingTweetStore(aws.tweets_table, UNEXPECTED),
+        tweet_store=ExplodingTweetStore(
+            aws.tweets_table, aws.s3, aws.bucket, UNEXPECTED
+        ),
         max_receive_count=5,
     )
 
@@ -567,7 +573,7 @@ def test_media_over_the_cap_is_recorded_and_the_tweet_is_stored(aws: Aws) -> Non
     failed = process_records(
         [sqs_record("m1", body(message))],
         media_store=MediaStore(aws.s3, aws.bucket, cdn.client(), max_bytes=1_000_000),
-        tweet_store=TweetStore(aws.tweets_table),
+        tweet_store=TweetStore(aws.tweets_table, aws.s3, aws.bucket),
     )
 
     assert failed == []
@@ -645,7 +651,7 @@ def test_cheapest_records_run_first_and_unknown_size_videos_last(
     process_records(
         records,
         media_store=MediaStore(aws.s3, aws.bucket, cdn.client()),
-        tweet_store=Spy(aws.tweets_table),
+        tweet_store=Spy(aws.tweets_table, aws.s3, aws.bucket),
     )
 
     assert order == [
@@ -679,7 +685,7 @@ def test_a_slow_video_first_does_not_starve_its_siblings_on_the_last_receive(
         media_store=MediaStore(
             aws.s3, aws.bucket, cdn.client(), clock=lambda: clock[0]
         ),
-        tweet_store=TweetStore(aws.tweets_table),
+        tweet_store=TweetStore(aws.tweets_table, aws.s3, aws.bucket),
         remaining_ms=lambda: int(SAFETY_MARGIN_MS + 30_000 - clock[0] * 1000),
         max_receive_count=5,
     )
@@ -702,7 +708,7 @@ def test_last_receive_record_without_time_is_written_with_failed_media(
             receives(sqs_record("m3", body(photo_message(TRANSIENT))), "4"),
         ],
         media_store=MediaStore(aws.s3, aws.bucket, cdn.client()),
-        tweet_store=TweetStore(aws.tweets_table),
+        tweet_store=TweetStore(aws.tweets_table, aws.s3, aws.bucket),
         remaining_ms=Countdown(SAFETY_MARGIN_MS - 1),
         max_receive_count=5,
     )
@@ -720,7 +726,7 @@ def test_last_receive_record_with_almost_no_time_is_still_reported(
     failed = process_records(
         [receives(sqs_record("m1", body(photo_message(GOOD))), "5")],
         media_store=MediaStore(aws.s3, aws.bucket, cdn.client()),
-        tweet_store=TweetStore(aws.tweets_table),
+        tweet_store=TweetStore(aws.tweets_table, aws.s3, aws.bucket),
         remaining_ms=Countdown(MIN_WRITE_MS - 1),
         max_receive_count=5,
     )
@@ -743,14 +749,14 @@ def test_last_receive_records_any_media_exception_as_failed(
         process_records(
             records,
             media_store=store,
-            tweet_store=TweetStore(aws.tweets_table),
+            tweet_store=TweetStore(aws.tweets_table, aws.s3, aws.bucket),
             max_receive_count=5,
         )
         == []
     )
     assert ddb_get(aws.tweets_table, tweet_id=GOOD)["media"][0]["status"] == "failed"
 
-    other = TweetStore(aws.tweets_table)
+    other = TweetStore(aws.tweets_table, aws.s3, aws.bucket)
     earlier = [receives(sqs_record("m2", body(photo_message(NO_MEDIA))), "4")]
     assert process_records(
         earlier, media_store=store, tweet_store=other, max_receive_count=5
@@ -920,5 +926,5 @@ def test_s3_client_has_bounded_timeouts_and_retries(aws: Aws) -> None:
 
 def test_aws_client_factories_are_cached(aws: Aws) -> None:
     assert process._s3_client() is process._s3_client()
-    assert process._tweet_store("t") is process._tweet_store("t")
-    assert process._tweet_store("t") is not process._tweet_store("u")
+    assert process._tweet_store("t", "b") is process._tweet_store("t", "b")
+    assert process._tweet_store("t", "b") is not process._tweet_store("u", "b")

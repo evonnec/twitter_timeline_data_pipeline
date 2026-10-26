@@ -211,6 +211,9 @@ Resources:
   # --- Functions -------------------------------------------------------------
   FetchFunction:
     Type: AWS::Serverless::Function
+    # Deploy the processor first: it understands note_text and offloads big texts to
+    # S3, so it must be live before the fetcher can send long posts.
+    DependsOn: ProcessFunction
     Properties:
       Description: Pulls a user's timeline from the X API and queues one message per Tweet.
       Handler: twitter_timeline_data_pipeline.handlers.fetch.handler

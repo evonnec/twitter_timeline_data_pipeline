@@ -52,7 +52,7 @@ def test_overlapping_fetch_runs_lose_nothing_and_never_move_the_checkpoint_back(
 
 @pytest.mark.xfail(
     strict=True,
-    reason="NEW: media dedup is check-then-act (HeadObject, then download and upload), "
+    reason="#42: media dedup is check-then-act (HeadObject, then download and upload), "
     "so two pollers holding copies of one message both download and write it",
 )
 def test_concurrent_duplicate_deliveries_download_media_once(sim: Simulation) -> None:

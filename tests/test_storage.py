@@ -1,4 +1,5 @@
 import io
+import json
 from collections.abc import Iterator
 from typing import Any, cast
 from urllib.parse import urlsplit
@@ -10,6 +11,7 @@ from botocore.exceptions import ClientError
 from conftest import STATE_TABLE, Aws
 from helpers import (
     GIF_URL,
+    KISS,
     LONG_POST_ID,
     PHOTO_URL,
     USER_ID,
@@ -29,6 +31,8 @@ from mypy_boto3_s3 import S3Client
 from twitter_timeline_data_pipeline.models import Media, Tweet, TweetMessage
 from twitter_timeline_data_pipeline.storage import (
     ALLOWED_MEDIA_HOSTS,
+    ITEM_TEXT_LIMIT_BYTES,
+    TEXT_PREVIEW_CHARS,
     CheckpointStore,
     MediaStore,
     PutResult,
@@ -524,6 +528,134 @@ def test_to_item_drops_none_values_at_every_level() -> None:
     assert item["media"] == [{"media_key": "7_2", "type": "video", "status": "skipped"}]
 
 
+# ---- text offload ------------------------------------------------------------
+
+HUGE_TEXT = KISS * 12_500  # 437,500 bytes: over DynamoDB's 400 KB item limit by itself
+
+
+def huge_message() -> TweetMessage:
+    return make_message(
+        tweet={"note_text": HUGE_TEXT, "text": "preview"},
+        media=tuple(
+            Media(
+                media_key=f"3_{n}",
+                type="photo",
+                url=f"https://pbs.twimg.com/media/{n}.jpg",
+                alt_text="\u6f22" * 1_000,
+            )
+            for n in range(4)
+        ),
+    )
+
+
+class CountingS3:
+    def __init__(self, s3: S3Client) -> None:
+        self.s3 = s3
+        self.puts = 0
+
+    def put_object(self, **kwargs: Any) -> Any:
+        self.puts += 1
+        return self.s3.put_object(**kwargs)
+
+
+def test_a_text_over_the_limit_goes_to_s3_and_the_item_keeps_a_prefix(
+    aws: Aws,
+) -> None:
+    message = huge_message()
+
+    result = TweetStore(aws.tweets_table, aws.s3, aws.bucket).put_tweet(message, [])
+
+    assert result.written
+    key = f"text/{USER_ID}/{TWEET_ID}.txt"
+    obj = aws.s3.get_object(Bucket=aws.bucket, Key=key)
+    assert obj["Body"].read().decode("utf-8") == HUGE_TEXT
+    assert obj["ContentType"] == "text/plain; charset=utf-8"
+    stored = stored_item(aws)
+    assert stored["text"] == HUGE_TEXT[:TEXT_PREVIEW_CHARS]
+    assert stored["text_truncated"] is True
+    assert stored["text_s3_key"] == key
+    assert stored["is_long_post"] is True
+    assert stored["display_text"] == "preview"
+    assert len(json.dumps(stored, default=str).encode()) < 400_000
+
+
+def test_an_offloaded_item_is_under_the_item_limit_by_the_size_estimate() -> None:
+    s3 = CountingS3(cast(Any, None))
+    s3.put_object = lambda **_: {}  # type: ignore[method-assign]
+    store = TweetStore(cast(Any, None), cast(Any, s3), "b")
+    message = huge_message()
+
+    item = store.build_item(message, [])
+    item["media"] = [{"alt_text": m.alt_text} for m in message.media]
+
+    assert estimate(item) < 400_000
+
+
+def estimate(item: Any) -> int:
+    match item:
+        case dict():
+            return 3 + sum(len(k.encode()) + estimate(v) for k, v in item.items())
+        case list():
+            return 3 + sum(estimate(v) for v in item)
+        case str():
+            return len(item.encode())
+        case _:
+            return 8
+
+
+def test_a_long_post_under_the_limit_makes_no_s3_call(aws: Aws) -> None:
+    s3 = CountingS3(aws.s3)
+    message = make_message(tweet={"note_text": "x" * ITEM_TEXT_LIMIT_BYTES})
+
+    TweetStore(aws.tweets_table, cast(Any, s3), aws.bucket).put_tweet(message, [])
+
+    assert s3.puts == 0
+    stored = stored_item(aws)
+    assert stored["text"] == "x" * ITEM_TEXT_LIMIT_BYTES
+    assert "text_truncated" not in stored
+    assert "text_s3_key" not in stored
+
+
+def test_the_limit_counts_bytes_not_characters(aws: Aws) -> None:
+    s3 = CountingS3(aws.s3)
+    # 100,001 CJK characters: under the limit as characters, 300,003 bytes.
+    message = make_message(tweet={"note_text": "\u6f22" * 100_001})
+
+    TweetStore(aws.tweets_table, cast(Any, s3), aws.bucket).put_tweet(message, [])
+
+    assert s3.puts == 1
+
+
+def test_the_preview_is_cut_on_a_code_point_boundary(aws: Aws) -> None:
+    # Emoji are 4 bytes and one code point; a cut by bytes would split one.
+    message = make_message(tweet={"note_text": "\U0001f600" * 80_000})
+
+    TweetStore(aws.tweets_table, aws.s3, aws.bucket).put_tweet(message, [])
+
+    preview = stored_item(aws)["text"]
+    assert preview == "\U0001f600" * TEXT_PREVIEW_CHARS
+    assert preview.encode("utf-8").decode("utf-8") == preview
+
+
+def test_the_text_key_falls_back_to_the_username_without_an_author_id() -> None:
+    message = make_message(tweet={"author_id": None})
+
+    assert TweetStore.text_key(message) == f"text/example_user/{TWEET_ID}.txt"
+
+
+def test_a_failed_text_upload_means_no_item_is_written(aws: Aws) -> None:
+    class Failing:
+        def put_object(self, **_: Any) -> None:
+            raise ClientError({"Error": {"Code": "InternalError"}}, "PutObject")
+
+    store = TweetStore(aws.tweets_table, cast(Any, Failing()), aws.bucket)
+
+    with pytest.raises(ClientError):
+        store.put_tweet(huge_message(), [])
+
+    assert aws.tweets_table.scan()["Count"] == 0
+
+
 def test_put_tweet_round_trips_through_dynamodb(aws: Aws) -> None:
     stored = StoredMedia(
         media_key="3_1700000000000000101",
@@ -533,7 +665,7 @@ def test_put_tweet_round_trips_through_dynamodb(aws: Aws) -> None:
         size_bytes=7,
     )
 
-    TweetStore(aws.tweets_table).put_tweet(full_message(), [stored])
+    TweetStore(aws.tweets_table, aws.s3, aws.bucket).put_tweet(full_message(), [stored])
 
     item = ddb_get(aws.tweets_table, tweet_id=TWEET_ID)
     assert item["username"] == "example_user"
@@ -545,7 +677,7 @@ def test_put_tweet_round_trips_through_dynamodb(aws: Aws) -> None:
 
 
 def test_put_tweet_is_queryable_via_username_index(aws: Aws) -> None:
-    store = TweetStore(aws.tweets_table)
+    store = TweetStore(aws.tweets_table, aws.s3, aws.bucket)
     for n, created in enumerate(["2026-10-02", "2026-10-01", "2026-10-03"]):
         store.put_tweet(
             make_message(f"17000000000000000{n:02d}", tweet={"created_at": created}), []
@@ -582,7 +714,7 @@ def stored_item(aws: Aws) -> dict[str, Any]:
 
 
 def test_put_tweet_newer_then_older_skips_the_older(aws: Aws) -> None:
-    store = TweetStore(aws.tweets_table)
+    store = TweetStore(aws.tweets_table, aws.s3, aws.bucket)
 
     assert store.put_tweet(likes(5000, NEWER), []).written is True
     assert store.put_tweet(likes(10, OLDER), []).written is False
@@ -593,7 +725,7 @@ def test_put_tweet_newer_then_older_skips_the_older(aws: Aws) -> None:
 
 
 def test_put_tweet_older_then_newer_replaces_the_item(aws: Aws) -> None:
-    store = TweetStore(aws.tweets_table)
+    store = TweetStore(aws.tweets_table, aws.s3, aws.bucket)
 
     assert store.put_tweet(likes(10, OLDER), []).written is True
     assert store.put_tweet(likes(5000, NEWER), []).written is True
@@ -604,7 +736,7 @@ def test_put_tweet_older_then_newer_replaces_the_item(aws: Aws) -> None:
 
 
 def test_put_tweet_with_equal_fetched_at_rewrites_idempotently(aws: Aws) -> None:
-    store = TweetStore(aws.tweets_table)
+    store = TweetStore(aws.tweets_table, aws.s3, aws.bucket)
 
     assert store.put_tweet(likes(7, NEWER), []).written is True
     assert store.put_tweet(likes(7, NEWER), []).written is True
@@ -618,7 +750,7 @@ def test_put_tweet_with_equal_fetched_at_rewrites_idempotently(aws: Aws) -> None
 def test_put_tweet_older_schema_version_cannot_overwrite_a_newer_one(
     aws: Aws,
 ) -> None:
-    store = TweetStore(aws.tweets_table)
+    store = TweetStore(aws.tweets_table, aws.s3, aws.bucket)
 
     assert store.put_tweet(likes(1, OLDER, schema_version=2), []).written is True
     # fetched later, but in the old format
@@ -630,7 +762,7 @@ def test_put_tweet_older_schema_version_cannot_overwrite_a_newer_one(
 
 
 def test_put_tweet_newer_schema_version_can_overwrite_an_older_one(aws: Aws) -> None:
-    store = TweetStore(aws.tweets_table)
+    store = TweetStore(aws.tweets_table, aws.s3, aws.bucket)
 
     assert store.put_tweet(likes(1, OLDER, schema_version=1), []).written is True
     assert store.put_tweet(likes(2, NEWER, schema_version=2), []).written is True
@@ -643,7 +775,11 @@ def test_put_tweet_overwrites_a_legacy_item_without_schema_version(aws: Aws) -> 
         Item={"tweet_id": TWEET_ID, "username": "u", "fetched_at": OLDER}
     )
 
-    assert TweetStore(aws.tweets_table).put_tweet(likes(3, NEWER), []).written
+    assert (
+        TweetStore(aws.tweets_table, aws.s3, aws.bucket)
+        .put_tweet(likes(3, NEWER), [])
+        .written
+    )
 
     item = stored_item(aws)
     assert item["schema_version"] == 1
@@ -653,13 +789,17 @@ def test_put_tweet_overwrites_a_legacy_item_without_schema_version(aws: Aws) -> 
 def test_put_tweet_overwrites_an_item_without_fetched_at(aws: Aws) -> None:
     aws.tweets_table.put_item(Item={"tweet_id": TWEET_ID, "username": "u"})
 
-    assert TweetStore(aws.tweets_table).put_tweet(likes(3, NEWER), []).written
+    assert (
+        TweetStore(aws.tweets_table, aws.s3, aws.bucket)
+        .put_tweet(likes(3, NEWER), [])
+        .written
+    )
 
     assert stored_item(aws)["fetched_at"] == NEWER
 
 
 def test_put_tweet_stale_result_reports_the_stored_values(aws: Aws) -> None:
-    store = TweetStore(aws.tweets_table)
+    store = TweetStore(aws.tweets_table, aws.s3, aws.bucket)
     store.put_tweet(likes(1, NEWER, schema_version=2), [])
 
     result = store.put_tweet(likes(2, OLDER), [])
@@ -677,7 +817,7 @@ def test_put_tweet_reraises_other_dynamodb_errors(aws: Aws) -> None:
                 "PutItem",
             )
 
-    store = TweetStore(cast(Any, Failing()))
+    store = TweetStore(cast(Any, Failing()), aws.s3, aws.bucket)
 
     with pytest.raises(ClientError, match="ProvisionedThroughputExceeded"):
         store.put_tweet(likes(1, NEWER), [])
@@ -701,7 +841,7 @@ def test_any_delivery_order_ends_with_the_greatest_fetched_at(
             KeySchema=[{"AttributeName": "tweet_id", "KeyType": "HASH"}],
             AttributeDefinitions=[{"AttributeName": "tweet_id", "AttributeType": "S"}],
         )
-        store = TweetStore(table)
+        store = TweetStore(table, boto3.client("s3"), "unused")
         # like_count is the delivery's own fetched_at day, so the winner is visible
         for stamp in fetched:
             day = int(stamp[8:10])

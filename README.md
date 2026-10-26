@@ -94,7 +94,7 @@ You can regenerate it with `TweetMessage(...).to_json()` from `twitter_timeline_
 
 **Compatibility.** `note_text` is an additive, optional field, so `schema_version` stays 1. A reader builds a Tweet from explicit keys and ignores unknown ones, so a processor from before this field still parses a new message (and stores the preview), and a new processor reading an old message gets `note_text = null`. The version only changes for a change a reader cannot ignore.
 
-**Size.** Each Tweet is one message, encoded as UTF-8. Only the characters SQS rejects or UTF-8 cannot encode (lone surrogates, U+FFFE, U+FFFF) are escaped, because escaping every non-ASCII character made emoji three to six times larger. The queues' `MaximumMessageSize` is 1 MiB (SQS's maximum; the dead-letter queue matches so redriven messages fit), and the fetch Lambda also groups messages so one `SendMessageBatch` call stays under 1 MiB in total. The worst case measured is about 363 KB: a 25,000-weighted-character post (12,500 emoji, skin-tone emoji, family emoji, tag flags or CJK characters) with four photos whose alt text is 1,000 characters each. The DynamoDB item for that post stays under DynamoDB's 400 KB item limit. A body over the limit stops the run with `MessageTooLargeError` instead of dropping data: the checkpoint is not advanced and the Lambda's Errors alarm fires.
+**Size.** Each Tweet is one message, encoded as UTF-8. Only the characters SQS rejects or UTF-8 cannot encode (lone surrogates, U+FFFE, U+FFFF) are escaped, because escaping every non-ASCII character made emoji three to six times larger. The queues' `MaximumMessageSize` is 1 MiB (SQS's maximum; the dead-letter queue matches so redriven messages fit), and the fetch Lambda also groups messages so one `SendMessageBatch` call stays under 1 MiB in total. The worst case measured is about 450 KB, under the 1 MiB limit: a 25,000-weighted-character post of 35-byte emoji sequences (12,500 of them, such as woman, skin tone, heart, kiss mark, man, skin tone) with four photos whose alt text is 1,000 characters each. That text alone is over DynamoDB's 400 KB item limit, so the processor moves any text over 300,000 UTF-8 bytes to S3 (see the Tweets table) and keeps the item under the limit. A body over the limit stops the run with `MessageTooLargeError` instead of dropping data: the checkpoint is not advanced and the Lambda's Errors alarm fires.
 
 **Field name.** X's docs and OpenAPI spec show a `post.fields` / `note_post` rename in progress. `Tweet.from_api` reads `note_tweet` and falls back to `note_post`, but the request still asks for `note_tweet`: run a smoke test with a real token before deploying to confirm long posts come back with their full text.
 
@@ -113,7 +113,9 @@ You can regenerate it with `TweetMessage(...).to_json()` from `twitter_timeline_
 | `tweet_id` | S | Tweet ID |
 | `username` | S | Normalized account name (lower case) |
 | `author_id` | S | |
-| `text` | S | The full text; for a long post, `note_tweet.text` |
+| `text` | S | The full text; for a long post, `note_tweet.text`. When `text_truncated` is `true`, only the first 2,000 characters |
+| `text_truncated` | BOOL | Only present (`true`) when the text was over 300,000 UTF-8 bytes and moved to S3 |
+| `text_s3_key` | S | Only with `text_truncated`: the S3 key of the full text |
 | `display_text` | S | Only for a long post: the API's truncated preview |
 | `is_long_post` | BOOL | `true` when the post has a `note_tweet`, else `false`. Absent on items written before this field existed, and `false` for messages queued by the old fetch Lambda |
 | `created_at` | S | ISO 8601 |
@@ -127,6 +129,8 @@ You can regenerate it with `TweetMessage(...).to_json()` from `twitter_timeline_
 | `fetched_at` | S | when the fetch Lambda saw the Tweet; a write is skipped if the stored value is later |
 | `stored_at` | S | when the item was written |
 | `schema_version` | N | a write is skipped if the stored value is higher |
+
+**Reading the full text.** Use `text` unless `text_truncated` is `true`; then fetch the object `text_s3_key` from the media bucket (`text/<author_id>/<tweet_id>.txt`, or the lower-cased username when the Tweet has no author ID; UTF-8, `text/plain`). The key is deterministic and the object is written before the item, so a redelivery overwrites it with the same text. Only posts over 300,000 bytes are offloaded (a handful of emoji-only posts at most), which keeps every item well under DynamoDB's 400 KB limit; the index's `text` is then the prefix.
 
 Each `media` entry has `media_key`, `type`, `status` (`stored` and `exists` for files in S3; otherwise `unavailable`, `skipped`, `too_large` or `failed`, see below) and, when known, `s3_key`, `content_type`, `source_url` and `size_bytes`. Statuses without a file in S3: `unavailable` (the source answered 4xx other than 429, or redirected), `skipped` (nothing to download: HLS-only video, or a URL that isn't https on an X media host), `too_large` (over `MAX_MEDIA_BYTES`; `size_bytes` is the estimate or the byte count where the download was stopped) and `failed` (transient errors persisted through the message's last receive, so the Tweet was written without the file).
 
@@ -143,6 +147,8 @@ media/<author_id>/<tweet_id>/<media_key><extension>
 ```
 
 If a Tweet has no `author_id`, the lower-cased username is used instead. The key is deterministic, so a repeat delivery finds the object and skips the download. Photos are fetched at original size (`name=orig`, other query parameters are kept). For videos and animated GIFs, the highest-bit-rate `video/mp4` variant is stored.
+
+The same bucket also holds the full text of oversized long posts at `text/<author_id>/<tweet_id>.txt` (UTF-8, `text/plain`, user metadata `tweet-id`); see the Tweets table. These objects are not tiered.
 
 Each object has the `Content-Type` of the source and user metadata `tweet-id`, `media-key` and `source-url`. The bucket is encrypted (SSE-S3), blocks all public access, refuses non-TLS requests, and aborts incomplete multipart uploads after 7 days. Versioning is on, so a deleted or overwritten object can be recovered for 30 days (noncurrent versions then expire). Objects under `media/` move to S3 Intelligent-Tiering on day 0, so cold video stops costing Standard rates; the trade-off is a small per-object monitoring fee, and objects under 128 KB are never tiered.
 
@@ -466,7 +472,7 @@ The script reads the table and bucket names from the stack outputs, runs `sam de
 - Unparenthesized multiple exceptions (PEP 758): `except KeyError, ValueError:` in `x_api.py`.
 - `type` statement aliases (PEP 695): `TweetId`, `MediaStatus` and others.
 - Generic function syntax (PEP 695): `get_number[N: (int, float)]` in `config.py`.
-- `itertools.batched` to split messages into SQS batches of 10.
+- Size-aware chunking of messages into `SendMessageBatch` calls: at most 10 messages and 1 MiB in total per call.
 - `typing.override` on the `_IterReader` methods.
 - Structural pattern matching (`match`) to choose a media download source.
 

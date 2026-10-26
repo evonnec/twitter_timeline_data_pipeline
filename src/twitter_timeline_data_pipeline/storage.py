@@ -7,6 +7,8 @@ re-send a Tweet after a retry:
   stored item only if it is not older (by ``fetched_at`` and ``schema_version``), so a
   stale redelivery can't overwrite newer data. A repeat of the same delivery rewrites
   the same data.
+- A post whose text is too big for a DynamoDB item has its full text uploaded to a
+  deterministic S3 key first.
 - Media objects get a deterministic S3 key, and an object that already exists is not
   downloaded again.
 """
@@ -334,11 +336,65 @@ class PutResult:
     stored_schema_version: int | None = None
 
 
+# DynamoDB items are limited to 400 KB (names and values together), and the
+# username-created_at-index projects ``text`` as well. Text over this many UTF-8 bytes
+# moves to S3, which leaves 100 KB for everything else in the item (the worst case is
+# about 50 KB: four photos with 1,000-character alt text, metrics and IDs) and for the
+# index entry's keys and the other projected attributes.
+ITEM_TEXT_LIMIT_BYTES = 300_000
+# How much of an offloaded text stays in the item as a preview (code points).
+TEXT_PREVIEW_CHARS = 2_000
+
+
+def _utf8(text: str) -> bytes:
+    # ``surrogatepass`` keeps a lone surrogate (which the message format allows) from
+    # raising, so the text is never lost; it is stored as is.
+    return text.encode("utf-8", "surrogatepass")
+
+
 class TweetStore:
     """Writes Tweet metadata to the tweets table (partition key ``tweet_id``)."""
 
-    def __init__(self, table: Table) -> None:
+    def __init__(self, table: Table, s3_client: S3Client, bucket: str) -> None:
         self._table = table
+        self._s3 = s3_client
+        self._bucket = bucket
+
+    @staticmethod
+    def text_key(message: TweetMessage) -> str:
+        """``text/<author_id>/<tweet_id>.txt``, with the same owner rule as media."""
+        owner = message.tweet.author_id or message.username.lower()
+        return f"text/{owner}/{message.tweet.id}.txt"
+
+    def build_item(
+        self, message: TweetMessage, media: Sequence[StoredMedia]
+    ) -> dict[str, Any]:
+        """``to_item``, with a too-big text moved to S3.
+
+        When the full text is over ``ITEM_TEXT_LIMIT_BYTES`` it is uploaded as UTF-8 to
+        ``text_key`` and the item keeps a prefix in ``text`` (cut on a code point),
+        ``text_truncated: true`` and ``text_s3_key``. Smaller items make no S3 call.
+
+        This runs before the conditional write. A stale message for the same Tweet
+        carries the same text, so overwriting the object is harmless.
+        """
+        item = self.to_item(message, media)
+        full_text = item["text"]
+        body = _utf8(full_text)
+        if len(body) <= ITEM_TEXT_LIMIT_BYTES:
+            return item
+        key = self.text_key(message)
+        self._s3.put_object(
+            Bucket=self._bucket,
+            Key=key,
+            Body=body,
+            ContentType="text/plain; charset=utf-8",
+            Metadata={"tweet-id": message.tweet.id},
+        )
+        item["text"] = full_text[:TEXT_PREVIEW_CHARS]
+        item["text_truncated"] = True
+        item["text_s3_key"] = key
+        return item
 
     @staticmethod
     def to_item(message: TweetMessage, media: Sequence[StoredMedia]) -> dict[str, Any]:
@@ -389,7 +445,7 @@ class TweetStore:
         """
         try:
             self._table.put_item(
-                Item=self.to_item(message, media),
+                Item=self.build_item(message, media),
                 ConditionExpression=(
                     "attribute_not_exists(tweet_id) OR ("
                     "(attribute_not_exists(fetched_at) "

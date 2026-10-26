@@ -289,3 +289,12 @@ def as_items(raw: object) -> list[dict[str, Any]]:
 
 def ddb_items(table: Table) -> list[dict[str, Any]]:
     return as_items(table.scan()["Items"])
+
+
+# 35 UTF-8 bytes, two weighted characters: the largest text X allows per character.
+KISS = (
+    "\U0001f469\U0001f3fb"  # woman, skin tone
+    "\u200d\u2764\ufe0f"  # joiner, heart
+    "\u200d\U0001f48b"  # joiner, kiss mark
+    "\u200d\U0001f468\U0001f3fc"  # joiner, man, skin tone
+)
