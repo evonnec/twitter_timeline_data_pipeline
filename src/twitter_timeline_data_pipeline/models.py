@@ -91,8 +91,19 @@ def _reject_constant(name: str) -> NoReturn:
     raise ValueError(f"non-finite JSON constant {name}")
 
 
+# Largest magnitude of any integer that is stored. DynamoDB numbers have 38 digits, so a
+# malformed message with a 45-digit count would make every write raise and the record
+# would loop to the DLQ forever. Real values are far smaller, so clamp instead.
+MAX_STORED_INT = 2**63 - 1
+
+
+def clamp_int(value: int) -> int:
+    """``value`` limited to ``+-MAX_STORED_INT``."""
+    return max(-MAX_STORED_INT, min(MAX_STORED_INT, value))
+
+
 def _opt_int(value: Any) -> int | None:
-    return None if value is None else int(value)
+    return None if value is None else clamp_int(int(value))
 
 
 def _opt_str(value: Any) -> str | None:
@@ -238,7 +249,8 @@ class Tweet:
                 for r in data.get("referenced_tweets") or ()
             ),
             public_metrics={
-                str(k): int(v) for k, v in (data.get("public_metrics") or {}).items()
+                str(k): clamp_int(int(v))
+                for k, v in (data.get("public_metrics") or {}).items()
             },
             edit_history_tweet_ids=tuple(
                 str(i) for i in data.get("edit_history_tweet_ids") or ()

@@ -108,12 +108,11 @@ def test_media_that_never_recovers_lands_in_the_retry_dlq_with_its_metadata(
 def test_a_retry_whose_tweet_item_is_missing_is_retried_not_dropped(
     make_sim: MakeSim,
 ) -> None:
-    """A media-retry message arrives for a Tweet that was never written (the process
-    function's write failed after it sent the retries, say), and the Tweet's own
-    message is redelivered later.
+    """A media-retry message arrives for a Tweet whose item was never written, and
+    the item never appears.
 
-    Expected: the retry is not deleted while the item is missing; it ends in the
-    media-retry DLQ if the item never appears.
+    Expected: the retry is not deleted while the item is missing; it is received
+    ``MediaRetryMaxReceiveCount`` times and ends in the media-retry DLQ.
     """
     sim = make_sim()
     x, user = sim.x, sim.username
@@ -136,3 +135,40 @@ def test_a_retry_whose_tweet_item_is_missing_is_retried_not_dropped(
     assert sim.depth(sim.retry_queue) == (0, 0)
     assert len(sim.dlq_bodies(sim.retry_dlq)) == 1
     assert sim.objects() == {}
+
+
+def test_a_crash_between_the_write_and_the_retry_send_is_recovered_by_a_redrive(
+    make_sim: MakeSim,
+) -> None:
+    """The process runtime dies on the retry ``SendMessage`` of the last receive, after
+    the Tweet was written with the photo ``retrying``. The CDN is down throughout, then
+    recovers.
+
+    Expected: the Tweet message is not lost: it reaches the main DLQ (alarm) while the
+    item says ``retrying``. After the CDN recovers, a redrive plus settle stores the
+    photo and every queue and DLQ ends empty.
+    """
+    sim = make_sim()
+    x, user = sim.x, sim.username
+    flaky = x.photo()
+    tweet = x.post(user, media=[flaky])
+    assert flaky.url
+    sim.cdn.fail(flaky.url, 503, times=None)
+    sim.aws.crash(
+        "SendMessage", when=lambda call: call.function == sim.process.name, times=1
+    )
+
+    sim.run(1)
+    sim.settle()
+
+    entry = media_entry(sim.tweets()[tweet.id], flaky.media_key)
+    assert entry["status"] == "retrying"
+    assert len(sim.dlq_bodies()) == 1
+    assert sim.retry_deliveries == []
+
+    sim.cdn.serve(flaky.url)
+    assert sim.redrive_dlq() == 1
+    sim.settle()
+
+    assert_stored(sim, [tweet])
+    assert_quiet(sim)

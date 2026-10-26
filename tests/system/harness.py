@@ -437,19 +437,15 @@ class Simulation:
         """Peek at a DLQ (the tweets queue's by default; messages stay there)."""
         url = (dlq or self.dlq).url
         bodies: list[str] = []
-        handles: list[str] = []
+        # A 1 s hold instead of ChangeMessageVisibility(0) afterwards: SQS caps a
+        # message's total visibility at 12 h from its first receive, and a message
+        # that went through the media-retry queue's receives is already past that.
         while messages := self.sqs.receive_message(
-            QueueUrl=url, MaxNumberOfMessages=10, VisibilityTimeout=60
+            QueueUrl=url, MaxNumberOfMessages=10, VisibilityTimeout=1
         ).get("Messages"):
             bodies += [m["Body"] for m in messages]
-            handles += [m["ReceiptHandle"] for m in messages]
-        for handle in handles:
-            self.sqs.change_message_visibility(
-                QueueUrl=url, ReceiptHandle=handle, VisibilityTimeout=0
-            )
-        # moto makes a message visible once the clock passes its deadline; the next
-        # receive happens at least a millisecond later.
-        self.clock.advance(0.001)
+        # moto makes a message visible once the clock passes its deadline.
+        self.clock.advance(1.001)
         return bodies
 
     @property

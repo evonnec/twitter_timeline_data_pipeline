@@ -231,8 +231,8 @@ Resources:
       QueueName: !Sub "${AWS::StackName}-media-retry"  # fixed so the DLQ can name it
       SqsManagedSseEnabled: true
       MessageRetentionPeriod: 1209600  # 14 days
-      # 6 x MediaRetryFunction timeout (300 s); BatchSize 1 has no batching window.
-      VisibilityTimeout: 1800
+      # 6 x MediaRetryFunction timeout (900 s); BatchSize 1 has no batching window.
+      VisibilityTimeout: 5400
       MaximumMessageSize: 1048576  # same as TweetsQueue
       RedrivePolicy:
         deadLetterTargetArn: !GetAtt MediaRetryDeadLetterQueue.Arn
@@ -343,7 +343,7 @@ Resources:
     Properties:
       Description: Stores media the process function gave up on and updates its Tweet item.
       Handler: twitter_timeline_data_pipeline.handlers.media_retry.handler
-      Timeout: 300  # room for a large video
+      Timeout: 900  # room for a large video (about 880 s of download)
       MemorySize: 512
       LoggingConfig:
         LogGroup: !Ref MediaRetryFunctionLogGroup
@@ -360,7 +360,7 @@ Resources:
               Resource: !GetAtt TweetsTable.Arn
             - Effect: Allow
               Action: [s3:PutObject, s3:GetObject, s3:AbortMultipartUpload]
-              Resource: !Sub "${MediaBucket.Arn}/*"
+              Resource: !Sub "${MediaBucket.Arn}/media/*"  # media only, not the text/ objects
             # ListBucket makes HeadObject return 404 instead of 403 for missing keys.
             - Effect: Allow
               Action: s3:ListBucket
@@ -407,6 +407,22 @@ Resources:
       EvaluationPeriods: 1
       Threshold: 0
       ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref AWS::NoValue]
+
+  MediaRetryFunctionErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: The media-retry function reported errors.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - {Name: FunctionName, Value: !Ref MediaRetryFunction}
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
       TreatMissingData: notBreaching
       AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref AWS::NoValue]
 

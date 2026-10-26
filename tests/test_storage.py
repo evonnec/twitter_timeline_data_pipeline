@@ -28,7 +28,13 @@ from hypothesis import strategies as st
 from moto import mock_aws
 from mypy_boto3_s3 import S3Client
 
-from twitter_timeline_data_pipeline.models import Media, MediaRetry, Tweet, TweetMessage
+from twitter_timeline_data_pipeline.models import (
+    MAX_STORED_INT,
+    Media,
+    MediaRetry,
+    Tweet,
+    TweetMessage,
+)
 from twitter_timeline_data_pipeline.storage import (
     ALLOWED_MEDIA_HOSTS,
     ITEM_LIMIT_BYTES,
@@ -1661,3 +1667,51 @@ def test_media_retry_queue_sends_the_delayed_json_message(aws: Aws) -> None:
     )["Attributes"]
     assert attributes["ApproximateNumberOfMessagesDelayed"] == "1"
     aws.sqs.purge_queue(QueueUrl=aws.retry_queue_url)
+
+
+def test_a_declared_content_length_too_big_to_store_is_capped(aws: Aws) -> None:
+    cdn = CdnStub()
+    cdn.responses[PHOTO_URL] = lambda: httpx.Response(
+        200, headers={"content-length": "9" * 45}
+    )
+    store = MediaStore(aws.s3, aws.bucket, cdn.client())
+
+    result = store.store(make_message(media=(PHOTO,)), PHOTO)
+
+    assert (result.status, result.size_bytes) == ("too_large", MAX_STORED_INT)
+
+
+def test_the_runbook_scan_finds_items_with_any_retrying_media(aws: Aws) -> None:
+    """The filter expression the README gives, against four media per item."""
+    store = TweetStore(aws.tweets_table, aws.s3, aws.bucket)
+
+    def put(tweet_id: str, statuses: list[str]) -> None:
+        items = [photo(f"3_{i}") for i in range(len(statuses))]
+        store.put_tweet(
+            make_message(tweet_id, media=tuple(items)),
+            [
+                StoredMedia(media_key=m.media_key, type="photo", status=st)  # type: ignore[arg-type]
+                for m, st in zip(items, statuses, strict=True)
+            ],
+        )
+
+    put("1700000000000000001", ["stored", "stored"])
+    put("1700000000000000002", ["stored", "retrying"])
+    put("1700000000000000003", ["retrying"])
+    put("1700000000000000004", ["stored", "stored", "stored", "retrying"])
+    put("1700000000000000005", [])
+
+    found = aws.tweets_table.scan(
+        FilterExpression=(
+            "media[0].#s = :r OR media[1].#s = :r OR media[2].#s = :r "
+            "OR media[3].#s = :r"
+        ),
+        ExpressionAttributeNames={"#s": "status"},
+        ExpressionAttributeValues={":r": "retrying"},
+    )
+
+    assert sorted(i["tweet_id"] for i in as_items(found["Items"])) == [
+        "1700000000000000002",
+        "1700000000000000003",
+        "1700000000000000004",
+    ]

@@ -444,6 +444,7 @@ def test_media_retry_queue_visibility_is_six_times_the_consumer_timeout(
 
     visibility = properties(template, "MediaRetryQueue")["VisibilityTimeout"]
 
+    assert visibility == 5400
     assert visibility >= 6 * timeout + event.get("MaximumBatchingWindowInSeconds", 0)
 
 
@@ -476,7 +477,7 @@ def test_media_retry_function_is_fed_one_message_at_a_time(template: Template) -
     assert event["BatchSize"] == 1
     assert "ReportBatchItemFailures" in event["FunctionResponseTypes"]
     props = properties(template, "MediaRetryFunction")
-    assert props["Timeout"] >= 300
+    assert props["Timeout"] == 900
     assert props["MemorySize"] == properties(template, "ProcessFunction")["MemorySize"]
     assert props["LoggingConfig"]["LogGroup"] == {"Ref": "MediaRetryFunctionLogGroup"}
     assert (
@@ -556,4 +557,28 @@ def test_media_retry_dead_letter_queue_has_an_alarm(template: Template) -> None:
     assert (
         alarm["AlarmActions"]
         == properties(template, "DeadLetterQueueNotEmptyAlarm")["AlarmActions"]
+    )
+
+
+def test_media_retry_function_writes_only_under_media(template: Template) -> None:
+    statements = policy_statements(template, "MediaRetryFunction")
+    object_actions = {"s3:PutObject", "s3:GetObject", "s3:AbortMultipartUpload"}
+    (objects,) = (s for s in statements if object_actions <= set(_as_list(s["Action"])))
+    (listing,) = (s for s in statements if s["Action"] == "s3:ListBucket")
+
+    assert objects["Resource"] == {"Fn::Sub": "${MediaBucket.Arn}/media/*"}
+    assert listing["Resource"] == {"Fn::GetAtt": ["MediaBucket", "Arn"]}
+
+
+def test_media_retry_function_has_an_errors_alarm(template: Template) -> None:
+    alarm = properties(template, "MediaRetryFunctionErrorsAlarm")
+
+    assert alarm["Namespace"] == "AWS/Lambda"
+    assert alarm["MetricName"] == "Errors"
+    assert alarm["Dimensions"] == [
+        {"Name": "FunctionName", "Value": {"Ref": "MediaRetryFunction"}}
+    ]
+    assert (
+        alarm["AlarmActions"]
+        == properties(template, "ProcessFunctionErrorsAlarm")["AlarmActions"]
     )

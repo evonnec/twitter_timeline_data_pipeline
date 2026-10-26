@@ -45,11 +45,6 @@ def _retry_one(
 ) -> None:
     """Handle one record; raises for anything that must be retried."""
     retry = MediaRetry.from_json(record["body"])
-    budget_s = (
-        None if remaining_ms is None else (remaining_ms() - SAFETY_MARGIN_MS) / 1000
-    )
-    if budget_s is not None and budget_s <= 0:
-        raise TransientMediaError("not enough time left to start")
     key = retry.media.media_key
     entries = tweet_store.get_media(retry.tweet_id)
     if entries is None:
@@ -70,6 +65,12 @@ def _retry_one(
             current.get("status"),
         )
         return
+    # After the reads above, so their time isn't counted as available for the download.
+    budget_s = (
+        None if remaining_ms is None else (remaining_ms() - SAFETY_MARGIN_MS) / 1000
+    )
+    if budget_s is not None and budget_s <= 0:
+        raise TransientMediaError("not enough time left to start")
     stored = media_store.store(retry.to_tweet_message(), retry.media, budget_s=budget_s)
     entry = {k: v for k, v in asdict(stored).items() if v is not None}
     if "source_url" not in entry and current.get("source_url"):

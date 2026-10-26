@@ -34,10 +34,12 @@ from botocore.exceptions import ClientError
 
 from twitter_timeline_data_pipeline.config import DEFAULT_MAX_MEDIA_BYTES
 from twitter_timeline_data_pipeline.models import (
+    MAX_STORED_INT,
     Media,
     MediaRetry,
     TweetId,
     TweetMessage,
+    clamp_int,
     escape_disallowed_chars,
     utc_now_iso,
 )
@@ -169,7 +171,7 @@ def _extension(content_type: str | None, url: str) -> str:
 
 # Cap for a size estimate: any real file is far smaller, and DynamoDB can't store a
 # number like the 10**400 a malformed bit_rate would produce (the write would fail).
-MAX_SIZE_ESTIMATE = 2**63 - 1
+MAX_SIZE_ESTIMATE = MAX_STORED_INT
 
 
 def estimated_size(media: Media, url: str) -> int | None:
@@ -377,7 +379,7 @@ class MediaStore:
                         media.media_key,
                         declared,
                     )
-                    return result("too_large", size_bytes=int(declared))
+                    return result("too_large", size_bytes=clamp_int(int(declared)))
                 reader = _IterReader(
                     response.iter_bytes(),
                     max_bytes=self._max_bytes,
