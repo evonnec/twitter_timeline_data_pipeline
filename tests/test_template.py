@@ -151,7 +151,14 @@ def test_username_index_projects_only_listing_attributes(template: Template) -> 
 
     assert index["Projection"] == {
         "ProjectionType": "INCLUDE",
-        "NonKeyAttributes": ["text", "media_count", "public_metrics"],
+        # text may be a prefix of an offloaded text; the markers say so.
+        "NonKeyAttributes": [
+            "text",
+            "text_truncated",
+            "text_s3_key",
+            "media_count",
+            "public_metrics",
+        ],
     }
 
 

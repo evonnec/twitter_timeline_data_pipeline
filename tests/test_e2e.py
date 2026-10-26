@@ -1,5 +1,6 @@
 """Fetch handler -> moto SQS -> process handler -> moto DynamoDB and S3."""
 
+import json
 from typing import Any
 
 import httpx
@@ -329,8 +330,8 @@ def test_a_worst_case_long_post_is_stored_with_its_full_text_in_s3(
     assert processed == {"batchItemFailures": []}
     stored = item(pipeline_env, LONG_POST_ID)
     assert stored["text_truncated"] is True
-    key = f"text/{USER_ID}/{LONG_POST_ID}.txt"
+    key = f"text/{USER_ID}/{LONG_POST_ID}.json"
     assert stored["text_s3_key"] == key
     assert len(stored["text"]) < len(text)
     obj = pipeline_env.s3.get_object(Bucket=pipeline_env.bucket, Key=key)
-    assert obj["Body"].read().decode("utf-8") == text
+    assert json.loads(obj["Body"].read()) == text

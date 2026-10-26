@@ -27,6 +27,13 @@ SCHEMA_VERSION = 1
 # surrogate can't be encoded) plus U+FFFE and U+FFFF.
 _DISALLOWED_CHARS = re.compile("[\ud800-\udfff\ufffe\uffff]")
 
+
+def escape_disallowed_chars(json_text: str) -> str:
+    """Escape (as ``\\uXXXX``) the characters in JSON text that SQS rejects or UTF-8
+    can't encode, so the text encodes as strict UTF-8 and parses back unchanged."""
+    return _DISALLOWED_CHARS.sub(lambda m: f"\\u{ord(m[0]):04x}", json_text)
+
+
 type TweetId = str
 type MediaKey = str
 type JSONObject = dict[str, Any]
@@ -258,7 +265,7 @@ class TweetMessage:
         # UTF-8, escaping only what SQS rejects or UTF-8 can't encode. Escaping every
         # non-ASCII character inflated emoji 3 to 6 times and ate the size limit.
         body = json.dumps(self.to_dict(), separators=(",", ":"), ensure_ascii=False)
-        return _DISALLOWED_CHARS.sub(lambda m: f"\\u{ord(m[0]):04x}", body)
+        return escape_disallowed_chars(body)
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> Self:
