@@ -17,7 +17,7 @@ import threading
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
-from types import ModuleType
+from types import FunctionType, ModuleType
 from typing import Any, Self
 
 import pytest
@@ -146,9 +146,9 @@ def virtualize_time(mp: pytest.MonkeyPatch, clock: SimClock, package: str) -> No
 
     Covers ``import time``, ``from time import monotonic`` (and friends), ``from
     datetime import datetime`` and ``import datetime`` in every loaded module of the
-    package, so the code under test sees simulated time however it is written.
-    Default argument values bound at import time (``sleep=time.sleep``) can't be
-    reached this way; they keep real time.
+    package, plus default argument values bound at import time (``sleep=time.sleep``,
+    ``clock=time.monotonic``) on its functions, methods and dataclass constructors, so
+    the code under test sees simulated time however it is written.
     """
     virtual_time = _VirtualTime(clock)
     virtual_dt = _virtual_datetime(clock)
@@ -172,3 +172,33 @@ def virtualize_time(mp: pytest.MonkeyPatch, clock: SimClock, package: str) -> No
                 mp.setattr(module, attr, datetime_module)
             elif callable(value) and id(value) in functions:
                 mp.setattr(module, attr, functions[id(value)])
+            if getattr(value, "__module__", None) == name:
+                for function in _functions_of(value):
+                    _patch_defaults(mp, function, functions)
+
+
+def _functions_of(value: object) -> Iterator[FunctionType]:
+    """A module-level function, or every method (and static/class method) of a class."""
+    if isinstance(value, FunctionType):
+        yield value
+    elif isinstance(value, type):
+        for member in vars(value).values():
+            inner = getattr(member, "__func__", member)
+            if isinstance(inner, FunctionType):
+                yield inner
+
+
+def _patch_defaults(
+    mp: pytest.MonkeyPatch, function: FunctionType, replacements: dict[int, Any]
+) -> None:
+    """Swap real-time defaults (``time.sleep``, ``time.monotonic``, ...) for virtual."""
+    if (defaults := function.__defaults__) and any(
+        id(d) in replacements for d in defaults
+    ):
+        swapped = tuple(replacements.get(id(d), d) for d in defaults)
+        mp.setattr(function, "__defaults__", swapped)
+    if (kwdefaults := function.__kwdefaults__) and any(
+        id(v) in replacements for v in kwdefaults.values()
+    ):
+        swapped_kw = {k: replacements.get(id(v), v) for k, v in kwdefaults.items()}
+        mp.setattr(function, "__kwdefaults__", swapped_kw)

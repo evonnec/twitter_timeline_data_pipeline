@@ -146,6 +146,8 @@ class FakeTweet:
     public_metrics: dict[str, int] = field(default_factory=dict)
     referenced_tweets: list[dict[str, str]] = field(default_factory=list)
     lang: str = "en"
+    json_overrides: dict[str, Any] = field(default_factory=dict)
+    """Fields to serve exactly as given (odd shapes the real API has produced)."""
 
     @property
     def full_text(self) -> str:
@@ -206,6 +208,11 @@ class FakeXApi:
         self._users[username.lower()] = _User(user_id, username)
         self._timelines.setdefault(user_id, [])
 
+    def rename_user(self, username: str, new_username: str) -> None:
+        """The account changes its handle; the old one becomes free."""
+        user = self._users.pop(username.removeprefix("@").lower())
+        self._users[new_username.lower()] = _User(user.id, new_username)
+
     def user_id(self, username: str) -> str:
         return self._users[username.removeprefix("@").lower()].id
 
@@ -214,7 +221,9 @@ class FakeXApi:
         self._last_id = max(candidate, self._last_id + 1)
         return str(self._last_id)
 
-    def photo(self, *, in_includes: bool = True, alt_text: str | None = None) -> FakeMedia:
+    def photo(
+        self, *, in_includes: bool = True, alt_text: str | None = None
+    ) -> FakeMedia:
         n = next(self._serial)
         return FakeMedia(
             media_key=f"3_{self.new_id()}",
@@ -396,18 +405,22 @@ class FakeXApi:
         call = ApiCall(endpoint, index, page, params, self._clock.now)
         self.calls.append(call)
 
-        for fault in self._faults:
+        for fault in list(self._faults):
             if fault.remaining == 0 or not fault.match(call):
                 continue
-            response = fault.respond(call)
+            # Counted before responding, so a reentrant call (an overlapping run
+            # started from ``before``) can't trigger the same fault again.
             fault.hits += 1
             if fault.remaining is not None:
                 fault.remaining -= 1
-            if response is not None:
+            if (response := fault.respond(call)) is not None:
                 return response
 
         auth = request.headers.get("authorization", "")
-        if not auth.startswith("Bearer ") or auth.removeprefix("Bearer ") not in self.tokens:
+        if (
+            not auth.startswith("Bearer ")
+            or auth.removeprefix("Bearer ") not in self.tokens
+        ):
             return httpx.Response(
                 401,
                 json={
@@ -429,10 +442,17 @@ class FakeXApi:
 
     def _error(self, status: int, call: ApiCall) -> httpx.Response:
         titles = {401: "Unauthorized", 403: "Forbidden", 503: "Service Unavailable"}
-        title = titles.get(status, "Internal Server Error" if status >= 500 else "Error")
+        title = titles.get(
+            status, "Internal Server Error" if status >= 500 else "Error"
+        )
         return httpx.Response(
             status,
-            json={"title": title, "detail": title, "type": "about:blank", "status": status},
+            json={
+                "title": title,
+                "detail": title,
+                "type": "about:blank",
+                "status": status,
+            },
             headers=self._rate_headers(call),
         )
 
@@ -455,7 +475,13 @@ class FakeXApi:
                 ]
             }
         else:
-            body = {"data": {"id": user.id, "name": user.username, "username": user.username}}
+            body = {
+                "data": {
+                    "id": user.id,
+                    "name": user.username,
+                    "username": user.username,
+                }
+            }
         return httpx.Response(200, json=body, headers=self._rate_headers(call))
 
     def _timeline(self, call: ApiCall, user_id: str) -> httpx.Response:
@@ -537,9 +563,13 @@ class FakeXApi:
             meta["newest_id"] = page[0].id
             meta["oldest_id"] = page[-1].id
             if len(selected) > len(page):
-                meta["next_token"] = self._token(user_id, int(page[-1].id), call.page + 1)
+                meta["next_token"] = self._token(
+                    user_id, int(page[-1].id), call.page + 1
+                )
         if call.page > 1:
-            meta["previous_token"] = hashlib.sha256(f"prev:{token}".encode()).hexdigest()[:26]
+            meta["previous_token"] = hashlib.sha256(
+                f"prev:{token}".encode()
+            ).hexdigest()[:26]
         body["meta"] = meta
         return httpx.Response(200, json=body, headers=headers)
 
@@ -555,7 +585,9 @@ def _iso(epoch_seconds: float) -> str:
 
 
 def _matcher(endpoint: Endpoint, page: int | None) -> Callable[[ApiCall], bool]:
-    return lambda call: call.endpoint == endpoint and (page is None or call.page == page)
+    return lambda call: (
+        call.endpoint == endpoint and (page is None or call.page == page)
+    )
 
 
 def _rate_headers(reset_at: float, *, remaining: int) -> dict[str, str]:
@@ -587,7 +619,9 @@ def _invalid_request(
             "errors": [
                 {
                     "parameters": {name: [value]},
-                    "message": f"The `{name}` query parameter value [{value}] is not valid",
+                    "message": (
+                        f"The `{name}` query parameter value [{value}] is not valid"
+                    ),
                 }
             ],
             "title": "Invalid Request",
@@ -636,6 +670,7 @@ def _tweet_json(tweet: FakeTweet, fields: set[str]) -> dict[str, Any]:
         out["possibly_sensitive"] = False
     if "reply_settings" in fields:
         out["reply_settings"] = "everyone"
+    out.update(tweet.json_overrides)
     return out
 
 
