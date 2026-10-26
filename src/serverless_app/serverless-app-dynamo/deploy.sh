@@ -1,6 +1,6 @@
 #!/bin/bash
 
-S3_BUCKET=twitter-media.nuclei-serverless-app
+S3_BUCKET=twitter-media.serverless-app
 #declare S3 bucket
 printf "========S3_BUCKET declared as $S3_BUCKET========\n"
 
@@ -18,6 +18,6 @@ aws cloudformation package --template-file out/sam.yaml --s3-bucket $S3_BUCKET \
 printf "========create packaged.yaml from sam.yaml========\n"
 
 aws cloudformation deploy --template-file out/packaged.yaml \
-    --stack-name nuclei-serverless-app-dynamo --capabilities CAPABILITY_IAM
+    --stack-name serverless-app-dynamo --capabilities CAPABILITY_IAM
 #deploy packaged.yaml as a stack
 printf "========deploy out/packaged.yaml========\n"
