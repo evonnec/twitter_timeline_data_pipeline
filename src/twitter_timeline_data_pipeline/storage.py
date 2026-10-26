@@ -11,6 +11,9 @@ re-send a Tweet after a retry:
   deterministic S3 key first.
 - Media objects get a deterministic S3 key, and an object that already exists is not
   downloaded again.
+- Media that couldn't be stored on a message's last receive is recorded as
+  ``retrying`` and queued for the media-retry function, whose conditional update
+  replaces only that entry.
 """
 
 import io
@@ -18,7 +21,7 @@ import logging
 import mimetypes
 import posixpath
 import time
-from collections.abc import Buffer, Callable, Iterator, Sequence
+from collections.abc import Buffer, Callable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, Any, Literal, cast, override
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -29,6 +32,7 @@ from botocore.exceptions import ClientError
 from twitter_timeline_data_pipeline.config import DEFAULT_MAX_MEDIA_BYTES
 from twitter_timeline_data_pipeline.models import (
     Media,
+    MediaRetry,
     TweetId,
     TweetMessage,
     utc_now_iso,
@@ -37,18 +41,21 @@ from twitter_timeline_data_pipeline.models import (
 if TYPE_CHECKING:
     from mypy_boto3_dynamodb.service_resource import Table
     from mypy_boto3_s3 import S3Client
+    from mypy_boto3_sqs import SQSClient
 
 logger = logging.getLogger(__name__)
 
 type MediaStatus = Literal[
-    "stored", "exists", "unavailable", "skipped", "too_large", "failed"
+    "stored", "exists", "unavailable", "skipped", "too_large", "retrying"
 ]
 """stored: uploaded now. exists: already in S3. unavailable: the source returned a
 4xx other than 429 (or a redirect, which isn't followed). skipped: nothing to download:
 a video with only an HLS variant, or a URL that isn't https on an allowed media host.
 too_large: over the size cap, by estimate or by counted bytes; ``size_bytes`` holds the
-estimate or the count at abort, and nothing is in S3. failed: transient errors outlasted
-the record's last SQS receive, so the Tweet was written without this media."""
+estimate or the count at abort, and nothing is in S3. retrying: transient errors
+outlasted the record's last SQS receive, so the Tweet was written without this file and
+a message on the media-retry queue will store it later and replace this status;
+``source_url`` (and the planned ``s3_key``) are recorded."""
 
 # Media is only downloaded from the X CDN; message bodies are untrusted input.
 ALLOWED_MEDIA_HOSTS = frozenset({"pbs.twimg.com", "video.twimg.com"})
@@ -78,6 +85,14 @@ class StoredMedia:
     content_type: str | None = None
     source_url: str | None = None
     size_bytes: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _Target:
+    raw_url: str
+    url: str  # raw_url at full size
+    known_type: str | None
+    key: str
 
 
 class _IterReader(io.RawIOBase):
@@ -186,6 +201,98 @@ class MediaStore:
         owner = message.tweet.author_id or message.username.lower()
         return f"media/{owner}/{message.tweet.id}/{media.media_key}{extension}"
 
+    def _target(self, message: TweetMessage, media: Media) -> _Target | StoredMedia:
+        """Where ``media`` is downloaded from and stored; ``skipped`` if nowhere."""
+        skipped = StoredMedia(
+            media_key=media.media_key, type=media.type, status="skipped"
+        )
+        source = media.download_source()
+        if source is None:
+            return skipped
+        raw_url, known_type = source
+        try:
+            url = _original_size_url(raw_url)
+            parts = urlsplit(url)
+            host = parts.hostname
+        except ValueError:  # malformed URL, e.g. an unclosed IPv6 bracket
+            parts, host = None, None
+        if parts is None or parts.scheme != "https" or host not in ALLOWED_MEDIA_HOSTS:
+            logger.warning(
+                "media %s skipped: host %r is not an allowed media host",
+                media.media_key,
+                host,
+            )
+            return skipped
+        return _Target(
+            raw_url=raw_url,
+            url=url,
+            known_type=known_type,
+            key=self.object_key(message, media, _extension(known_type, url)),
+        )
+
+    def _cheap_result(
+        self, media: Media, target: _Target, *, head: bool = True
+    ) -> StoredMedia | None:
+        """The outcome knowable without downloading: ``exists`` (HeadObject, skipped
+        with ``head=False``) or ``too_large`` (by the size estimate); None when a
+        download is needed. Raises for a HeadObject failure other than a missing key."""
+
+        def result(status: MediaStatus, **extra: Any) -> StoredMedia:
+            return StoredMedia(
+                media_key=media.media_key,
+                type=media.type,
+                status=status,
+                source_url=target.url,
+                **extra,
+            )
+
+        try:
+            if head:
+                found = self._s3.head_object(Bucket=self._bucket, Key=target.key)
+                return result(
+                    "exists",
+                    s3_key=target.key,
+                    content_type=found.get("ContentType"),
+                    size_bytes=found.get("ContentLength"),
+                )
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") not in _MISSING_OBJECT_CODES:
+                raise
+        # Skip before opening a connection when the message already says it's too big.
+        estimate = estimated_size(media, target.raw_url)
+        if estimate is not None and estimate > self._max_bytes:
+            logger.warning(
+                "media %s too large: estimated %d bytes", media.media_key, estimate
+            )
+            return result("too_large", size_bytes=estimate)
+        return None
+
+    def precheck(
+        self, message: TweetMessage, media: Media, *, head: bool = True
+    ) -> StoredMedia:
+        """The cheap checks without a download, for a media item that can't be stored.
+
+        Returns ``skipped``, ``too_large`` or ``exists`` when one applies, else
+        ``retrying`` with the ``source_url`` and the planned ``s3_key``. ``head=False``
+        makes no S3 call. Never raises: a failing HeadObject just leaves the item
+        ``retrying``.
+        """
+        target = self._target(message, media)
+        if isinstance(target, StoredMedia):
+            return target
+        try:
+            cheap = self._cheap_result(media, target, head=head)
+        except Exception:
+            logger.exception("cheap checks failed for media %s", media.media_key)
+            cheap = None
+        return cheap or StoredMedia(
+            media_key=media.media_key,
+            type=media.type,
+            status="retrying",
+            s3_key=target.key,
+            source_url=target.url,
+        )
+
     def store(
         self,
         message: TweetMessage,
@@ -201,28 +308,11 @@ class MediaStore:
         is still recorded.
         """
         deadline = None if budget_s is None else self._clock() + budget_s
-        source = media.download_source()
-        if source is None:
-            return StoredMedia(
-                media_key=media.media_key, type=media.type, status="skipped"
-            )
-        raw_url, known_type = source
-        try:
-            url = _original_size_url(raw_url)
-            parts = urlsplit(url)
-            host = parts.hostname
-        except ValueError:  # malformed URL, e.g. an unclosed IPv6 bracket
-            parts, host = None, None
-        if parts is None or parts.scheme != "https" or host not in ALLOWED_MEDIA_HOSTS:
-            logger.warning(
-                "media %s skipped: host %r is not an allowed media host",
-                media.media_key,
-                host,
-            )
-            return StoredMedia(
-                media_key=media.media_key, type=media.type, status="skipped"
-            )
-        key = self.object_key(message, media, _extension(known_type, url))
+        target = self._target(message, media)
+        if isinstance(target, StoredMedia):
+            return target
+        url, key = target.url, target.key
+        known_type = target.known_type
 
         def result(status: MediaStatus, **extra: Any) -> StoredMedia:
             return StoredMedia(
@@ -233,26 +323,8 @@ class MediaStore:
                 **extra,
             )
 
-        try:
-            head = self._s3.head_object(Bucket=self._bucket, Key=key)
-        except ClientError as exc:
-            if exc.response.get("Error", {}).get("Code") not in _MISSING_OBJECT_CODES:
-                raise
-        else:
-            return result(
-                "exists",
-                s3_key=key,
-                content_type=head.get("ContentType"),
-                size_bytes=head.get("ContentLength"),
-            )
-
-        # Skip before opening a connection when the message already says it's too big.
-        estimate = estimated_size(media, raw_url)
-        if estimate is not None and estimate > self._max_bytes:
-            logger.warning(
-                "media %s too large: estimated %d bytes", media.media_key, estimate
-            )
-            return result("too_large", size_bytes=estimate)
+        if (cheap := self._cheap_result(media, target)) is not None:
+            return cheap
 
         timeout: Any = httpx.USE_CLIENT_DEFAULT
         if deadline is not None:
@@ -472,6 +544,83 @@ class TweetStore:
                 )
             raise
         return PutResult(written=True)
+
+    def get_media(self, tweet_id: TweetId) -> list[dict[str, Any]] | None:
+        """The item's ``media`` entries (strongly consistent), None if no such item."""
+        item = self._table.get_item(
+            Key={"tweet_id": tweet_id},
+            ConsistentRead=True,
+            ProjectionExpression="media",
+        ).get("Item")
+        if item is None:
+            return None
+        return cast("list[dict[str, Any]]", item.get("media") or [])
+
+    def resolve_media(
+        self,
+        tweet_id: TweetId,
+        index: int,
+        media_key: str,
+        entry: Mapping[str, Any],
+    ) -> bool:
+        """Replace ``media[index]`` with ``entry`` if it is still the ``retrying`` entry
+        for ``media_key`` of an item that exists; return whether it was replaced.
+
+        False means the item changed since it was read (another delivery stored the
+        file, or a newer fetch rewrote the item), so there is nothing left to do. Any
+        other DynamoDB error propagates.
+        """
+        position = f"media[{int(index)}]"
+        try:
+            self._table.update_item(
+                Key={"tweet_id": tweet_id},
+                UpdateExpression=f"SET {position} = :entry",
+                ConditionExpression=(
+                    f"attribute_exists(tweet_id) AND {position}.media_key = :key "
+                    f"AND {position}.#status = :retrying"
+                ),
+                ExpressionAttributeNames={"#status": "status"},
+                ExpressionAttributeValues={
+                    ":entry": dict(entry),
+                    ":key": media_key,
+                    ":retrying": "retrying",
+                },
+            )
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") == (
+                "ConditionalCheckFailedException"
+            ):
+                return False
+            raise
+        return True
+
+
+# Delay before a media-retry message becomes visible: gives a CDN outage or a brief
+# throttle time to pass before the first retry.
+MEDIA_RETRY_DELAY_SECONDS = 300
+
+
+class MediaRetryQueue:
+    """Sends media-retry messages to their SQS queue."""
+
+    def __init__(
+        self,
+        sqs_client: SQSClient,
+        queue_url: str,
+        *,
+        delay_seconds: int = MEDIA_RETRY_DELAY_SECONDS,
+    ) -> None:
+        self._sqs = sqs_client
+        self._queue_url = queue_url
+        self._delay = delay_seconds
+
+    def send(self, retry: MediaRetry) -> None:
+        """Enqueue ``retry``; any SQS error propagates."""
+        self._sqs.send_message(
+            QueueUrl=self._queue_url,
+            MessageBody=retry.to_json(),
+            DelaySeconds=self._delay,
+        )
 
 
 class CheckpointStore:

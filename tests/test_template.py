@@ -3,6 +3,7 @@
 import ast
 import importlib
 import inspect
+import json
 from pathlib import Path
 from typing import Any
 
@@ -80,8 +81,12 @@ def test_runtime_is_python_3_14(template: Template) -> None:
     assert all("Runtime" not in props for props in functions(template).values())
 
 
-def test_there_are_exactly_two_functions(template: Template) -> None:
-    assert set(functions(template)) == {"FetchFunction", "ProcessFunction"}
+def test_there_are_exactly_three_functions(template: Template) -> None:
+    assert set(functions(template)) == {
+        "FetchFunction",
+        "ProcessFunction",
+        "MediaRetryFunction",
+    }
 
 
 @pytest.mark.parametrize(
@@ -89,6 +94,7 @@ def test_there_are_exactly_two_functions(template: Template) -> None:
     [
         ("FetchFunction", "twitter_timeline_data_pipeline.handlers.fetch"),
         ("ProcessFunction", "twitter_timeline_data_pipeline.handlers.process"),
+        ("MediaRetryFunction", "twitter_timeline_data_pipeline.handlers.media_retry"),
     ],
 )
 def test_handler_path_resolves_to_a_callable(
@@ -197,8 +203,8 @@ def test_dead_letter_queue_keeps_messages_longer_than_the_source(
     assert dlq > 345_600  # longer than the 4-day default the source queue keeps
 
 
-def sqs_event(template: Template) -> dict[str, Any]:
-    events = properties(template, "ProcessFunction")["Events"]
+def sqs_event(template: Template, function: str = "ProcessFunction") -> dict[str, Any]:
+    events = properties(template, function)["Events"]
     (event,) = (e for e in events.values() if e["Type"] == "SQS")
     found: dict[str, Any] = event["Properties"]
     return found
@@ -235,7 +241,11 @@ def test_fetch_function_runs_on_a_schedule(template: Template) -> None:
 
 @pytest.mark.parametrize(
     ("function", "module_file"),
-    [("FetchFunction", "fetch.py"), ("ProcessFunction", "process.py")],
+    [
+        ("FetchFunction", "fetch.py"),
+        ("ProcessFunction", "process.py"),
+        ("MediaRetryFunction", "media_retry.py"),
+    ],
 )
 def test_every_required_env_var_is_set_on_its_function(
     template: Template, function: str, module_file: str
@@ -254,7 +264,9 @@ def test_fetch_function_has_a_token_source(template: Template) -> None:
     assert env["BEARER_TOKEN_SECRET_ARN"] == {"Ref": "BearerTokenSecret"}
 
 
-@pytest.mark.parametrize("function", ["FetchFunction", "ProcessFunction"])
+@pytest.mark.parametrize(
+    "function", ["FetchFunction", "ProcessFunction", "MediaRetryFunction"]
+)
 def test_env_vars_are_all_known_to_settings(template: Template, function: str) -> None:
     assert set(env_of(template, function)) <= set(ENV_VARS.values())
 
@@ -389,3 +401,152 @@ def test_fetch_is_deployed_after_the_processor(template: Template) -> None:
     # A fetcher that sends long posts must not go live before a processor that
     # understands them.
     assert resource(template, "FetchFunction")["DependsOn"] == "ProcessFunction"
+
+
+def policy_statements(template: Template, function: str) -> list[dict[str, Any]]:
+    return [
+        s
+        for policy in properties(template, function)["Policies"]
+        if isinstance(policy, dict) and "Statement" in policy
+        for s in policy["Statement"]
+    ]
+
+
+def test_media_retry_queue_redrives_to_its_own_dead_letter_queue(
+    template: Template,
+) -> None:
+    queue = properties(template, "MediaRetryQueue")
+    policy = queue["RedrivePolicy"]
+    parameter = template["Parameters"]["MediaRetryMaxReceiveCount"]
+
+    assert policy["deadLetterTargetArn"] == {
+        "Fn::GetAtt": ["MediaRetryDeadLetterQueue", "Arn"]
+    }
+    assert policy["maxReceiveCount"] == {"Ref": "MediaRetryMaxReceiveCount"}
+    assert parameter["Default"] == 10
+    assert parameter["MinValue"] >= 1
+    assert queue["SqsManagedSseEnabled"] is True
+    assert queue["MessageRetentionPeriod"] == 14 * 86400
+
+
+def test_media_retry_queue_visibility_is_six_times_the_consumer_timeout(
+    template: Template,
+) -> None:
+    timeout = properties(template, "MediaRetryFunction")["Timeout"]
+    event = sqs_event(template, "MediaRetryFunction")
+
+    visibility = properties(template, "MediaRetryQueue")["VisibilityTimeout"]
+
+    assert visibility >= 6 * timeout + event.get("MaximumBatchingWindowInSeconds", 0)
+
+
+def test_media_retry_dead_letter_queue_is_retained_and_redrive_restricted(
+    template: Template,
+) -> None:
+    dlq = properties(template, "MediaRetryDeadLetterQueue")
+    queue_name = properties(template, "MediaRetryQueue")["QueueName"]
+
+    assert dlq["MessageRetentionPeriod"] == 14 * 86400
+    assert dlq["SqsManagedSseEnabled"] is True
+    assert dlq["RedriveAllowPolicy"]["redrivePermission"] == "byQueue"
+    (arn,) = dlq["RedriveAllowPolicy"]["sourceQueueArns"]
+    assert arn["Fn::Sub"].endswith(":" + queue_name["Fn::Sub"])
+
+
+@pytest.mark.parametrize("name", ["MediaRetryQueue", "MediaRetryDeadLetterQueue"])
+def test_media_retry_queues_take_the_same_message_size_as_the_main_queue(
+    template: Template, name: str
+) -> None:
+    main = properties(template, "TweetsQueue")["MaximumMessageSize"]
+
+    assert properties(template, name)["MaximumMessageSize"] == main
+
+
+def test_media_retry_function_is_fed_one_message_at_a_time(template: Template) -> None:
+    event = sqs_event(template, "MediaRetryFunction")
+
+    assert event["Queue"] == {"Fn::GetAtt": ["MediaRetryQueue", "Arn"]}
+    assert event["BatchSize"] == 1
+    assert "ReportBatchItemFailures" in event["FunctionResponseTypes"]
+    props = properties(template, "MediaRetryFunction")
+    assert props["Timeout"] >= 300
+    assert props["MemorySize"] == properties(template, "ProcessFunction")["MemorySize"]
+    assert props["LoggingConfig"]["LogGroup"] == {"Ref": "MediaRetryFunctionLogGroup"}
+    assert (
+        resource(template, "MediaRetryFunctionLogGroup")["Properties"][
+            "RetentionInDays"
+        ]
+        == 30
+    )
+
+
+def test_media_retry_function_environment(template: Template) -> None:
+    env = env_of(template, "MediaRetryFunction")
+
+    assert env == {
+        "TWEETS_TABLE": {"Ref": "TweetsTable"},
+        "MEDIA_BUCKET": {"Ref": "MediaBucket"},
+        "MAX_MEDIA_BYTES": {"Ref": "MaxMediaBytes"},
+    }
+
+
+def test_process_function_sends_to_the_retry_queue_only(template: Template) -> None:
+    env = env_of(template, "ProcessFunction")
+    sends = [
+        p
+        for p in properties(template, "ProcessFunction")["Policies"]
+        if isinstance(p, dict) and "SQSSendMessagePolicy" in p
+    ]
+
+    assert env["MEDIA_RETRY_QUEUE_URL"] == {"Ref": "MediaRetryQueue"}
+    assert sends == [
+        {
+            "SQSSendMessagePolicy": {
+                "QueueName": {"Fn::GetAtt": ["MediaRetryQueue", "QueueName"]}
+            }
+        }
+    ]
+    assert "MEDIA_RETRY_QUEUE_URL" not in env_of(template, "FetchFunction")
+
+
+def test_media_retry_function_permissions(template: Template) -> None:
+    statements = policy_statements(template, "MediaRetryFunction")
+    by_resource = {
+        json_key(s["Resource"]): set(_as_list(s["Action"])) for s in statements
+    }
+
+    assert by_resource[json_key({"Fn::GetAtt": ["TweetsTable", "Arn"]})] == {
+        "dynamodb:GetItem",
+        "dynamodb:UpdateItem",
+    }
+    actions = {a for s in statements for a in _as_list(s["Action"])}
+    assert {
+        "s3:PutObject",
+        "s3:GetObject",
+        "s3:AbortMultipartUpload",
+        "s3:ListBucket",
+    } <= actions
+    assert not any(a.startswith("sqs:") for a in actions)
+    assert "dynamodb:PutItem" not in actions
+
+
+def json_key(value: Any) -> str:
+    return json.dumps(value, sort_keys=True)
+
+
+def test_media_retry_dead_letter_queue_has_an_alarm(template: Template) -> None:
+    alarm = properties(template, "MediaRetryDeadLetterQueueNotEmptyAlarm")
+
+    assert alarm["Dimensions"] == [
+        {
+            "Name": "QueueName",
+            "Value": {"Fn::GetAtt": ["MediaRetryDeadLetterQueue", "QueueName"]},
+        }
+    ]
+    assert alarm["MetricName"] == "ApproximateNumberOfMessagesVisible"
+    assert alarm["Threshold"] == 0
+    assert alarm["ComparisonOperator"] == "GreaterThanThreshold"
+    assert (
+        alarm["AlarmActions"]
+        == properties(template, "DeadLetterQueueNotEmptyAlarm")["AlarmActions"]
+    )

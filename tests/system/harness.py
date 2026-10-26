@@ -167,11 +167,28 @@ class Simulation:
             if schedule.enabled
         ]
         (self.fetch,) = (f for f in self.functions.values() if f.spec.schedules)
-        (self.process,) = (f for f in self.functions.values() if f.spec.sqs_events)
-        (self.esm,) = self.event_sources
+        (self.process,) = self._functions_running("process")
+        (self.media_retry,) = self._functions_running("media_retry")
+        (self.esm,) = self._sources_of(self.process)
+        (self.retry_esm,) = self._sources_of(self.media_retry)
         self.queue: QueueSpec = self.esm.queue
         assert self.queue.dead_letter_arn is not None
         self.dlq: QueueSpec = self.stack.queue_by_arn(self.queue.dead_letter_arn)
+        self.retry_queue: QueueSpec = self.retry_esm.queue
+        assert self.retry_queue.dead_letter_arn is not None
+        self.retry_dlq: QueueSpec = self.stack.queue_by_arn(
+            self.retry_queue.dead_letter_arn
+        )
+
+    def _functions_running(self, module: str) -> list[LambdaRuntime]:
+        return [
+            f
+            for f in self.functions.values()
+            if f.spec.handler.endswith(f".handlers.{module}.handler")
+        ]
+
+    def _sources_of(self, runtime: LambdaRuntime) -> list[SqsEventSource]:
+        return [s for s in self.event_sources if s.runtime is runtime]
 
     # --- patches -------------------------------------------------------------------
 
@@ -255,11 +272,27 @@ class Simulation:
 
     def process_until(self, when: float) -> list[Invocation]:
         """Let the event source work (through visibility timeouts) until ``when``."""
-        invocations: list[Invocation] = []
-        for source in self.event_sources:
-            invocations += source.drain(until=when)
+        invocations = self._work(until=when)
         self.clock.advance_to(when)
         return invocations
+
+    def _work(self, until: float) -> list[Invocation]:
+        """Poll every event source until none has anything due (a Tweet message may
+        enqueue a media retry, and the other way round), waiting out visibility
+        timeouts and send delays, but never past ``until``."""
+        invocations: list[Invocation] = []
+        while True:
+            progressed = False
+            for source in self.event_sources:
+                while done := source.poll():
+                    invocations += done
+                    progressed = True
+            if progressed:
+                continue
+            due = [d for s in self.event_sources if (d := s.next_due()) is not None]
+            if not due or min(due) > until:
+                return invocations
+            self.clock.advance_to(min(due))
 
     def run(self, runs: int = 1) -> list[Invocation]:
         """``runs`` scheduled fetches, one schedule interval apart. The queue is worked
@@ -276,11 +309,8 @@ class Simulation:
         return self.fetch.invoke(dict(event or {}))
 
     def settle(self, max_seconds: float = 2 * 86400) -> list[Invocation]:
-        """Work the queue until nothing is visible or in flight (bounded)."""
-        invocations: list[Invocation] = []
-        for source in self.event_sources:
-            invocations += source.drain(until=self.clock.now + max_seconds)
-        return invocations
+        """Work the queues until nothing is visible, delayed or in flight (bounded)."""
+        return self._work(until=self.clock.now + max_seconds)
 
     def advance(self, seconds: float) -> None:
         self.process_until(self.clock.now + seconds)
@@ -299,16 +329,22 @@ class Simulation:
             "MessageId"
         ]
 
-    def redrive_dlq(self) -> int:
-        """Move every DLQ message back to the tweets queue (a DLQ redrive)."""
+    def redrive_dlq(self, *, media_retry: bool = False) -> int:
+        """Move every DLQ message back to its source queue (a DLQ redrive): the tweets
+        queue's, or with ``media_retry`` the media-retry queue's."""
+        dlq, queue = (
+            (self.retry_dlq, self.retry_queue)
+            if media_retry
+            else (self.dlq, self.queue)
+        )
         moved = 0
         while messages := self.sqs.receive_message(
-            QueueUrl=self.dlq.url, MaxNumberOfMessages=10, VisibilityTimeout=60
+            QueueUrl=dlq.url, MaxNumberOfMessages=10, VisibilityTimeout=60
         ).get("Messages"):
             for m in messages:
-                self.sqs.send_message(QueueUrl=self.queue.url, MessageBody=m["Body"])
+                self.sqs.send_message(QueueUrl=queue.url, MessageBody=m["Body"])
                 self.sqs.delete_message(
-                    QueueUrl=self.dlq.url, ReceiptHandle=m["ReceiptHandle"]
+                    QueueUrl=dlq.url, ReceiptHandle=m["ReceiptHandle"]
                 )
                 moved += 1
         return moved
@@ -390,18 +426,26 @@ class Simulation:
             int(attributes["ApproximateNumberOfMessagesNotVisible"]),
         )
 
-    def dlq_bodies(self) -> list[str]:
-        """Peek at the DLQ (messages stay there)."""
+    def delayed(self, queue: QueueSpec) -> int:
+        """Messages of ``queue`` still waiting out their ``DelaySeconds``."""
+        attributes = self.sqs.get_queue_attributes(
+            QueueUrl=queue.url, AttributeNames=["ApproximateNumberOfMessagesDelayed"]
+        )["Attributes"]
+        return int(attributes["ApproximateNumberOfMessagesDelayed"])
+
+    def dlq_bodies(self, dlq: QueueSpec | None = None) -> list[str]:
+        """Peek at a DLQ (the tweets queue's by default; messages stay there)."""
+        url = (dlq or self.dlq).url
         bodies: list[str] = []
         handles: list[str] = []
         while messages := self.sqs.receive_message(
-            QueueUrl=self.dlq.url, MaxNumberOfMessages=10, VisibilityTimeout=60
+            QueueUrl=url, MaxNumberOfMessages=10, VisibilityTimeout=60
         ).get("Messages"):
             bodies += [m["Body"] for m in messages]
             handles += [m["ReceiptHandle"] for m in messages]
         for handle in handles:
             self.sqs.change_message_visibility(
-                QueueUrl=self.dlq.url, ReceiptHandle=handle, VisibilityTimeout=0
+                QueueUrl=url, ReceiptHandle=handle, VisibilityTimeout=0
             )
         # moto makes a message visible once the clock passes its deadline; the next
         # receive happens at least a millisecond later.
@@ -410,7 +454,13 @@ class Simulation:
 
     @property
     def deliveries(self) -> list[Delivery]:
-        return [d for source in self.event_sources for d in source.deliveries]
+        """Deliveries to the process function (media retries are in
+        ``retry_deliveries``)."""
+        return self.esm.deliveries
+
+    @property
+    def retry_deliveries(self) -> list[Delivery]:
+        return self.retry_esm.deliveries
 
     def deliveries_of(self, tweet_id: str) -> list[Delivery]:
         """Deliveries of messages about ``tweet_id`` to the process function."""

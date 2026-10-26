@@ -43,6 +43,7 @@ def clear_caches() -> Iterator[None]:
         fetch.sqs_client.cache_clear()
         fetch.checkpoint_store.cache_clear()
         process._s3_client.cache_clear()
+        process._sqs_client.cache_clear()
         process._http_client.cache_clear()
         process._tweet_store.cache_clear()
         credentials.clear_cache()
@@ -60,6 +61,7 @@ class Aws:
     tweets_table: Table
     state_table: Table
     queue_url: str
+    retry_queue_url: str
     bucket: str = BUCKET
 
 
@@ -98,6 +100,7 @@ def aws() -> Iterator[Aws]:
         s3.create_bucket(Bucket=BUCKET)
         sqs = boto3.client("sqs")
         queue_url = sqs.create_queue(QueueName="test-tweets")["QueueUrl"]
+        retry_queue_url = sqs.create_queue(QueueName="test-media-retry")["QueueUrl"]
         yield Aws(
             s3=s3,
             sqs=sqs,
@@ -105,6 +108,7 @@ def aws() -> Iterator[Aws]:
             tweets_table=tweets,
             state_table=state,
             queue_url=queue_url,
+            retry_queue_url=retry_queue_url,
         )
 
 
@@ -112,6 +116,7 @@ def aws() -> Iterator[Aws]:
 def pipeline_env(monkeypatch: pytest.MonkeyPatch, aws: Aws) -> Aws:
     """Environment variables the handlers read, pointing at the moto resources."""
     monkeypatch.setenv("QUEUE_URL", aws.queue_url)
+    monkeypatch.setenv("MEDIA_RETRY_QUEUE_URL", aws.retry_queue_url)
     monkeypatch.setenv("STATE_TABLE", STATE_TABLE)
     monkeypatch.setenv("TWEETS_TABLE", TWEETS_TABLE)
     monkeypatch.setenv("MEDIA_BUCKET", BUCKET)

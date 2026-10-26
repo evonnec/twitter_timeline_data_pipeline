@@ -23,6 +23,7 @@ ENV_VARS: Mapping[str, str] = {
     "http_timeout": "HTTP_TIMEOUT_SECONDS",
     "max_media_bytes": "MAX_MEDIA_BYTES",
     "max_receive_count": "MAX_RECEIVE_COUNT",
+    "media_retry_queue_url": "MEDIA_RETRY_QUEUE_URL",
 }
 
 
@@ -54,7 +55,10 @@ class Settings:
     ``too_large`` without a copy in S3."""
     max_receive_count: int | None = None
     """The queue's ``maxReceiveCount``. On a record's last receive its media
-    failures are recorded instead of retried. None disables that."""
+    failures are recorded as ``retrying`` and queued for the media-retry function
+    instead of failing the record. None disables that."""
+    media_retry_queue_url: str | None = None
+    """Queue the process function sends media-retry messages to."""
 
     def __post_init__(self) -> None:
         if not 5 <= self.max_results <= 100:
@@ -120,6 +124,7 @@ class Settings:
                 if get("max_receive_count") is None
                 else get_number("max_receive_count", int, 1)
             ),
+            media_retry_queue_url=get("media_retry_queue_url"),
         )
 
     def require(self, *attrs: str) -> None:

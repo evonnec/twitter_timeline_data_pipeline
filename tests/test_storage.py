@@ -28,12 +28,13 @@ from hypothesis import strategies as st
 from moto import mock_aws
 from mypy_boto3_s3 import S3Client
 
-from twitter_timeline_data_pipeline.models import Media, Tweet, TweetMessage
+from twitter_timeline_data_pipeline.models import Media, MediaRetry, Tweet, TweetMessage
 from twitter_timeline_data_pipeline.storage import (
     ALLOWED_MEDIA_HOSTS,
     ITEM_TEXT_LIMIT_BYTES,
     TEXT_PREVIEW_CHARS,
     CheckpointStore,
+    MediaRetryQueue,
     MediaStore,
     PutResult,
     StoredMedia,
@@ -1197,3 +1198,151 @@ def test_store_with_no_time_left_makes_no_request(aws: Aws) -> None:
         media_store(aws, cdn).store(make_message(media=(PHOTO,)), PHOTO, budget_s=0)
 
     assert cdn.requests == []
+
+
+# ---- precheck, media updates and the retry queue ------------------------------------
+
+
+def test_precheck_leaves_an_unstorable_media_retrying_with_url_and_planned_key(
+    aws: Aws,
+) -> None:
+    cdn = CdnStub()
+    store = MediaStore(aws.s3, aws.bucket, cdn.client())
+
+    result = store.precheck(make_message(media=(PHOTO,)), PHOTO)
+
+    assert result == StoredMedia(
+        media_key=PHOTO.media_key,
+        type="photo",
+        status="retrying",
+        s3_key=PHOTO_KEY,
+        source_url=f"{PHOTO_URL}?name=orig",
+    )
+    assert cdn.requests == []
+
+
+def test_precheck_finds_an_object_already_in_s3(aws: Aws) -> None:
+    aws.s3.put_object(
+        Bucket=aws.bucket, Key=PHOTO_KEY, Body=JPEG, ContentType="image/jpeg"
+    )
+    store = MediaStore(aws.s3, aws.bucket, CdnStub().client())
+
+    result = store.precheck(make_message(media=(PHOTO,)), PHOTO)
+
+    assert (result.status, result.s3_key, result.size_bytes) == (
+        "exists",
+        PHOTO_KEY,
+        len(JPEG),
+    )
+
+
+def test_precheck_without_head_makes_no_s3_call(aws: Aws) -> None:
+    aws.s3.put_object(Bucket=aws.bucket, Key=PHOTO_KEY, Body=JPEG)
+    store = MediaStore(aws.s3, aws.bucket, CdnStub().client())
+
+    result = store.precheck(make_message(media=(PHOTO,)), PHOTO, head=False)
+
+    assert result.status == "retrying"  # it exists, but this check was skipped
+
+
+def test_precheck_applies_the_size_estimate_and_the_host_allowlist(aws: Aws) -> None:
+    big = Media.from_dict(
+        {
+            "media_key": "7_big",
+            "type": "video",
+            "duration_ms": 10_000,
+            "variants": [
+                {
+                    "content_type": "video/mp4",
+                    "bit_rate": 8_000_000,
+                    "url": VIDEO_HI_URL,
+                }
+            ],
+        }
+    )
+    elsewhere = photo("3_x", "https://example.com/a.jpg")
+    store = MediaStore(aws.s3, aws.bucket, CdnStub().client(), max_bytes=1_000_000)
+    message = make_message(media=(big, elsewhere))
+
+    assert store.precheck(message, big).status == "too_large"
+    assert store.precheck(message, elsewhere).status == "skipped"
+
+
+def test_precheck_never_raises_when_head_object_fails(aws: Aws) -> None:
+    def deny(**_kw: Any) -> None:
+        raise ClientError({"Error": {"Code": "500", "Message": "boom"}}, "HeadObject")
+
+    aws.s3.meta.events.register("before-call.s3.HeadObject", deny)
+    store = MediaStore(aws.s3, aws.bucket, CdnStub().client())
+
+    result = store.precheck(make_message(media=(PHOTO,)), PHOTO)
+
+    assert (result.status, result.s3_key) == ("retrying", PHOTO_KEY)
+
+
+def test_get_media_reads_entries_and_reports_a_missing_item(aws: Aws) -> None:
+    store = TweetStore(aws.tweets_table, aws.s3, aws.bucket)
+    store.put_tweet(
+        make_message(media=(PHOTO,)),
+        [StoredMedia(media_key=PHOTO.media_key, type="photo", status="skipped")],
+    )
+    store.put_tweet(make_message("1700000000000000999"), [])
+
+    entries = store.get_media(TWEET_ID)
+
+    assert entries is not None
+    assert [e["status"] for e in entries] == ["skipped"]
+    assert store.get_media("1700000000000000999") == []
+    assert store.get_media("1") is None
+
+
+def test_resolve_media_replaces_only_a_matching_retrying_entry(aws: Aws) -> None:
+    store = TweetStore(aws.tweets_table, aws.s3, aws.bucket)
+    other = photo("3_other")
+    store.put_tweet(
+        make_message(media=(PHOTO, other)),
+        [
+            StoredMedia(media_key=PHOTO.media_key, type="photo", status="retrying"),
+            StoredMedia(media_key="3_other", type="photo", status="retrying"),
+        ],
+    )
+    done = {"media_key": PHOTO.media_key, "type": "photo", "status": "stored"}
+
+    assert store.resolve_media(TWEET_ID, 0, PHOTO.media_key, done)
+    assert not store.resolve_media(TWEET_ID, 0, PHOTO.media_key, done)  # not retrying
+    assert not store.resolve_media(TWEET_ID, 1, PHOTO.media_key, done)  # other key
+    assert not store.resolve_media(TWEET_ID, 5, "x", done)  # no such index
+    assert not store.resolve_media("1", 0, PHOTO.media_key, done)  # no item
+    entries = store.get_media(TWEET_ID)
+    assert entries is not None
+    assert [e["status"] for e in entries] == ["stored", "retrying"]
+    assert aws.tweets_table.scan()["Count"] == 1  # no item was created for "1"
+
+
+def test_resolve_media_propagates_other_errors(aws: Aws) -> None:
+    store = TweetStore(aws.tweets_table, aws.s3, aws.bucket)
+
+    def deny(**_kw: Any) -> None:
+        raise ClientError(
+            {"Error": {"Code": "ProvisionedThroughputExceededException"}}, "UpdateItem"
+        )
+
+    aws.tweets_table.meta.client.meta.events.register(
+        "before-call.dynamodb.UpdateItem", deny
+    )
+
+    with pytest.raises(ClientError):
+        store.resolve_media(TWEET_ID, 0, "k", {})
+
+
+def test_media_retry_queue_sends_the_delayed_json_message(aws: Aws) -> None:
+    queue = MediaRetryQueue(aws.sqs, aws.retry_queue_url, delay_seconds=45)
+    retry = MediaRetry(tweet_id=TWEET_ID, username="u", media=PHOTO)
+
+    queue.send(retry)
+
+    attributes = aws.sqs.get_queue_attributes(
+        QueueUrl=aws.retry_queue_url, AttributeNames=["All"]
+    )["Attributes"]
+    assert attributes["ApproximateNumberOfMessagesDelayed"] == "1"
+    aws.sqs.purge_queue(QueueUrl=aws.retry_queue_url)

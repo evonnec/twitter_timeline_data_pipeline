@@ -34,6 +34,7 @@ import boto3
 from botocore.awsrequest import AWSResponse
 from botocore.compat import HTTPHeaders
 from botocore.exceptions import ClientError
+from moto.sqs.models import sqs_backends
 
 from system.clock import FunctionCrashed, FunctionTimedOut, SimClock
 from system.stack import (
@@ -497,6 +498,27 @@ class SqsEventSource:
             if until is not None and due > until:
                 return invocations
             self.clock.advance_to(due)
+
+    def next_due(self) -> float | None:
+        """When something here becomes receivable again, or None if nothing will.
+
+        Call it after ``poll`` found nothing: whatever was due is then gone (deleted or
+        moved to the DLQ by that receive), so only later visibility timeouts of
+        messages in flight and the delivery time of delayed messages (``DelaySeconds``)
+        are left to wait for.
+        """
+        self._in_flight = {
+            k: t for k, t in self._in_flight.items() if t >= self.clock.now
+        }
+        times = list(self._in_flight.values())
+        # moto keeps a delayed message's delivery time on the message itself.
+        backend = sqs_backends[ACCOUNT_ID][REGION]
+        times += [
+            m.delayed_until / 1000
+            for m in backend.queues[self.queue.name]._messages
+            if m.delayed_until / 1000 >= self.clock.now
+        ]
+        return min(times) + 0.001 if times else None  # moto: visible once now > t
 
     def _fit_payload(
         self, batch: list[MessageTypeDef]
