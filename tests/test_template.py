@@ -12,6 +12,7 @@ from cfnlint.api import lint_all  # type: ignore[import-untyped]
 from cfnlint.decode import cfn_yaml  # type: ignore[import-untyped]
 
 from twitter_timeline_data_pipeline.config import ENV_VARS
+from twitter_timeline_data_pipeline.storage import MEDIA_HOSTS_OVERRIDE_ENV
 
 ROOT = Path(__file__).parent.parent
 TEMPLATE = ROOT / "template.yaml"
@@ -582,3 +583,65 @@ def test_media_retry_function_has_an_errors_alarm(template: Template) -> None:
         alarm["AlarmActions"]
         == properties(template, "ProcessFunctionErrorsAlarm")["AlarmActions"]
     )
+
+
+def test_fetch_function_writes_only_under_raw_and_quarantine(
+    template: Template,
+) -> None:
+    statements = policy_statements(template, "FetchFunction")
+    puts = [s for s in statements if "s3:PutObject" in _as_list(s["Action"])]
+
+    assert all(s["Effect"] == "Allow" and s["Action"] == "s3:PutObject" for s in puts)
+    # one statement per prefix, each scoped to exactly that prefix
+    assert [s["Resource"] for s in puts] == [
+        {"Fn::Sub": "${MediaBucket.Arn}/raw/*"},
+        {"Fn::Sub": "${MediaBucket.Arn}/quarantine/*"},
+    ]
+    # nothing else of S3: no reads, no listing, no other prefix
+    other = [
+        s
+        for s in statements
+        if s not in puts and any(a.startswith("s3:") for a in _as_list(s["Action"]))
+    ]
+    assert other == []
+
+
+def test_fetch_function_gets_the_bucket_name(template: Template) -> None:
+    assert env_of(template, "FetchFunction")["MEDIA_BUCKET"] == {"Ref": "MediaBucket"}
+
+
+def test_no_lifecycle_rule_can_reach_raw_pages(template: Template) -> None:
+    rules = properties(template, "MediaBucket")["LifecycleConfiguration"]["Rules"]
+    acting = {
+        "ExpirationInDays",
+        "ExpirationDate",
+        "ExpiredObjectDeleteMarker",
+        "NoncurrentVersionExpiration",
+        "NoncurrentVersionTransitions",
+        "Transitions",
+    }
+
+    for rule in rules:
+        if acting & rule.keys():
+            # every expiring or transitioning rule names its (non-raw) prefix
+            assert rule.get("Prefix") in {"media/", "text/"}, rule["Id"]
+    noncurrent = {r["Prefix"] for r in rules if "NoncurrentVersionExpiration" in r}
+    assert noncurrent == {"media/", "text/"}
+
+
+def test_process_function_cannot_write_raw_pages(template: Template) -> None:
+    statements = policy_statements(template, "ProcessFunction")
+    (objects,) = (s for s in statements if "s3:PutObject" in _as_list(s["Action"]))
+
+    assert objects["Resource"] == [
+        {"Fn::Sub": "${MediaBucket.Arn}/media/*"},
+        {"Fn::Sub": "${MediaBucket.Arn}/text/*"},
+    ]
+
+
+def test_no_function_sets_the_test_only_media_host_override(template: Template) -> None:
+    for name, props in functions(template).items():
+        assert MEDIA_HOSTS_OVERRIDE_ENV not in props.get("Environment", {}).get(
+            "Variables", {}
+        ), name
+    assert MEDIA_HOSTS_OVERRIDE_ENV not in TEMPLATE.read_text()

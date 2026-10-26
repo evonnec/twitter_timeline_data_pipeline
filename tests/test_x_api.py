@@ -754,3 +754,51 @@ def test_long_post_is_parsed_with_its_full_text() -> None:
     assert tweet.text.endswith("https://t.co/FakeLong1")
     assert tweet.full_text == tweet.note_text
     assert len(tweet.note_text) > 280
+
+
+def test_unparseable_page_raises_an_error_carrying_the_raw_page() -> None:
+    body = {"data": {"text": "not a list"}, "meta": {"result_count": 1}}
+
+    def api(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=body)
+
+    with x_client(api) as client, pytest.raises(x_api.PageParseError) as info:
+        list(client.iter_timeline(USER_ID))
+
+    assert info.value.raw.body == body
+    assert info.value.raw.endpoint == f"/users/{USER_ID}/tweets"
+    assert info.value.status_code == 200
+    assert isinstance(info.value, XApiError)
+
+
+def _not_found(**overrides: str) -> dict[str, Any]:
+    error = {
+        "title": "Not Found Error",
+        "resource_type": "user",
+        "parameter": "id",
+        "type": "https://api.twitter.com/2/problems/resource-not-found",
+    }
+    return {"errors": [{**error, **overrides}], "meta": {"result_count": 0}}
+
+
+def test_iter_timeline_user_not_found_raises_not_found() -> None:
+    with (
+        x_client(script(ok(_not_found()))) as client,
+        pytest.raises(NotFoundError, match="not found"),
+    ):
+        list(client.iter_timeline(USER_ID))
+
+
+@pytest.mark.parametrize(
+    "overrides", [{"resource_type": "tweet"}, {"parameter": "ids"}]
+)
+def test_iter_timeline_other_not_found_errors_are_not_a_missing_user(
+    overrides: dict[str, str],
+) -> None:
+    with (
+        x_client(script(ok(_not_found(**overrides)))) as client,
+        pytest.raises(XApiError) as e,
+    ):
+        list(client.iter_timeline(USER_ID))
+
+    assert not isinstance(e.value, NotFoundError)

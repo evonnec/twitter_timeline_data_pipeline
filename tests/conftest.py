@@ -10,7 +10,7 @@ from mypy_boto3_dynamodb.service_resource import DynamoDBServiceResource, Table
 from mypy_boto3_s3 import S3Client
 from mypy_boto3_sqs import SQSClient
 
-from twitter_timeline_data_pipeline import credentials
+from twitter_timeline_data_pipeline import credentials, raw
 from twitter_timeline_data_pipeline.config import ENV_VARS
 from twitter_timeline_data_pipeline.handlers import fetch, process
 
@@ -25,7 +25,12 @@ def isolated_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     """Fake credentials and region so no test can reach real AWS, and a clean env."""
     for name in ENV_VARS.values():
         monkeypatch.delenv(name, raising=False)
-    for name in ("AWS_PROFILE", "AWS_ENDPOINT_URL", "AWS_SESSION_TOKEN"):
+    for name in (
+        "AWS_PROFILE",
+        "AWS_ENDPOINT_URL",
+        "AWS_SESSION_TOKEN",
+        "MEDIA_ALLOWED_HOSTS_OVERRIDE",
+    ):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
@@ -41,11 +46,13 @@ def clear_caches() -> Iterator[None]:
 
     def clear() -> None:
         fetch.sqs_client.cache_clear()
+        raw.s3_client.cache_clear()
         fetch.checkpoint_store.cache_clear()
         process._s3_client.cache_clear()
         process._sqs_client.cache_clear()
         process._http_client.cache_clear()
         process._tweet_store.cache_clear()
+        process._test_media_hosts.cache_clear()
         credentials.clear_cache()
 
     clear()

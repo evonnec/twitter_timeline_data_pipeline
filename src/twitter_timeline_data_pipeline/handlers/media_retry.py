@@ -24,6 +24,7 @@ from twitter_timeline_data_pipeline.handlers.process import (
     SAFETY_MARGIN_MS,
     _http_client,
     _s3_client,
+    _test_media_hosts,
     _tweet_store,
 )
 from twitter_timeline_data_pipeline.models import MediaRetry, MessageError
@@ -128,6 +129,7 @@ def handler(event: Any, context: Any) -> dict[str, list[dict[str, str]]]:
             settings.media_bucket,
             _http_client(settings.http_timeout),
             max_bytes=settings.max_media_bytes,
+            test_hosts=_test_media_hosts(),
         ),
         tweet_store=_tweet_store(settings.tweets_table, settings.media_bucket),
         remaining_ms=getattr(context, "get_remaining_time_in_millis", None),

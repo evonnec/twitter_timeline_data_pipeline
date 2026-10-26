@@ -9,6 +9,7 @@ price is duplicates (at most the page in flight), which processing absorbs.
 
 import dataclasses
 import functools
+import json
 import logging
 import time
 from collections.abc import Callable, Iterable, Iterator, Sequence
@@ -25,14 +26,27 @@ from twitter_timeline_data_pipeline.models import (
     TweetId,
     TweetMessage,
     normalize_username,
+    utc_now_iso,
 )
+from twitter_timeline_data_pipeline.quarantine import (
+    QuarantineStore,
+    QuarantineUnavailableError,
+)
+from twitter_timeline_data_pipeline.raw import RawPageStore, s3_client
 from twitter_timeline_data_pipeline.storage import (
     CheckpointState,
     CheckpointStore,
     Gap,
     merge_gaps,
 )
-from twitter_timeline_data_pipeline.x_api import AuthError, RateLimitError, XClient
+from twitter_timeline_data_pipeline.x_api import (
+    AccessError,
+    AuthError,
+    NotFoundError,
+    PageParseError,
+    RateLimitError,
+    XClient,
+)
 
 if TYPE_CHECKING:
     from mypy_boto3_sqs import SQSClient
@@ -50,6 +64,27 @@ RETRY_BACKOFF_SECONDS = 0.5
 # moves text over ``ITEM_TEXT_LIMIT_BYTES`` to S3 and keeps the item under the limit
 # (checked in the tests); re-check that if the limit or the item layout changes.
 SQS_MAX_MESSAGE_BYTES = 1_048_576
+
+
+class IdentityChangedError(RuntimeError):
+    """The handle now belongs to a different user ID than the one the state item was
+    built for (the account renamed and someone else took the handle, or the event named
+    another ID). Nothing is ingested and the state is left as it was, so the run fails
+    (alarm fires) and an operator decides; see the README runbook."""
+
+
+IDENTITY_CHANGED_MESSAGE = (
+    "identity changed for handle %s: %s user_id %s, now %s; nothing ingested"
+)
+"""Stable, greppable text of the ERROR logged on an identity change (a CloudWatch
+metric filter can match on it)."""
+
+FIRST_BINDING_MESSAGE = "binding handle %s to user_id %s (no user ID was stored)"
+"""Stable, greppable text of the WARNING logged when a handle is first tied to an ID
+(a new account, a legacy item, or an operator-cleared ``user_id``): the one moment a
+takeover could not be told from the account itself."""
+
+DEFAULT_USER_ID_TTL = timedelta(hours=24)
 
 
 class EnqueueError(RuntimeError):
@@ -84,17 +119,40 @@ def _send_batch(
     queue_url: str,
     bodies: Sequence[str],
     sleep: Callable[[float], None],
-) -> None:
-    """Send up to 10 bodies, retrying only the entries SQS reports as Failed."""
+    reject: Callable[[str, str], None] | None = None,
+) -> int:
+    """Send up to 10 bodies, retrying only the entries SQS reports as Failed; returns
+    how many were sent (``reject``ed ones don't count).
+
+    An entry failed with ``SenderFault`` would fail the same way again, so it is not
+    retried: ``reject(body, error)`` quarantines it and the rest carry on. Without a
+    ``reject`` callback it raises ``EnqueueError`` straight away, so nothing is
+    dropped.
+    """
     pending: list[SendMessageBatchRequestEntryTypeDef] = [
         {"Id": str(i), "MessageBody": body} for i, body in enumerate(bodies)
     ]
+    rejected = 0
     for attempt in range(SEND_RETRIES + 1):
         response = sqs.send_message_batch(QueueUrl=queue_url, Entries=pending)
         failed = {f["Id"]: f for f in response.get("Failed", [])}
         if not failed:
-            return
-        pending = [e for e in pending if e["Id"] in failed]
+            return len(bodies) - rejected
+        faulty = [
+            e
+            for e in pending
+            if e["Id"] in failed and failed[e["Id"]].get("SenderFault")
+        ]
+        for entry in faulty:
+            error = failed[entry["Id"]]
+            detail = f"{error.get('Code', 'SenderFault')}: {error.get('Message', '')}"
+            if reject is None:
+                raise EnqueueError(f"SQS rejected a message as unsendable: {detail}")
+            reject(entry["MessageBody"], detail)
+            rejected += 1
+        pending = [e for e in pending if e["Id"] in failed and e not in faulty]
+        if not pending:
+            return len(bodies) - rejected
         if attempt < SEND_RETRIES:
             logger.warning(
                 "%d of %d messages failed to enqueue (attempt %d): %s",
@@ -120,6 +178,22 @@ def _encode(messages: Sequence[TweetMessage]) -> list[str]:
             )
         bodies.append(body)
     return bodies
+
+
+def send_messages(
+    sqs: SQSClient,
+    queue_url: str,
+    messages: Sequence[TweetMessage],
+    sleep: Callable[[float], None],
+    reject: Callable[[str, str], None] | None = None,
+) -> int:
+    """Encode (and size-check) every message, then send them in batches; returns the
+    number sent (``reject``ed ones, see ``_send_batch``, are not counted). Nothing is
+    sent if any message is over the limit. Shared by the fetch run and ``replay``."""
+    sent = 0
+    for chunk in _chunk_bodies(_encode(messages)):
+        sent += _send_batch(sqs, queue_url, chunk, sleep, reject)
+    return sent
 
 
 def _chunk_bodies(bodies: Sequence[str]) -> Iterator[list[str]]:
@@ -170,6 +244,7 @@ class _Run:
 
     username: str
     user_id: str
+    user_id_resolved_at: str
     x_client: XClient
     sqs: SQSClient
     queue_url: str
@@ -179,6 +254,10 @@ class _Run:
     max_pages: int
     sleep: Callable[[float], None]
     now: Callable[[], datetime]
+    raw_pages: RawPageStore | None = None
+    """Where raw pages are landed before their messages are enqueued; None skips it."""
+    quarantine: QuarantineStore | None = None
+    """Where unparseable items and unsendable messages go; None fails such pages."""
     pages: int = 0
     requests: int = 0
     tweets: int = 0
@@ -218,6 +297,21 @@ class _Run:
                 self.pages += 1
                 last = page
                 yield page
+        except PageParseError as exc:
+            self.requests += 1
+            # The response is valid JSON the parser rejects: keep it before failing,
+            # so the data can be replayed once the parser is fixed. Nothing is
+            # enqueued and the cursor stays.
+            if self.raw_pages is not None:
+                key = self.raw_pages.put(
+                    username=self.username,
+                    user_id=self.user_id,
+                    fetched_at=utc_now_iso(),
+                    page_no=self.pages + 1,
+                    page=exc.raw,
+                )
+                logger.error("unparseable page kept at %s: %s", key, exc)
+            raise
         except Exception:
             self.requests += 1
             raise
@@ -226,30 +320,103 @@ class _Run:
             self.ended_empty = True
 
     def enqueue(self, page: TimelinePage) -> list[int]:
-        """Send the page's messages; returns its Tweet IDs."""
-        messages = page.messages(self.username)
+        """Land the raw page, then send its messages; returns its Tweet IDs.
+
+        The raw upload comes first: if it fails nothing is enqueued, the run fails and
+        the cursor still covers the page's range, so no Tweet is lost.
+        """
+        stamp = utc_now_iso()
+        key = None
+        if self.raw_pages is not None:
+            assert page.raw is not None  # every page from iter_timeline carries it
+            key = self.raw_pages.put(
+                username=self.username,
+                user_id=self.user_id,
+                fetched_at=stamp,
+                page_no=self.pages,
+                page=page.raw,
+            )
+        self.quarantine_items(page, key, stamp)
+        messages = page.messages(self.username, fetched_at=stamp, raw_key=key)
         self.tweets += len(messages)
+
+        def reject(body: str, error: str) -> None:
+            self.put_quarantine("message", json.loads(body), error, key, stamp)
+
         # Every body is encoded (and size-checked) before anything is sent, so an
         # over-limit Tweet fails the page with nothing enqueued and the cursor unmoved.
-        for chunk in _chunk_bodies(_encode(messages)):
-            _send_batch(self.sqs, self.queue_url, chunk, self.sleep)
-            self.enqueued += len(chunk)
-        return [int(t.id) for t in page.tweets]
+        self.enqueued += send_messages(
+            self.sqs,
+            self.queue_url,
+            messages,
+            self.sleep,
+            reject if self.quarantine is not None else None,
+        )
+        # A quarantined Tweet's ID counts as seen: it is preserved, so the cursor
+        # may move past it and later runs don't fetch it again.
+        return page.cursor_ids()
+
+    def put_quarantine(
+        self, kind: str, item: Any, error: str, raw_key: str | None, stamp: str
+    ) -> None:
+        if self.quarantine is None:
+            raise QuarantineUnavailableError(
+                f"a {kind} needs quarantining ({error}) but no quarantine bucket is "
+                "configured; the page is left unfetched"
+            )
+        self.quarantine.put(
+            kind=kind,
+            item=item,
+            error=error,
+            raw_key=raw_key,
+            user_id=self.user_id,
+            fetched_at=stamp,
+            page_no=self.pages,
+        )
+
+    def quarantine_items(
+        self, page: TimelinePage, raw_key: str | None, stamp: str
+    ) -> None:
+        """Write the page's unparseable items to quarantine. A failed write fails the
+        page (nothing enqueued, cursor unmoved): an item is never dropped."""
+        for q in page.quarantined:
+            self.put_quarantine(q.kind, q.item, q.error, raw_key, stamp)
 
     def commit(self, seen: Sequence[int], gaps: Iterable[Gap]) -> None:
         """Persist the cursor: ``newest_id`` never drops, ``gaps`` replace the list
         (merged, so overlapping ranges collapse)."""
         newest = max([int(self.state.newest_id or 0), *seen])
-        new = CheckpointState(
-            newest_id=str(newest) if newest else None,
-            gaps=merge_gaps(gaps),
+        self.save(
+            replace(
+                self.state,
+                newest_id=str(newest) if newest else None,
+                gaps=merge_gaps(gaps),
+            )
+        )
+
+    def save(self, new: CheckpointState) -> None:
+        """Write ``new`` as the next version (with the run's user ID), or raise
+        ``_StateConflict``."""
+        new = replace(
+            new,
             version=self.state.version + 1,
+            user_id=self.user_id,
+            user_id_resolved_at=self.user_id_resolved_at,
         )
         if not self.checkpoints.save(
             self.username, new, expected_version=self.state.version
         ):
             raise _StateConflict
         self.state = new
+
+    def remember_user(self) -> None:
+        """Store the run's user ID and when it was confirmed, if that is news. Every
+        other save carries them too; this one covers runs that save nothing else."""
+        if (self.state.user_id, self.state.user_id_resolved_at) != (
+            self.user_id,
+            self.user_id_resolved_at,
+        ):
+            self.save(self.state)
 
     def fetch_new(self, since_id: TweetId | None, budget: int) -> None:
         """Phase 1: Tweets newer than ``since_id``, newest first.
@@ -365,7 +532,13 @@ class _Run:
                 continue
             try:
                 self.fill_gap(gap, budget)
-            except RateLimitError, AuthError, _StateConflict:
+            except (
+                RateLimitError,
+                AuthError,
+                AccessError,
+                NotFoundError,
+                _StateConflict,
+            ):
                 raise  # every other gap would fail the same way
             except Exception as exc:
                 logger.warning(
@@ -385,6 +558,12 @@ class _Run:
             since_id=gap.since_id, until_id=gap.until_id, budget=budget
         ):
             ids = self.enqueue(page)
+            if page.quarantined and not ids and not page.next_token:
+                # Only Tweets without a usable ID, on the last page: they are kept in
+                # raw/ and quarantine/, so the range is done (else it never closes).
+                data = True
+                self.commit([], others)
+                continue
             if not ids:  # an empty page pointing onward: nothing learned
                 continue
             # Data came back, so the range is alive: reset the empty-response count.
@@ -448,6 +627,32 @@ def _anchored(backfill: Gap | None, newest_id: TweetId | None) -> Gap | None:
     return replace(backfill, until_id=str(until))
 
 
+def _check_identity(
+    username: str, expected: str | None, found: str, source: str = "stored"
+) -> None:
+    """Raise ``IdentityChangedError`` if ``found`` differs from the ``expected`` user
+    ID (``source`` says where that came from: the state item or the event)."""
+    if expected is not None and expected != found:
+        logger.error(IDENTITY_CHANGED_MESSAGE, username, source, expected, found)
+        raise IdentityChangedError(
+            IDENTITY_CHANGED_MESSAGE % (username, source, expected, found)
+        )
+
+
+def _is_fresh(state: CheckpointState, moment: datetime, ttl: timedelta) -> bool:
+    """Whether the stored user ID was confirmed less than ``ttl`` ago (a timestamp in
+    the future does not count)."""
+    if state.user_id is None or state.user_id_resolved_at is None:
+        return False
+    try:
+        resolved = datetime.fromisoformat(state.user_id_resolved_at)
+    except ValueError:
+        return False  # unreadable: look it up again
+    if resolved.tzinfo is None:
+        return False
+    return timedelta(0) <= moment - resolved < ttl
+
+
 def run_fetch(
     *,
     username: str,
@@ -459,6 +664,10 @@ def run_fetch(
     max_pages: int,
     since_id: str | None = None,
     backfill: Gap | None = None,
+    raw_pages: RawPageStore | None = None,
+    quarantine: QuarantineStore | None = None,
+    user_id: str | None = None,
+    user_id_ttl: timedelta = DEFAULT_USER_ID_TTL,
     sleep: Callable[[float], None] = time.sleep,
     now: Callable[[], datetime] = lambda: datetime.now(UTC),
 ) -> FetchResult:
@@ -472,22 +681,53 @@ def run_fetch(
     oldest gap). A 429 ends the run cleanly (``stopped_reason="rate_limited"``) after
     saving; other errors propagate, with progress up to the last full page saved. An
     error in one gap is raised only after the remaining gaps have had their turn.
-    ``now`` is the clock used to age out empty gaps.
+    ``now`` is the clock used to age out empty gaps and the stored user ID. With
+    ``raw_pages`` every page (empty ones that point onward included) is written to
+    S3 before its messages are enqueued, and each message carries the object's key
+    as ``raw_key``. With ``quarantine`` a Tweet or media object that fails to parse
+    (and a message SQS rejects with ``SenderFault``) is written there and the rest of
+    the page goes on; without it such a page fails, so nothing is dropped.
+
+    The user ID is stored with the state and reused for ``user_id_ttl``; it is looked
+    up again when missing, expired, or when the timeline reports the user not found.
+    ``user_id`` (e.g. from the event) is an assertion, not a source: it must equal the
+    stored ID, and when nothing is stored the handle is looked up and must resolve to
+    it. Only a lookup sets ``user_id_resolved_at``. Whenever the ID found differs from
+    the stored or asserted one, ``IdentityChangedError`` is raised before anything is
+    ingested or saved.
     """
     username = normalize_username(username)
-    user_id = x_client.get_user_id(username)
+    state = checkpoints.load(username)
+    moment = now()
+    resolved_at = _iso(moment)
+    cached = False
+    asserted = user_id
+    if asserted is not None:
+        _check_identity(username, state.user_id, asserted)  # stored vs the event
+    if _is_fresh(state, moment, user_id_ttl):
+        assert state.user_id is not None and state.user_id_resolved_at is not None
+        user_id, resolved_at, cached = state.user_id, state.user_id_resolved_at, True
+    else:
+        user_id = x_client.get_user_id(username)
+        _check_identity(username, state.user_id, user_id)
+        _check_identity(username, asserted, user_id, "event")
+        if state.user_id is None:
+            logger.warning(FIRST_BINDING_MESSAGE, username, user_id)
     run = _Run(
         username=username,
         user_id=user_id,
+        user_id_resolved_at=resolved_at,
         x_client=x_client,
         sqs=sqs,
         queue_url=queue_url,
         checkpoints=checkpoints,
-        state=checkpoints.load(username),
+        state=state,
         max_results=max_results,
         max_pages=max_pages,
         sleep=sleep,
         now=now,
+        raw_pages=raw_pages,
+        quarantine=quarantine,
     )
     since_id = since_id or run.state.newest_id
     stopped_reason: str | None = None
@@ -499,8 +739,17 @@ def run_fetch(
             # One request checks for new Tweets and one goes to the oldest gap, so
             # neither can starve the other even with MAX_PAGES=1.
             run.max_pages = max(max_pages, 2)
-        run.fetch_new(since_id, run.max_pages - (1 if run.pending else 0))
-        run.fill_gaps()
+        try:
+            run.fetch_new(since_id, run.max_pages - (1 if run.pending else 0))
+            run.fill_gaps()
+        except NotFoundError:
+            if not cached:
+                raise
+            # The cached ID may be stale: look the handle up again. A different ID is
+            # an identity change; the same one means the user really is gone.
+            _check_identity(username, user_id, x_client.get_user_id(username))
+            raise
+        run.remember_user()
     except RateLimitError as exc:
         logger.warning("rate limited, stopping early; progress is saved: %s", exc)
         stopped_reason = "rate_limited"
@@ -557,10 +806,21 @@ def _parse_backfill(raw: Any) -> Gap | None:
     )
 
 
+def _parse_user_id(raw: Any) -> str | None:
+    """The event's ``user_id``: a numeric ID (string or integer), optional."""
+    if raw is None:
+        return None
+    text = str(raw) if isinstance(raw, int) and not isinstance(raw, bool) else raw
+    if not isinstance(text, str) or not (text.isascii() and text.isdecimal()):
+        raise ValueError('"user_id" must be a numeric user ID')
+    return str(int(text))
+
+
 def handler(event: Any, context: Any) -> dict[str, Any]:
     settings = Settings.from_env()
-    settings.require("queue_url", "state_table")
+    settings.require("queue_url", "state_table", "media_bucket")
     assert settings.queue_url and settings.state_table  # narrowed by require()
+    assert settings.media_bucket
 
     username = event.get("username") if isinstance(event, dict) else None
     username = username or settings.username
@@ -570,11 +830,14 @@ def handler(event: Any, context: Any) -> dict[str, Any]:
         event.get("backfill") if isinstance(event, dict) else None
     )
 
+    user_id = _parse_user_id(event.get("user_id") if isinstance(event, dict) else None)
+
     token = get_bearer_token(settings)
     max_rate_limit_wait = 60.0
     if remaining_ms := getattr(context, "get_remaining_time_in_millis", None):
         max_rate_limit_wait = max(0.0, min(60.0, remaining_ms() / 1000 - 15))
 
+    raw_pages = RawPageStore(s3_client(), settings.media_bucket)
     try:
         with XClient(
             token,
@@ -591,6 +854,12 @@ def handler(event: Any, context: Any) -> dict[str, Any]:
                 max_results=settings.max_results,
                 max_pages=settings.max_pages,
                 backfill=backfill,
+                raw_pages=raw_pages,
+                quarantine=QuarantineStore(
+                    s3_client(), settings.media_bucket, run_id=raw_pages.run_id
+                ),
+                user_id=user_id,
+                user_id_ttl=timedelta(hours=settings.user_id_ttl_hours),
             )
     except AuthError:
         clear_cache()  # the token may have been rotated; re-read it next time

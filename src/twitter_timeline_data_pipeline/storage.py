@@ -21,6 +21,7 @@ import io
 import json
 import logging
 import mimetypes
+import os
 import posixpath
 import re
 import time
@@ -77,6 +78,41 @@ poster frame that can't be stored yet also makes the entry ``retrying``."""
 
 # Media is only downloaded from the X CDN; message bodies are untrusted input.
 ALLOWED_MEDIA_HOSTS = frozenset({"pbs.twimg.com", "video.twimg.com"})
+
+# TEST ONLY. Comma-separated hostnames that are also allowed, over http or https, so the
+# integration tests can serve media from a stub. template.yaml never sets it (a template
+# test enforces that), and the handlers log a WARNING when it is active.
+MEDIA_HOSTS_OVERRIDE_ENV = "MEDIA_ALLOWED_HOSTS_OVERRIDE"
+_HOSTNAME_RE = re.compile(r"[a-z0-9]([a-z0-9.-]*[a-z0-9])?")
+
+
+def media_hosts_override(environ: Mapping[str, str] | None = None) -> frozenset[str]:
+    """Extra media hosts from ``MEDIA_ALLOWED_HOSTS_OVERRIDE``; empty when unset.
+
+    Also empty, with an ERROR logged, when ``AWS_ENDPOINT_URL`` is not set: the override
+    only makes sense next to an emulated AWS, so a stray copy in a real deployment
+    (which uses the default endpoints) is ignored instead of widening the allowlist.
+
+    Raises ``ValueError`` for an entry that isn't a bare hostname (no scheme, port or
+    path), so a typo can't silently widen the allowlist.
+    """
+    env = os.environ if environ is None else environ
+    raw = env.get(MEDIA_HOSTS_OVERRIDE_ENV, "")
+    hosts = frozenset(h.strip().lower() for h in raw.split(",") if h.strip())
+    for host in hosts:
+        if not _HOSTNAME_RE.fullmatch(host):
+            raise ValueError(
+                f"{MEDIA_HOSTS_OVERRIDE_ENV}: {host!r} is not a bare hostname"
+            )
+    if hosts and not env.get("AWS_ENDPOINT_URL"):
+        logger.error(
+            "%s is set but AWS_ENDPOINT_URL is not, so this is not an emulated AWS: "
+            "ignoring the override. Remove it from this deployment.",
+            MEDIA_HOSTS_OVERRIDE_ENV,
+        )
+        return frozenset()
+    return hosts
+
 
 _KNOWN_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".gif", ".webp", ".mp4"})
 _MISSING_OBJECT_CODES = frozenset({"404", "NoSuchKey", "NotFound"})
@@ -241,7 +277,11 @@ class MediaStore:
         *,
         max_bytes: int = DEFAULT_MAX_MEDIA_BYTES,
         clock: Callable[[], float] = time.monotonic,
+        test_hosts: frozenset[str] = frozenset(),
     ) -> None:
+        """``test_hosts`` is for the integration tests only: see
+        ``media_hosts_override``."""
+        self._test_hosts = test_hosts
         self._s3 = s3_client
         self._bucket = bucket
         self._http = http_client
@@ -291,8 +331,8 @@ class MediaStore:
             "preview not stored",
         )
 
-    @staticmethod
     def _allowed_target(
+        self,
         media: Media,
         raw_url: str,
         known_type: str | None,
@@ -307,7 +347,11 @@ class MediaStore:
             host = parts.hostname
         except ValueError:  # malformed URL, e.g. an unclosed IPv6 bracket
             parts, host = None, None
-        if parts is None or parts.scheme != "https" or host not in ALLOWED_MEDIA_HOSTS:
+        allowed = parts is not None and (
+            (parts.scheme == "https" and host in ALLOWED_MEDIA_HOSTS)
+            or (parts.scheme in ("http", "https") and host in self._test_hosts)
+        )
+        if parts is None or not allowed:
             logger.warning(
                 "media %s %s: host %r is not an allowed media host",
                 media.media_key,
@@ -761,6 +805,7 @@ class TweetStore:
             "media": entries,
             "media_count": len(entries),
             "fetched_at": message.fetched_at,
+            "raw_key": message.raw_key,
             "stored_at": utc_now_iso(),
             "schema_version": message.schema_version,
         }
@@ -1095,12 +1140,16 @@ class CheckpointState:
 
     ``newest_id`` is the highest Tweet ID enqueued. ``gaps`` are ranges below it (or
     manual backfills) still to fetch. ``version`` is the optimistic-lock counter; items
-    written before gaps existed have none and count as version 0.
+    written before gaps existed have none and count as version 0. ``user_id`` is the
+    numeric ID the handle resolved to, ``user_id_resolved_at`` (ISO-8601 UTC, ``Z``)
+    when it was last confirmed; items written before they existed have neither.
     """
 
     newest_id: TweetId | None = None
     gaps: tuple[Gap, ...] = ()
     version: int = 0
+    user_id: str | None = None
+    user_id_resolved_at: str | None = None
 
 
 class CheckpointStore:
@@ -1117,10 +1166,13 @@ class CheckpointStore:
         if item is None:
             return CheckpointState()
         newest = item.get("newest_id")
+        user_id = item.get("user_id")
         return CheckpointState(
             newest_id=None if newest is None else str(int(newest)),
             gaps=tuple(Gap.from_item(g) for g in item.get("gaps", ())),
             version=int(item.get("version", 0)),
+            user_id=None if user_id is None else str(user_id),
+            user_id_resolved_at=item.get("user_id_resolved_at"),
         )
 
     def save(
@@ -1140,6 +1192,10 @@ class CheckpointStore:
         }
         if state.newest_id is not None:
             item["newest_id"] = int(state.newest_id)
+        if state.user_id is not None:
+            item["user_id"] = state.user_id
+        if state.user_id_resolved_at is not None:
+            item["user_id_resolved_at"] = state.user_id_resolved_at
         # A missing version is 0: a new item or one from before versions existed.
         condition = "version = :expected"
         if expected_version == 0:

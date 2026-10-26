@@ -102,6 +102,11 @@ def clamp_int(value: int) -> int:
     return max(-MAX_STORED_INT, min(MAX_STORED_INT, value))
 
 
+def valid_tweet_id(value: object) -> bool:
+    """Whether ``value`` is a Tweet ID: a string of ASCII decimal digits."""
+    return isinstance(value, str) and value.isascii() and value.isdecimal()
+
+
 def _opt_int(value: Any) -> int | None:
     return None if value is None else clamp_int(int(value))
 
@@ -224,7 +229,16 @@ class Tweet:
 
     @classmethod
     def from_api(cls, data: Mapping[str, Any]) -> Self:
-        """Build from an API Tweet object (media keys live under ``attachments``)."""
+        """Build from an API Tweet object (media keys live under ``attachments``).
+
+        Raises ``ValueError`` unless ``id`` is a decimal string (or a whole number):
+        an ID the cursor can't use must not get as far as the queue.
+        """
+        raw_id = data["id"]
+        if type(raw_id) is int and raw_id >= 0:
+            raw_id = str(raw_id)  # a JSON number is coerced, a float or null is not
+        if not valid_tweet_id(raw_id):
+            raise ValueError(f"not a Tweet ID: {raw_id!r}")
         attachments = data.get("attachments") or {}
         # X is renaming the field (the docs and OpenAPI spec show ``note_post``).
         note = data.get("note_tweet") or data.get("note_post") or {}
@@ -283,9 +297,16 @@ class TweetMessage:
     missing_media_keys: tuple[MediaKey, ...] = ()
     fetched_at: str = field(default_factory=utc_now_iso)
     schema_version: int = SCHEMA_VERSION
+    raw_key: str | None = None
+    """S3 key of the raw API page this Tweet came from (lineage). Additive and
+    optional: omitted from the body when None, so an old reader never sees it and a
+    message from an older fetcher parses with None."""
 
     def to_dict(self) -> JSONObject:
-        return asdict(self)
+        data = asdict(self)
+        if data["raw_key"] is None:
+            del data["raw_key"]
+        return data
 
     def to_json(self) -> str:
         # UTF-8, escaping only what SQS rejects or UTF-8 can't encode. Escaping every
@@ -309,6 +330,7 @@ class TweetMessage:
             ),
             fetched_at=normalize_fetched_at(data["fetched_at"]),
             schema_version=version,
+            raw_key=_opt_str(data.get("raw_key")),
         )
 
     @classmethod
@@ -420,6 +442,28 @@ class MediaRetry:
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class RawPage:
+    """The request and the unparsed response body of one timeline page, as landed in
+    S3. ``params`` never holds credentials (the token is a header, not a parameter)."""
+
+    endpoint: str
+    params: Mapping[str, str | int]
+    body: JSONObject
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class QuarantinedItem:
+    """A Tweet or media object of an API page that could not be parsed. ``item`` is
+    the JSON exactly as received; ``tweet_id`` is its ``id`` when it has a usable one,
+    so the cursor can still move past it."""
+
+    kind: str  # "tweet" | "media"
+    item: Any
+    error: str
+    tweet_id: TweetId | None = None
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class TimelinePage:
     """One page of ``GET /2/users/:id/tweets`` with its media expansion resolved."""
 
@@ -428,9 +472,39 @@ class TimelinePage:
     newest_id: TweetId | None = None
     oldest_id: TweetId | None = None
     next_token: str | None = None
+    raw: RawPage | None = field(default=None, compare=False, repr=False)
+    """The response this page was parsed from; None for a page built by hand."""
+    quarantined: tuple[QuarantinedItem, ...] = ()
+    """Items of the page that failed to parse. They are not in ``tweets``/``media``."""
+
+    def cursor_ids(self) -> list[int]:
+        """The Tweet IDs the cursor may treat as seen: the parsed Tweets, plus the IDs
+        of quarantined ones that lie within the page's own ID range (the parsed Tweets
+        and ``meta.oldest_id``/``newest_id``). A bad Tweet's ``id`` is untrusted: one
+        outside that range could skip real Tweets or push ``newest_id`` past them, so
+        it counts as having no ID."""
+        ids = [int(t.id) for t in self.tweets]
+        bounds = [
+            int(i)
+            for i in (self.oldest_id, self.newest_id)
+            if i is not None and valid_tweet_id(i)  # meta is untrusted too
+        ]
+        span = [*ids, *bounds]
+        if span:
+            low, high = min(span), max(span)
+            ids += [
+                int(q.tweet_id)
+                for q in self.quarantined
+                if q.tweet_id and low <= int(q.tweet_id) <= high
+            ]
+        return ids
 
     def messages(
-        self, username: str, *, fetched_at: str | None = None
+        self,
+        username: str,
+        *,
+        fetched_at: str | None = None,
+        raw_key: str | None = None,
     ) -> list[TweetMessage]:
         """One message per Tweet, each carrying the media its ``media_keys`` name.
 
@@ -457,6 +531,7 @@ class TimelinePage:
                     media=tuple(media),
                     missing_media_keys=tuple(missing),
                     fetched_at=stamp,
+                    raw_key=raw_key,
                 )
             )
         return messages

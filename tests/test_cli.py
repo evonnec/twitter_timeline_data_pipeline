@@ -317,7 +317,7 @@ def test_malformed_upstream_data_exits_one(
         response = stub(request)
         if request.url.path.endswith("/tweets"):
             body = response.json()
-            body["data"][0]["public_metrics"]["like_count"] = "n/a"
+            body["data"] = "n/a"
             return httpx.Response(200, json=body)
         return response
 
@@ -326,7 +326,7 @@ def test_malformed_upstream_data_exits_one(
     code = main([*FETCH, "--dry-run"])
 
     assert code == EXIT_FAILURE
-    assert "n/a" in capsys.readouterr().err
+    assert "non-list data" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize(
@@ -443,3 +443,233 @@ def test_dry_run_normalizes_the_username(
     assert {m.username for m in dry_run_lines(capsys.readouterr().out)} == {
         "example_user"
     }
+
+
+# ---- raw pages and replay --------------------------------------------------------
+
+RAW = "s3://test-media-bucket/raw/"
+
+
+def queue_depth(aws: Aws) -> int:
+    attrs = aws.sqs.get_queue_attributes(
+        QueueUrl=aws.queue_url, AttributeNames=["ApproximateNumberOfMessages"]
+    )["Attributes"]
+    return int(attrs["ApproximateNumberOfMessages"])
+
+
+def raw_keys(aws: Aws) -> list[str]:
+    listing = aws.s3.list_objects_v2(Bucket=aws.bucket, Prefix="raw/")
+    return [o["Key"] for o in listing.get("Contents", [])]
+
+
+def test_fetch_lands_raw_pages_when_the_bucket_is_set(
+    pipeline_env: Aws, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    install_x_api(monkeypatch, cli, XApiStub())
+
+    assert main(FETCH) == EXIT_OK
+
+    assert len(raw_keys(pipeline_env)) == 2
+
+
+def test_fetch_without_a_bucket_is_a_usage_error_and_moves_nothing(
+    pipeline_env: Aws,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    api = XApiStub()
+    install_x_api(monkeypatch, cli, api)
+    monkeypatch.delenv("MEDIA_BUCKET")
+
+    assert main(FETCH) == EXIT_USAGE
+
+    assert "MEDIA_BUCKET" in capsys.readouterr().err
+    assert api.requests == []
+    assert (
+        CheckpointStore(pipeline_env.state_table).load("example_user").newest_id is None
+    )
+
+
+def test_no_raw_is_an_explicit_opt_out(
+    pipeline_env: Aws,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    install_x_api(monkeypatch, cli, XApiStub())
+    monkeypatch.delenv("MEDIA_BUCKET")
+
+    with caplog.at_level(logging.WARNING):
+        assert main([*FETCH, "--no-raw"]) == EXIT_OK
+
+    assert raw_keys(pipeline_env) == []
+    assert "will not be landed" in caplog.text
+
+
+def test_fetch_dry_run_writes_no_raw_pages(
+    pipeline_env: Aws, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    install_x_api(monkeypatch, cli, XApiStub())
+
+    assert main([*FETCH, "--dry-run"]) == EXIT_OK
+
+    assert raw_keys(pipeline_env) == []
+
+
+def test_replay_dry_run_prints_the_messages_the_fetch_built(
+    pipeline_env: Aws,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    install_x_api(monkeypatch, cli, XApiStub())
+    main(FETCH)
+    capsys.readouterr()
+    sent = [
+        m["Body"]
+        for m in pipeline_env.sqs.receive_message(
+            QueueUrl=pipeline_env.queue_url, MaxNumberOfMessages=10
+        )["Messages"]
+    ]
+    monkeypatch.setattr(cli, "XClient", None)  # replay must not build an API client
+
+    assert main(["replay", "--raw", RAW, "--dry-run"]) == EXIT_OK
+
+    captured = capsys.readouterr()
+    lines = captured.out.splitlines()
+    assert len(lines) == 7
+    messages = dry_run_lines(captured.out)
+    assert all(m.raw_key and m.raw_key.startswith("raw/") for m in messages)
+    assert len(sent) == 7
+    assert sorted(sent) == sorted(lines)  # same bodies, fetched_at included
+    summary = json.loads(captured.err.splitlines()[-1])
+    assert (summary["objects"], summary["tweets"], summary["enqueued"]) == (2, 7, 0)
+
+
+def test_replay_enqueues_and_never_touches_the_cursor(
+    pipeline_env: Aws,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    install_x_api(monkeypatch, cli, XApiStub())
+    main(FETCH)
+    capsys.readouterr()
+    before = CheckpointStore(pipeline_env.state_table).load("example_user")
+    depth = queue_depth(pipeline_env)
+
+    assert main(["replay", "--raw", f"{RAW}{USER_ID}/"]) == EXIT_OK
+
+    summary = json.loads(capsys.readouterr().out)
+    assert (summary["objects"], summary["tweets"], summary["enqueued"]) == (2, 7, 7)
+    assert queue_depth(pipeline_env) == depth + 7
+    assert CheckpointStore(pipeline_env.state_table).load("example_user") == before
+
+
+@pytest.mark.parametrize("uri", ["s3://b/media/", "http://b/raw/", "nonsense"])
+def test_replay_with_a_bad_uri_is_a_usage_error(
+    uri: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert main(["replay", "--raw", uri, "--dry-run"]) == EXIT_USAGE
+
+    assert "expected s3://" in capsys.readouterr().err
+
+
+def test_replay_without_a_queue_is_a_usage_error(
+    pipeline_env: Aws,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.delenv("QUEUE_URL")
+
+    assert main(["replay", "--raw", RAW]) == EXIT_USAGE
+
+    assert "QUEUE_URL" in capsys.readouterr().err
+
+
+def test_replay_of_a_corrupt_object_fails_at_runtime(
+    pipeline_env: Aws, capsys: pytest.CaptureFixture[str]
+) -> None:
+    pipeline_env.s3.put_object(Bucket=pipeline_env.bucket, Key="raw/1/x", Body=b"junk")
+
+    assert main(["replay", "--raw", RAW, "--dry-run"]) == EXIT_FAILURE
+
+    assert "raw/1/x" in capsys.readouterr().err
+
+
+def test_replay_from_a_missing_bucket_fails_at_runtime(
+    pipeline_env: Aws, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert (
+        main(["replay", "--raw", "s3://nope-bucket/raw/", "--dry-run"]) == EXIT_FAILURE
+    )
+
+    assert "NoSuchBucket" in capsys.readouterr().err
+
+
+def test_replay_with_nothing_under_the_prefix_fails(
+    pipeline_env: Aws, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code = main(["replay", "--raw", f"{RAW}nobody/", "--dry-run"])
+
+    assert code == EXIT_FAILURE
+    assert "no raw pages found" in capsys.readouterr().err
+
+
+def test_replay_prefix_matches_whole_path_segments(
+    pipeline_env: Aws, capsys: pytest.CaptureFixture[str]
+) -> None:
+    pipeline_env.s3.put_object(Bucket=pipeline_env.bucket, Key="raw/10/x", Body=b"junk")
+
+    # "raw/1" must not select raw/10/x (which would fail as a corrupt object)
+    assert main(["replay", "--raw", "s3://test-media-bucket/raw/1", "--dry-run"]) == (
+        EXIT_FAILURE
+    )
+
+    assert "no raw pages found under s3://test-media-bucket/raw/1/" in (
+        capsys.readouterr().err
+    )
+
+
+def test_replay_skips_folder_markers_and_resumes_after_a_key(
+    pipeline_env: Aws,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    install_x_api(monkeypatch, cli, XApiStub())
+    main(FETCH)
+    pipeline_env.s3.put_object(Bucket=pipeline_env.bucket, Key="raw/0/", Body=b"")
+    first, second = raw_keys(pipeline_env)[1:]  # [0] is the marker
+    capsys.readouterr()
+
+    assert main(["replay", "--raw", RAW, "--dry-run"]) == EXIT_OK
+    whole = json.loads(capsys.readouterr().err.splitlines()[-1])
+    assert whole["skipped"] == ["raw/0/"]
+    assert (whole["objects"], whole["last_key"]) == (2, second)
+
+    assert main(["replay", "--raw", RAW, "--dry-run", "--start-after", first]) == (
+        EXIT_OK
+    )
+    resumed = capsys.readouterr()
+    assert json.loads(resumed.err.splitlines()[-1])["objects"] == 1
+    assert len(resumed.out.splitlines()) == 2  # the second page's two Tweets
+
+
+def test_replay_of_a_page_with_a_bad_fetched_at_enqueues_nothing(
+    pipeline_env: Aws, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from twitter_timeline_data_pipeline.raw import Envelope
+
+    envelope = Envelope(
+        username="u",
+        user_id="1",
+        fetched_at="not a time",
+        request={},
+        response={"data": [{"id": "5", "text": "t"}]},
+    )
+    pipeline_env.s3.put_object(
+        Bucket=pipeline_env.bucket, Key="raw/1/x.json.gz", Body=envelope.to_bytes()
+    )
+    depth = queue_depth(pipeline_env)
+
+    assert main(["replay", "--raw", RAW]) == EXIT_FAILURE
+
+    assert "raw/1/x.json.gz" in capsys.readouterr().err
+    assert queue_depth(pipeline_env) == depth
