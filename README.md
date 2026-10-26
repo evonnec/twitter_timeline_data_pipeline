@@ -117,7 +117,7 @@ You can regenerate it with `TweetMessage(...).to_json()` from `twitter_timeline_
 | `stored_at` | S | when the item was written |
 | `schema_version` | N | |
 
-Each `media` entry has `media_key`, `type`, `status` (`stored` and `exists` for files in S3, `unavailable` or `skipped`) and, when known, `s3_key`, `content_type`, `source_url` and `size_bytes`.
+Each `media` entry has `media_key`, `type`, `status` (`stored` and `exists` for files in S3; otherwise `unavailable`, `skipped`, `too_large` or `failed`, see below) and, when known, `s3_key`, `content_type`, `source_url` and `size_bytes`. Statuses without a file in S3: `unavailable` (the source answered 4xx other than 429, or redirected), `skipped` (nothing to download: HLS-only video, or a URL that isn't https on an X media host), `too_large` (over `MAX_MEDIA_BYTES`; `size_bytes` is the estimate or the byte count where the download was stopped) and `failed` (transient errors persisted through the message's last receive, so the Tweet was written without the file).
 
 ### State table (`StateTable`)
 
@@ -139,7 +139,7 @@ Each object has the `Content-Type` of the source and user metadata `tweet-id`, `
 
 - **`GET /2/users/:id/tweets`.** It returns an account's own Tweets and works with an app-only bearer token (the home timeline endpoint needs user-context OAuth). One request returns up to 100 Tweets with their media expanded, instead of one lookup per Tweet, which keeps API usage low.
 - **At-least-once, with repeatable writes.** SQS can deliver a message twice, and a failed fetch run is re-run from the old checkpoint. Tweets are written with `PutItem` keyed by `tweet_id`, so a repeat overwrites the same item. Writes are last-write-wins, not conditional: a stale redelivery (for example a DLQ redrive of an old message) overwrites newer data such as `public_metrics`. Media keys are deterministic and existing objects are not downloaded again.
-- **Checkpoint after enqueue.** If a run fails midway, the next run re-sends some Tweets (harmless duplicates) rather than losing any. Loss and delay cases are listed under limitations: the page-cap gap loses Tweets, and a batch that fails repeatedly (for example a media timeout) ends in the DLQ without its metadata being written.
+- **Checkpoint after enqueue.** If a run fails midway, the next run re-sends some Tweets (harmless duplicates) rather than losing any. Loss and delay cases are listed under limitations: the page-cap gap loses Tweets, and a record that was never started before its last receive ends in the DLQ without its metadata. A media download that keeps failing no longer does: on the last receive the Tweet is written with that media marked `failed`.
 - **Overlapping fetch runs are harmless.** The fetch function has no reserved concurrency. The checkpoint write is conditional, so it never moves backwards, and duplicate messages are handled by idempotent processing.
 - **Partial batch responses, DLQ and alarms.** `ProcessFunction` returns the IDs of failed records, so one bad message does not retry the other nine. Transient media errors (timeouts, 429, 5xx) fail the record for retry. Malformed messages and unexpected errors fail it too and end up in the DLQ after 5 receives (kept 14 days). Alarms cover a non-empty DLQ, fetch errors (1 hour window) and whole-invocation process errors (5 minute window). Because of partial batch responses, a failed record is not a Lambda `Errors` datapoint, so the DLQ alarm is the signal for record-level failures. DLQ messages expire after 14 days. Set `AlarmTopicArn` to get notified through SNS.
 - **Streaming uploads.** Media is downloaded only over https from `pbs.twimg.com` and `video.twimg.com` (message bodies are treated as untrusted), redirects are not followed, and the file is streamed from the CDN straight into S3 `upload_fileobj` through a small file-like adapter, so a large video is never held in memory.
@@ -260,8 +260,10 @@ Other options: `--max-pages`, `--max-results` (5 to 100), `--since-id` and `--lo
 | `MAX_PAGES` | fetch | `5` | Maximum pages per run, at least 1 |
 | `X_API_BASE_URL` | fetch | `https://api.x.com/2` | API base URL, for testing against a stub |
 | `HTTP_TIMEOUT_SECONDS` | both | `10` | Timeout for API and media HTTP requests, must be above 0 |
+| `MAX_MEDIA_BYTES` | process | `536870912` (512 MiB) | Largest media file stored, must be above 0 |
+| `MAX_RECEIVE_COUNT` | process | none | The queue's `maxReceiveCount`; on a message's last receive its failing media are recorded as `failed` instead of retried. Unset disables this. At least 1 |
 
-Blank values count as unset. The template sets everything except `TWITTER_BEARER_TOKEN`, `X_API_BASE_URL` and `HTTP_TIMEOUT_SECONDS`.
+Blank values count as unset. The template sets everything except `TWITTER_BEARER_TOKEN`, `X_API_BASE_URL` and `HTTP_TIMEOUT_SECONDS`. It sets `MAX_MEDIA_BYTES` and `MAX_RECEIVE_COUNT` from the `MaxMediaBytes` and `MaxReceiveCount` parameters.
 
 ## Deploying
 
@@ -309,6 +311,8 @@ Extra arguments are passed to `sam deploy`, for example `scripts/deploy.sh --reg
 | `ScheduleEnabled` | `true` | Set to `false` to disable the schedule rule |
 | `MaxPages` | `5` | Maximum timeline pages per run |
 | `MaxResults` | `100` | Tweets per page (5 to 100) |
+| `MaxMediaBytes` | `536870912` | Largest media file stored, in bytes; bigger ones are recorded as `too_large` |
+| `MaxReceiveCount` | `5` | Receives before a message moves to the DLQ; also tells the process function which receive is the last |
 | `LogLevel` | `INFO` | Lambda application log level (`DEBUG`, `INFO`, `WARN`, `ERROR`); logs are JSON. SDK and HTTP library loggers stay at WARNING regardless |
 | `AlarmTopicArn` | empty | Optional SNS topic notified by the alarms |
 
@@ -434,7 +438,7 @@ The script reads the table and bucket names from the stack outputs, runs `sam de
 - X API access now requires a paid plan. Billing is currently pay-per-use, charged per post read, and rate limits depend on the plan; check current pricing before deploying. Cost scales with Tweets read per run, which is bounded by `MaxPages x MaxResults` and multiplied by the schedule frequency, so lower `MaxPages` or run less often to spend less.
 - The first run backfills at most `MAX_PAGES x MAX_RESULTS` Tweets (500 by default). The API itself only exposes an account's 3,200 most recent Tweets (800 with `exclude=replies`).
 - Tweets can be lost in the page-cap case: if a run reaches the page cap while a checkpoint is set, Tweets older than those fetched but newer than the checkpoint are skipped, and a warning is logged. Raise `MaxPages` or run more often.
-- Large videos have no size or time budget yet. A batch that times out is retried and can end up in the DLQ, and the Tweets in it have no metadata stored until it is redriven. DLQ messages expire after 14 days, after which they are gone.
+- Media downloads are bounded. A file over `MaxMediaBytes` is recorded as `too_large`, judged before downloading from a video's `bit_rate x duration_ms` or the response `Content-Length`, or while streaming from the bytes counted; nothing is left in S3 and the Tweet is still stored. The function also watches the invocation's remaining time. It stops starting records once under 20 s remain (room for one stalled read, finishing or aborting an upload, and the DynamoDB write) and returns the rest in `batchItemFailures`, so only those are retried. Each download gets the time left minus that margin and fails as a transient error when it runs out; the upload is aborted. On a message's last receive (`MaxReceiveCount`) a media failure no longer fails the record: the Tweet is written with that media marked `failed` and the file is not retried. Limits: a record that was never started on its last receive still goes to the DLQ without metadata, and `BatchSize` stays at 10, so one slow download delays the nine records behind it until the next invocation; lower `BatchSize` (keeping it within the visibility timeout rule) for media-heavy accounts.
 - A media key that is missing from the response's `includes` (deleted or withheld media) is dropped with a warning, so the Tweet is stored without that media entry.
 - Writes are last-write-wins: a stale redelivery or DLQ redrive overwrites a newer item.
 - Edited Tweets get a new ID and are stored as new items; the old ones remain. `edit_history_tweet_ids` links them.

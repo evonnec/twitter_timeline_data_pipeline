@@ -13,7 +13,8 @@ import io
 import logging
 import mimetypes
 import posixpath
-from collections.abc import Buffer, Iterator, Sequence
+import time
+from collections.abc import Buffer, Callable, Iterator, Sequence
 from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, Any, Literal, cast, override
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -21,6 +22,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 import httpx
 from botocore.exceptions import ClientError
 
+from twitter_timeline_data_pipeline.config import DEFAULT_MAX_MEDIA_BYTES
 from twitter_timeline_data_pipeline.models import (
     Media,
     TweetId,
@@ -34,10 +36,15 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-type MediaStatus = Literal["stored", "exists", "unavailable", "skipped"]
+type MediaStatus = Literal[
+    "stored", "exists", "unavailable", "skipped", "too_large", "failed"
+]
 """stored: uploaded now. exists: already in S3. unavailable: the source returned a
 4xx other than 429 (or a redirect, which isn't followed). skipped: nothing to download:
-a video with only an HLS variant, or a URL that isn't https on an allowed media host."""
+a video with only an HLS variant, or a URL that isn't https on an allowed media host.
+too_large: over the size cap, by estimate or by counted bytes; ``size_bytes`` holds the
+estimate or the count at abort, and nothing is in S3. failed: transient errors outlasted
+the record's last SQS receive, so the Tweet was written without this media."""
 
 # Media is only downloaded from the X CDN; message bodies are untrusted input.
 ALLOWED_MEDIA_HOSTS = frozenset({"pbs.twimg.com", "video.twimg.com"})
@@ -48,6 +55,14 @@ _MISSING_OBJECT_CODES = frozenset({"404", "NoSuchKey", "NotFound"})
 
 class TransientMediaError(RuntimeError):
     """A media download failed in a way a retry may fix (timeout, 429, 5xx)."""
+
+
+class _MediaTooLarge(Exception):
+    """The body passed the size cap while streaming; ``size`` is the count so far."""
+
+    def __init__(self, size: int) -> None:
+        super().__init__(size)
+        self.size = size
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -64,11 +79,23 @@ class StoredMedia:
 class _IterReader(io.RawIOBase):
     """File-like view of a byte iterator, so S3 can stream it without buffering.
 
-    Counts the bytes handed out in ``size``.
+    Counts the bytes handed out in ``size``. Raises ``_MediaTooLarge`` when the next
+    chunk would pass ``max_bytes`` and ``TransientMediaError`` once ``clock()`` reaches
+    ``deadline``. Raising from here makes the S3 transfer abort its multipart upload.
     """
 
-    def __init__(self, chunks: Iterator[bytes]) -> None:
+    def __init__(
+        self,
+        chunks: Iterator[bytes],
+        *,
+        max_bytes: int | None = None,
+        deadline: float | None = None,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
         self._chunks = chunks
+        self._max_bytes = max_bytes
+        self._deadline = deadline
+        self._clock = clock
         self._pending = memoryview(b"")
         self.size = 0
 
@@ -80,9 +107,13 @@ class _IterReader(io.RawIOBase):
     def readinto(self, buffer: Buffer) -> int:
         view = memoryview(buffer).cast("B")
         while not self._pending:
+            if self._deadline is not None and self._clock() >= self._deadline:
+                raise TransientMediaError("download passed its time budget")
             chunk = next(self._chunks, None)
             if chunk is None:
                 return 0
+            if self._max_bytes is not None and self.size + len(chunk) > self._max_bytes:
+                raise _MediaTooLarge(self.size + len(chunk))
             self._pending = memoryview(chunk)
         n = min(len(view), len(self._pending))
         view[:n] = self._pending[:n]
@@ -113,15 +144,33 @@ def _extension(content_type: str | None, url: str) -> str:
     return suffix if suffix in _KNOWN_EXTENSIONS else ""
 
 
+def _estimated_size(media: Media, url: str) -> int | None:
+    """Bytes implied by the chosen variant's ``bit_rate`` and the media's duration."""
+    if media.type not in ("video", "animated_gif") or not media.duration_ms:
+        return None
+    for variant in media.variants:
+        if variant.url == url and variant.bit_rate:
+            return variant.bit_rate * media.duration_ms // 8000
+    return None
+
+
 class MediaStore:
     """Streams media files from the X CDN into S3."""
 
     def __init__(
-        self, s3_client: S3Client, bucket: str, http_client: httpx.Client
+        self,
+        s3_client: S3Client,
+        bucket: str,
+        http_client: httpx.Client,
+        *,
+        max_bytes: int = DEFAULT_MAX_MEDIA_BYTES,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._s3 = s3_client
         self._bucket = bucket
         self._http = http_client
+        self._max_bytes = max_bytes
+        self._clock = clock
 
     @staticmethod
     def object_key(message: TweetMessage, media: Media, extension: str) -> str:
@@ -133,12 +182,21 @@ class MediaStore:
         owner = message.tweet.author_id or message.username.lower()
         return f"media/{owner}/{message.tweet.id}/{media.media_key}{extension}"
 
-    def store(self, message: TweetMessage, media: Media) -> StoredMedia:
+    def store(
+        self,
+        message: TweetMessage,
+        media: Media,
+        *,
+        budget_s: float | None = None,
+    ) -> StoredMedia:
         """Upload one media item unless it's already stored.
 
-        Raises ``TransientMediaError`` for failures worth retrying; returns status
-        ``unavailable`` for permanent ones so the Tweet is still recorded.
+        Raises ``TransientMediaError`` for failures worth retrying, including a
+        download that outlasts ``budget_s`` seconds; returns status ``unavailable``
+        for permanent ones and ``too_large`` for files over the size cap, so the Tweet
+        is still recorded.
         """
+        deadline = None if budget_s is None else self._clock() + budget_s
         source = media.download_source()
         if source is None:
             return StoredMedia(
@@ -184,6 +242,14 @@ class MediaStore:
                 size_bytes=head.get("ContentLength"),
             )
 
+        # Skip before opening a connection when the message already says it's too big.
+        estimate = _estimated_size(media, raw_url)
+        if estimate is not None and estimate > self._max_bytes:
+            logger.warning(
+                "media %s too large: estimated %d bytes", media.media_key, estimate
+            )
+            return result("too_large", size_bytes=estimate)
+
         try:
             # Redirects stay off so a media host can't bounce the download elsewhere.
             with self._http.stream("GET", url, follow_redirects=False) as response:
@@ -200,7 +266,20 @@ class MediaStore:
                     or response.headers.get("content-type", "").split(";")[0].strip()
                     or "application/octet-stream"
                 )
-                reader = _IterReader(response.iter_bytes())
+                declared = response.headers.get("content-length", "")
+                if declared.isdigit() and int(declared) > self._max_bytes:
+                    logger.warning(
+                        "media %s too large: Content-Length %s",
+                        media.media_key,
+                        declared,
+                    )
+                    return result("too_large", size_bytes=int(declared))
+                reader = _IterReader(
+                    response.iter_bytes(),
+                    max_bytes=self._max_bytes,
+                    deadline=deadline,
+                    clock=self._clock,
+                )
                 self._s3.upload_fileobj(
                     io.BufferedReader(reader),
                     self._bucket,
@@ -214,6 +293,11 @@ class MediaStore:
                         },
                     },
                 )
+        except _MediaTooLarge as exc:
+            logger.warning(
+                "media %s too large: stopped at %d bytes", media.media_key, exc.size
+            )
+            return result("too_large", size_bytes=exc.size)
         except httpx.TransportError as exc:  # includes timeouts
             raise TransientMediaError(f"{type(exc).__name__} fetching {url}") from exc
         return result(

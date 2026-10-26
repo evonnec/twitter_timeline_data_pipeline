@@ -1,4 +1,5 @@
 import io
+from collections.abc import Iterator
 from typing import Any, cast
 from urllib.parse import urlsplit
 
@@ -29,6 +30,7 @@ from twitter_timeline_data_pipeline.storage import (
     TweetStore,
     _extension,
     _IterReader,
+    _MediaTooLarge,
     _original_size_url,
 )
 
@@ -618,3 +620,201 @@ def test_checkpoint_advance_reraises_other_dynamodb_errors(aws: Aws) -> None:
 
     with pytest.raises(ClientError):
         store.advance("example_user", "1")
+
+
+# ---- size cap and time budget ------------------------------------------------
+
+
+class FakeClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def leftover_uploads(aws: Aws) -> list[Any]:
+    uploads = aws.s3.list_multipart_uploads(Bucket=aws.bucket).get("Uploads", [])
+    return list(uploads)
+
+
+def keys_in_bucket(aws: Aws) -> list[str]:
+    contents = aws.s3.list_objects_v2(Bucket=aws.bucket).get("Contents", [])
+    return [o["Key"] for o in contents if "Key" in o]
+
+
+def streaming_cdn(url: str, chunks: Iterator[bytes], **headers: str) -> CdnStub:
+    cdn = CdnStub()
+    cdn.responses[url] = lambda: httpx.Response(
+        200, content=chunks, headers={"Content-Type": "video/mp4", **headers}
+    )
+    return cdn
+
+
+def sized_video(bit_rate: int | None, duration_ms: int | None) -> Media:
+    return Media.from_dict(
+        {
+            "media_key": "7_1",
+            "type": "video",
+            "duration_ms": duration_ms,
+            "variants": [
+                {
+                    "content_type": "video/mp4",
+                    "bit_rate": bit_rate,
+                    "url": VIDEO_HI_URL,
+                },
+                {"content_type": "video/mp4", "bit_rate": 0, "url": GIF_URL},
+            ],
+        }
+    )
+
+
+def test_iter_reader_raises_once_the_next_chunk_passes_the_cap() -> None:
+    reader = _IterReader(iter([b"abcd", b"efgh", b"ijkl"]), max_bytes=10)
+    buffered = io.BufferedReader(reader, buffer_size=4)
+
+    with pytest.raises(_MediaTooLarge) as info:
+        buffered.read()
+
+    assert info.value.size == 12
+
+
+def test_iter_reader_allows_exactly_the_cap() -> None:
+    reader = _IterReader(iter([b"abcd", b"efgh", b"ij"]), max_bytes=10)
+
+    assert io.BufferedReader(reader, buffer_size=4).read() == b"abcdefghij"
+
+
+def test_iter_reader_raises_transient_error_at_the_deadline() -> None:
+    clock = FakeClock()
+
+    def chunks() -> Iterator[bytes]:
+        for _ in range(5):
+            clock.now += 3
+            yield b"x" * 10
+
+    reader = _IterReader(chunks(), deadline=7, clock=clock)
+
+    with pytest.raises(TransientMediaError, match="time budget"):
+        io.BufferedReader(reader, buffer_size=10).read()
+
+    assert reader.size == 30  # the chunk that crossed the deadline was handed out
+
+
+def test_store_aborts_a_small_stream_past_the_cap(aws: Aws) -> None:
+    chunks = iter([b"x" * 512] * 100)
+    cdn = streaming_cdn(VIDEO_HI_URL, chunks)
+    item = video()
+    store = MediaStore(aws.s3, aws.bucket, cdn.client(), max_bytes=1000)
+
+    stored = store.store(make_message(media=(item,)), item)
+
+    assert stored.status == "too_large"
+    assert stored.size_bytes == 1024  # the second chunk passed the cap
+    assert stored.s3_key is None
+    assert keys_in_bucket(aws) == []
+    assert leftover_uploads(aws) == []
+    assert len(list(chunks)) == 98  # the rest of the body was never read
+
+
+def test_store_aborts_a_multipart_upload_past_the_cap(aws: Aws) -> None:
+    chunk = b"\x00" * 65536
+    cdn = streaming_cdn(VIDEO_HI_URL, iter([chunk] * 192))  # 12 MiB, past 9 MiB
+    item = video()
+    store = MediaStore(aws.s3, aws.bucket, cdn.client(), max_bytes=9 * 1024 * 1024)
+
+    stored = store.store(make_message(media=(item,)), item)
+
+    assert stored.status == "too_large"
+    assert stored.size_bytes == 9 * 1024 * 1024 + 65536
+    assert keys_in_bucket(aws) == []
+    assert leftover_uploads(aws) == []
+
+
+def test_store_skips_on_the_bit_rate_estimate_without_a_request(aws: Aws) -> None:
+    cdn = CdnStub()
+    item = sized_video(bit_rate=8_000_000, duration_ms=10_000)  # 10 MB
+    store = MediaStore(aws.s3, aws.bucket, cdn.client(), max_bytes=1_000_000)
+
+    stored = store.store(make_message(media=(item,)), item)
+
+    assert stored.status == "too_large"
+    assert stored.size_bytes == 10_000_000
+    assert stored.source_url == VIDEO_HI_URL
+    assert cdn.requests == []
+    assert keys_in_bucket(aws) == []
+
+
+@pytest.mark.parametrize(
+    ("bit_rate", "duration_ms"),
+    [(None, 10_000), (8_000_000, None), (0, 10_000), (800_000, 10_000)],
+)
+def test_store_downloads_when_there_is_no_usable_estimate_or_it_fits(
+    aws: Aws, bit_rate: int | None, duration_ms: int | None
+) -> None:
+    cdn = CdnStub()
+    cdn.serve(VIDEO_HI_URL, b"mp4", "video/mp4")
+    item = sized_video(bit_rate, duration_ms)
+    store = MediaStore(aws.s3, aws.bucket, cdn.client(), max_bytes=1_000_000)
+
+    assert store.store(make_message(media=(item,)), item).status == "stored"
+
+
+def test_store_estimate_ignores_other_variants_and_photos(aws: Aws) -> None:
+    cdn = CdnStub()
+    cdn.serve(PHOTO_URL, b"jpg", "image/jpeg")
+    store = MediaStore(aws.s3, aws.bucket, cdn.client(), max_bytes=10)
+    photo_item = Media.from_dict(
+        {"media_key": "3_1", "type": "photo", "url": PHOTO_URL, "duration_ms": 10**9}
+    )
+
+    stored = store.store(make_message(media=(photo_item,)), photo_item)
+
+    assert stored.status == "stored"
+
+
+def test_store_skips_on_content_length_without_reading_the_body(aws: Aws) -> None:
+    def never_read() -> Iterator[bytes]:
+        raise AssertionError("the body must not be downloaded")
+        yield b""
+
+    cdn = streaming_cdn(VIDEO_HI_URL, never_read(), **{"Content-Length": "2000"})
+    item = video()
+    store = MediaStore(aws.s3, aws.bucket, cdn.client(), max_bytes=1000)
+
+    stored = store.store(make_message(media=(item,)), item)
+
+    assert stored.status == "too_large"
+    assert stored.size_bytes == 2000
+    assert keys_in_bucket(aws) == []
+    assert leftover_uploads(aws) == []
+
+
+def test_store_accepts_a_body_exactly_at_the_cap(aws: Aws) -> None:
+    cdn = CdnStub()
+    cdn.serve(PHOTO_URL, b"x" * 100, "image/jpeg")
+    store = MediaStore(aws.s3, aws.bucket, cdn.client(), max_bytes=100)
+
+    stored = store.store(make_message(media=(PHOTO,)), PHOTO)
+
+    assert (stored.status, stored.size_bytes) == ("stored", 100)
+
+
+def test_store_slow_download_hits_its_deadline_and_leaves_nothing(aws: Aws) -> None:
+    clock = FakeClock()
+
+    def slow() -> Iterator[bytes]:
+        for _ in range(200):
+            clock.now += 1
+            yield b"\x00" * 65536
+
+    cdn = streaming_cdn(VIDEO_HI_URL, slow())
+    item = video()
+    store = MediaStore(aws.s3, aws.bucket, cdn.client(), clock=clock)
+
+    with pytest.raises(TransientMediaError, match="time budget"):
+        store.store(make_message(media=(item,)), item, budget_s=10)
+
+    assert keys_in_bucket(aws) == []
+    assert leftover_uploads(aws) == []
+    assert clock.now == 10  # stopped as soon as the deadline was reached

@@ -1,12 +1,14 @@
 """Process Lambda: SQS -> Tweet metadata in DynamoDB, media in S3.
 
 Uses the SQS partial batch response: only records that failed are retried, and after
-``maxReceiveCount`` receives they land in the DLQ.
+``maxReceiveCount`` receives they land in the DLQ. A timed-out invocation returns no
+partial response and would retry the whole batch, so the work is bounded by the time
+the invocation has left.
 """
 
 import functools
 import logging
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from typing import TYPE_CHECKING, Any
 
 import boto3
@@ -27,24 +29,79 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Time kept back from the invocation. A download can overrun its deadline by one httpx
+# read timeout (10 s by default) before the stalled read returns, and finishing the
+# multipart upload (or aborting it) and writing the DynamoDB item need a few more
+# seconds. 20 s covers both, and leaves 100 s of the 120 s timeout for downloads.
+SAFETY_MARGIN_MS = 20_000
+
+
+def _receive_count(record: Mapping[str, Any]) -> int:
+    try:
+        return int(record["attributes"]["ApproximateReceiveCount"])
+    except KeyError, TypeError, ValueError:
+        return 0
+
 
 def process_records(
     records: Iterable[Mapping[str, Any]],
     *,
     media_store: MediaStore,
     tweet_store: TweetStore,
+    remaining_ms: Callable[[], int] | None = None,
+    max_receive_count: int | None = None,
 ) -> list[str]:
-    """Process SQS records; return the ``messageId`` of each one that failed."""
+    """Process SQS records; return the ``messageId`` of each one that failed.
+
+    With ``remaining_ms`` (Lambda's ``get_remaining_time_in_millis``), a record isn't
+    started once less than ``SAFETY_MARGIN_MS`` is left: it and every later record are
+    returned as failed untouched, so the invocation ends before its timeout and SQS
+    retries only those. With ``max_receive_count``, a record on its last receive has
+    its transiently failing media recorded as ``failed`` and its Tweet written anyway,
+    since a failed record would go to the DLQ without its metadata.
+    """
+    pending = list(records)
     failed: list[str] = []
-    for record in records:
+    for index, record in enumerate(pending):
+        if remaining_ms is not None and remaining_ms() < SAFETY_MARGIN_MS:
+            unstarted = [r["messageId"] for r in pending[index:]]
+            logger.warning(
+                "out of time: %d records left for retry: %s", len(unstarted), unstarted
+            )
+            failed.extend(unstarted)
+            break
         message_id = record["messageId"]
+        last_receive = (
+            max_receive_count is not None
+            and _receive_count(record) >= max_receive_count
+        )
         try:
             message = TweetMessage.from_json(record["body"])
             # Media first: a transient failure must leave no metadata that points at
             # media that isn't there.
-            stored: list[StoredMedia] = [
-                media_store.store(message, m) for m in message.media
-            ]
+            stored: list[StoredMedia] = []
+            for m in message.media:
+                try:
+                    budget_s = (
+                        None
+                        if remaining_ms is None
+                        else (remaining_ms() - SAFETY_MARGIN_MS) / 1000
+                    )
+                    if budget_s is not None and budget_s <= 0:
+                        raise TransientMediaError("no time left to download")
+                    stored.append(media_store.store(message, m, budget_s=budget_s))
+                except TransientMediaError as exc:
+                    if not last_receive:
+                        raise
+                    logger.error(
+                        "message %s media %s failed on its last receive: %s",
+                        message_id,
+                        m.media_key,
+                        exc,
+                    )
+                    stored.append(
+                        StoredMedia(media_key=m.media_key, type=m.type, status="failed")
+                    )
             tweet_store.put_tweet(message, stored)
         except MessageError:
             logger.exception("message %s is malformed", message_id)
@@ -90,8 +147,13 @@ def handler(event: Any, context: Any) -> dict[str, list[dict[str, str]]]:
     failed = process_records(
         event["Records"],
         media_store=MediaStore(
-            _s3_client(), settings.media_bucket, _http_client(settings.http_timeout)
+            _s3_client(),
+            settings.media_bucket,
+            _http_client(settings.http_timeout),
+            max_bytes=settings.max_media_bytes,
         ),
         tweet_store=_tweet_store(settings.tweets_table),
+        remaining_ms=getattr(context, "get_remaining_time_in_millis", None),
+        max_receive_count=settings.max_receive_count,
     )
     return {"batchItemFailures": [{"itemIdentifier": i} for i in failed]}

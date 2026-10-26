@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Self
 
 DEFAULT_X_API_BASE_URL = "https://api.x.com/2"
+DEFAULT_MAX_MEDIA_BYTES = 512 * 1024 * 1024
 
 # Settings attribute -> environment variable, also used in error messages.
 ENV_VARS: Mapping[str, str] = {
@@ -20,6 +21,8 @@ ENV_VARS: Mapping[str, str] = {
     "max_pages": "MAX_PAGES",
     "x_api_base_url": "X_API_BASE_URL",
     "http_timeout": "HTTP_TIMEOUT_SECONDS",
+    "max_media_bytes": "MAX_MEDIA_BYTES",
+    "max_receive_count": "MAX_RECEIVE_COUNT",
 }
 
 
@@ -46,6 +49,12 @@ class Settings:
     """Upper bound on pages per fetch run, to stay inside rate limits."""
     x_api_base_url: str = DEFAULT_X_API_BASE_URL
     http_timeout: float = 10.0
+    max_media_bytes: int = DEFAULT_MAX_MEDIA_BYTES
+    """Largest media file the process Lambda stores; bigger ones are recorded as
+    ``too_large`` without a copy in S3."""
+    max_receive_count: int | None = None
+    """The queue's ``maxReceiveCount``. On a record's last receive its media
+    failures are recorded instead of retried. None disables that."""
 
     def __post_init__(self) -> None:
         if not 5 <= self.max_results <= 100:
@@ -59,6 +68,15 @@ class Settings:
         if self.http_timeout <= 0:
             raise ConfigError(
                 f"{ENV_VARS['http_timeout']} must be > 0, got {self.http_timeout}"
+            )
+        if self.max_media_bytes <= 0:
+            raise ConfigError(
+                f"{ENV_VARS['max_media_bytes']} must be > 0, got {self.max_media_bytes}"
+            )
+        if self.max_receive_count is not None and self.max_receive_count < 1:
+            raise ConfigError(
+                f"{ENV_VARS['max_receive_count']} must be >= 1, "
+                f"got {self.max_receive_count}"
             )
 
     @classmethod
@@ -96,6 +114,12 @@ class Settings:
             max_pages=get_number("max_pages", int, 5),
             x_api_base_url=get("x_api_base_url") or DEFAULT_X_API_BASE_URL,
             http_timeout=get_number("http_timeout", float, 10.0),
+            max_media_bytes=get_number("max_media_bytes", int, DEFAULT_MAX_MEDIA_BYTES),
+            max_receive_count=(
+                None
+                if get("max_receive_count") is None
+                else get_number("max_receive_count", int, 1)
+            ),
         )
 
     def require(self, *attrs: str) -> None:

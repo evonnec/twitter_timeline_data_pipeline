@@ -30,6 +30,18 @@ Parameters:
     MinValue: 5
     MaxValue: 100
     Description: Tweets per API page.
+  MaxMediaBytes:
+    Type: Number
+    Default: 536870912  # 512 MiB
+    MinValue: 1
+    Description: Largest media file stored; bigger ones are recorded as too_large.
+  MaxReceiveCount:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    Description: >-
+      Receives before a message moves to the dead-letter queue. On the last one the
+      Tweet is written even if its media keeps failing.
   LogLevel:
     Type: String
     Default: INFO
@@ -179,7 +191,7 @@ Resources:
       VisibilityTimeout: 730
       RedrivePolicy:
         deadLetterTargetArn: !GetAtt TweetsDeadLetterQueue.Arn
-        maxReceiveCount: 5
+        maxReceiveCount: !Ref MaxReceiveCount
 
   # --- Log groups ------------------------------------------------------------
   FetchFunctionLogGroup:
@@ -245,6 +257,8 @@ Resources:
         Variables:
           TWEETS_TABLE: !Ref TweetsTable
           MEDIA_BUCKET: !Ref MediaBucket
+          MAX_MEDIA_BYTES: !Ref MaxMediaBytes
+          MAX_RECEIVE_COUNT: !Ref MaxReceiveCount
       Policies:
         - DynamoDBWritePolicy:
             TableName: !Ref TweetsTable
