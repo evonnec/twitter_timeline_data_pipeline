@@ -12,6 +12,7 @@ from cfnlint.api import lint_all  # type: ignore[import-untyped]
 from cfnlint.decode import cfn_yaml  # type: ignore[import-untyped]
 
 from twitter_timeline_data_pipeline.config import ENV_VARS
+from twitter_timeline_data_pipeline.storage import MEDIA_HOSTS_OVERRIDE_ENV
 
 ROOT = Path(__file__).parent.parent
 TEMPLATE = ROOT / "template.yaml"
@@ -582,3 +583,11 @@ def test_media_retry_function_has_an_errors_alarm(template: Template) -> None:
         alarm["AlarmActions"]
         == properties(template, "ProcessFunctionErrorsAlarm")["AlarmActions"]
     )
+
+
+def test_no_function_sets_the_test_only_media_host_override(template: Template) -> None:
+    for name, props in functions(template).items():
+        assert MEDIA_HOSTS_OVERRIDE_ENV not in props.get("Environment", {}).get(
+            "Variables", {}
+        ), name
+    assert MEDIA_HOSTS_OVERRIDE_ENV not in TEMPLATE.read_text()

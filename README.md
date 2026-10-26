@@ -259,6 +259,9 @@ Each object has the `Content-Type` of the source and user metadata `tweet-id`, `
 ├── scripts/
 │   ├── build_lambda.sh                build build/lambda/ for Python 3.14 on arm64
 │   ├── deploy.sh                      build, then sam deploy
+│   ├── integration_test.sh            run the integration tests with Docker (see below)
+│   ├── check_iam.sh                   offline IAM policy check of the template
+│   ├── expand_sam_template.py         expand the SAM transform (used by check_iam.sh)
 │   ├── put_secret.sh                  store the bearer token in Secrets Manager
 │   └── delete.sh                      delete the stack
 ├── src/twitter_timeline_data_pipeline/
@@ -273,6 +276,8 @@ Each object has the `Content-Type` of the source and user metadata `tweet-id`, `
 │       ├── process.py                 ProcessFunction handler
 │       └── media_retry.py             MediaRetryFunction handler
 └── tests/                             moto-mocked tests, no AWS account needed
+    ├── system/                        in-process simulation of the event source mapping and DLQ
+    └── integration/                   built bundle in the Lambda runtime image, with LocalStack
 ```
 
 ## Local development
@@ -298,9 +303,10 @@ uv build                     # build the sdist and wheel into dist/
 | Format | `ruff format --check` |
 | Type check | `mypy` (strict) |
 | Test | `pytest` with coverage on Python 3.14 and 3.15; 3.15 shows readiness for the next Lambda runtime. JUnit and coverage reports are uploaded as artifacts |
-| Validate template | `cfn-lint template.yaml` and `shellcheck scripts/*.sh` |
+| Validate template | `cfn-lint template.yaml`, `shellcheck scripts/*.sh`, and the offline IAM check (`scripts/check_iam.sh`; see [IAM policy validation](#iam-policy-validation)) |
 | Build | After all of the above: `uv build`, a smoke test of the wheel in an isolated environment (import, `--help`, `--version`), and the Lambda bundle zipped as `twitter_timeline_data_pipeline-<version>-lambda-arm64.zip` |
-| GitHub Release | On `v*` tags only: checks the tag, then creates the release |
+| Integration | After Build: runs the Lambda zip that Build produced in the real Lambda runtime image against LocalStack (see [Integration tests](#integration-tests)) |
+| GitHub Release | On `v*` tags only, after Build and Integration: checks the tag, then creates the release |
 
 ### Cutting a release
 
@@ -325,6 +331,66 @@ This repository is private, and publishing to PyPI would make the package public
 1. On PyPI, add a trusted publisher for this repository with workflow `ci.yml` and environment `pypi`.
 2. Create the `pypi` environment in the repository settings, ideally limited to `v*` tags with required reviewers.
 3. Set the repository variable `PUBLISH_TO_PYPI` to `true`.
+
+## Integration tests
+
+The unit tests and the in-process simulation in `tests/system/` import the source tree. The integration tests run the **built Lambda bundle** (`build/lambda/`, the same files as the release zip) in the real Lambda runtime image, so a missing dependency, a wrong-platform wheel or a bad handler path fails before a deploy does.
+
+**What runs where**
+
+- Each of the three functions runs the unzipped bundle in `public.ecr.aws/lambda/python:3.14` for `linux/arm64`, through the image's built-in Runtime Interface Emulator, and is invoked over its HTTP API. On an amd64 host (the CI runner) the image runs under QEMU.
+- [LocalStack](https://github.com/localstack/localstack) (pinned to `4.14.0`) provides SQS, S3, DynamoDB and Secrets Manager. The functions reach it through `AWS_ENDPOINT_URL`.
+- `tests/integration/stub_server.py` (standard library only) stands in for the X API and the media CDN. It needs the bearer token, so the fetch function really reads it from Secrets Manager.
+- The tests (`tests/integration/`) assert that fetched Tweets land in DynamoDB and their media in S3 (and that a media file that is gone at the source is recorded as `unavailable`), that a second fetch uses the saved checkpoint, that a poison message is received `maxReceiveCount` times and then sits in the dead-letter queue, and that in a mixed batch only the failing record is redelivered (the partial batch response).
+
+**What is emulated, and how it differs from a deployment**
+
+- The tables, bucket, queues and secret are created from the properties in `template.yaml` (key schemas, indexes, versioning, message sizes, and each function's `Environment` block with every `!Ref` resolved), not by deploying the template: LocalStack's community edition has no Python 3.14 Lambda runtime. If a function gains an environment variable that the harness cannot resolve, the run fails instead of silently going without it.
+- Queue visibility timeouts are 2 seconds and `maxReceiveCount` is 3, so the poison-message test takes seconds. The poller in `tests/integration/esm.py` plays the Lambda event source mapping: it receives a batch, invokes the function with the SQS event shape, and deletes only the records not listed in `batchItemFailures`. The visibility timeout, receive counts and the move to the dead-letter queue are LocalStack's SQS. What the real mapping adds (scaling, batching window, `MaximumConcurrency`) is not emulated.
+- Encryption, point-in-time recovery, lifecycle rules, IAM, alarms, tracing and the schedule are not emulated. The media-retry function is checked only for starting and handling an empty batch here; its behaviour is covered by `tests/system/`.
+- The process function may download only from `pbs.twimg.com` and `video.twimg.com`. The stub is on another host, so the tests set the test-only variable `MEDIA_ALLOWED_HOSTS_OVERRIDE` (comma-separated bare hostnames, also allowed over plain http). The functions log a `WARNING` when it is active, and a template test fails if any function sets it. Never set it on a real deployment.
+
+**Running locally**
+
+You need Docker, `curl`, `python3` and uv. On a non-arm64 host, enable arm64 emulation once: `docker run --privileged --rm tonistiigi/binfmt --install arm64`.
+
+```bash
+scripts/build_lambda.sh             # or unzip a CI "lambda" artifact into build/lambda/
+scripts/integration_test.sh         # start everything, run the tests, clean up; logs print on failure
+
+# or step by step, to iterate on the tests against a running stack:
+scripts/integration_test.sh up
+scripts/integration_test.sh test
+scripts/integration_test.sh logs
+scripts/integration_test.sh down
+```
+
+The first run pulls two images, and the arm64 image under emulation starts slowly. The integration tests are not collected by a plain `uv run pytest`; the script sets `RUN_INTEGRATION=1` and the `IT_*` variables the fixtures read. LocalStack releases after `4.14.0` require an account auth token: set `LOCALSTACK_AUTH_TOKEN` (the CI job passes the repository secret of that name through when it exists) and change `LOCALSTACK_IMAGE` if you move to a newer release.
+
+**In CI**
+
+The `integration` job downloads the `lambda` artifact that the Build job uploaded, unzips it, sets up QEMU, and runs `scripts/integration_test.sh up`, then `test`, then (on failure) `logs`, and always `down`. Each is a separate step, so a failure names the stage. The arm64 hosted runners are not assumed to exist for a private repository; if they are available, the QEMU step can be dropped.
+
+### IAM policy validation
+
+IAM Access Analyzer's `validate-policy` is the authoritative check, but it needs AWS credentials, which CI does not have. CI instead runs `scripts/check_iam.sh` in the template job: it expands the SAM transform offline (so the `Policies` shorthand becomes real IAM roles) and runs [checkov](https://www.checkov.io/)'s IAM checks on the result (wildcard actions and resources, admin access, privilege escalation, data exfiltration, credentials exposure, permissions management, trust policies). Any finding fails the job. To accept one, add its ID to `WAIVED` in the script with the reason beside it; there are none today.
+
+To run Access Analyzer by hand, with credentials, against a deployed stack (the policies then have literal ARNs, which the template's `!Sub` and `!GetAtt` values are not):
+
+```bash
+STACK=twitter-timeline-pipeline
+for role in $(aws cloudformation describe-stack-resources --stack-name "$STACK" \
+    --query "StackResources[?ResourceType=='AWS::IAM::Role'].PhysicalResourceId" --output text); do
+  for policy in $(aws iam list-role-policies --role-name "$role" --query PolicyNames --output text); do
+    echo "== $role / $policy"
+    aws iam get-role-policy --role-name "$role" --policy-name "$policy" \
+      --query PolicyDocument --output json > "/tmp/$policy.json"
+    aws accessanalyzer validate-policy --policy-type IDENTITY_POLICY \
+      --policy-document "file:///tmp/$policy.json" \
+      --query 'findings[].[findingType,issueCode,findingDetails]' --output text
+  done
+done
+```
 
 ## Running locally
 
@@ -355,11 +421,12 @@ Other options: `--max-pages`, `--max-results` (5 to 100), `--since-id` and `--lo
 | `USER_ID_TTL_HOURS` | fetch | `24` | Hours a stored user ID is reused before the handle is looked up again; 0 looks it up on every run, at most 8760. Set from the `UserIdTtlHours` parameter |
 | `X_API_BASE_URL` | fetch | `https://api.x.com/2` | API base URL, for testing against a stub |
 | `HTTP_TIMEOUT_SECONDS` | both | `10` | Timeout for API and media HTTP requests, must be above 0 |
+| `MEDIA_ALLOWED_HOSTS_OVERRIDE` | process, media-retry | none | Test only: extra media hosts (comma-separated bare hostnames, http allowed). Logs a warning; the template never sets it |
 | `MAX_MEDIA_BYTES` | process, media-retry | `536870912` (512 MiB) | Largest media file stored, must be above 0 |
 | `MAX_RECEIVE_COUNT` | process | none | The queue's `maxReceiveCount`; on a message's last receive its failing media are recorded as `retrying` and queued for the media-retry function instead of failing the record. Unset disables this. At least 1 |
 | `MEDIA_RETRY_QUEUE_URL` | process | none | URL of the media-retry queue |
 
-Blank values count as unset. The template sets everything except `TWITTER_BEARER_TOKEN`, `X_API_BASE_URL` and `HTTP_TIMEOUT_SECONDS`. It sets `MAX_MEDIA_BYTES` and `MAX_RECEIVE_COUNT` from the `MaxMediaBytes` and `MaxReceiveCount` parameters.
+Blank values count as unset. The template sets everything except `TWITTER_BEARER_TOKEN`, `X_API_BASE_URL`, `HTTP_TIMEOUT_SECONDS` and `MEDIA_ALLOWED_HOSTS_OVERRIDE`. It sets `MAX_MEDIA_BYTES` and `MAX_RECEIVE_COUNT` from the `MaxMediaBytes` and `MaxReceiveCount` parameters.
 
 ## Deploying
 
