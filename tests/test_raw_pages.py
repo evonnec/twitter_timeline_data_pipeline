@@ -385,3 +385,223 @@ def test_replay_of_a_response_that_cannot_be_parsed_names_the_key(aws: Aws) -> N
 
     with pytest.raises(RawPageError, match=r"raw/1/x\.json\.gz"):
         run_replay(s3=aws.s3, bucket=BUCKET, prefix="raw/", send=len)
+
+
+# ---- hardening ---------------------------------------------------------------------
+
+
+def test_a_raw_page_is_never_overwritten(aws: Aws) -> None:
+    pages = store(aws)
+    api = XApiStub()
+    run(aws, api, FakeSqs(), pages)
+    original = aws.s3.get_object(Bucket=BUCKET, Key=keys(aws)[0])["Body"].read()
+    page = envelope_at(aws, keys(aws)[0])
+    from twitter_timeline_data_pipeline.models import RawPage
+
+    # the same key again (a retry of the same page) is treated as already landed
+    pages.put(
+        username=USERNAME,
+        user_id=USER_ID,
+        fetched_at="2026-10-26T00:00:00Z",
+        page_no=1,
+        page=RawPage(endpoint="/x", params={}, body={"other": 1}),
+    )
+    assert page.response  # sanity
+    versions = aws.s3.list_object_versions(Bucket=BUCKET, Prefix="raw/")["Versions"]
+    assert len(versions) == 2  # nothing added for the existing key
+    assert aws.s3.get_object(Bucket=BUCKET, Key=keys(aws)[0])["Body"].read() == original
+
+
+def test_other_upload_errors_propagate(aws: Aws) -> None:
+    from twitter_timeline_data_pipeline.models import RawPage
+
+    with pytest.raises(ClientError, match="NoSuchBucket"):
+        RawPageStore(aws.s3, "nope-bucket").put(
+            username="u",
+            user_id="1",
+            fetched_at=STAMP,
+            page_no=1,
+            page=RawPage(endpoint="/x", params={}, body={}),
+        )
+
+
+def test_upload_failure_in_the_gap_phase_enqueues_nothing_for_that_page(
+    aws: Aws,
+) -> None:
+    sqs = FakeSqs()
+
+    with pytest.raises(ClientError):
+        run(
+            aws,
+            XApiStub(),
+            sqs,
+            RawPageStore(aws.s3, "nope-bucket"),
+            since_id="1700000000000000005",  # nothing new: only the gap phase fetches
+            backfill=Gap(until_id="1700000000000000005"),
+        )
+
+    assert sqs.calls == []
+    state = CheckpointStore(aws.state_table).load(USERNAME)
+    assert state.gaps  # the range is still owed
+
+
+def test_page_the_parser_rejects_is_landed_before_the_run_fails(
+    aws: Aws, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from twitter_timeline_data_pipeline import x_api
+
+    def broken(body: Any, *, raw: Any = None) -> Any:
+        raise ValueError("cannot parse")
+
+    monkeypatch.setattr(x_api, "parse_timeline_page", broken)
+    sqs = FakeSqs()
+
+    with pytest.raises(x_api.PageParseError, match="cannot parse"):
+        run(aws, XApiStub(), sqs, store(aws))
+
+    (key,) = keys(aws)
+    assert envelope_at(aws, key).response["data"]
+    assert sqs.calls == []
+    assert CheckpointStore(aws.state_table).load(USERNAME).newest_id is None
+
+
+def test_unparseable_page_without_a_store_just_fails(
+    aws: Aws, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from twitter_timeline_data_pipeline import x_api
+
+    def broken(body: Any, *, raw: Any = None) -> Any:
+        raise ValueError("cannot parse")
+
+    monkeypatch.setattr(x_api, "parse_timeline_page", broken)
+
+    with pytest.raises(x_api.PageParseError):
+        run(aws, XApiStub(), FakeSqs(), None)
+
+    assert keys(aws) == []
+
+
+def test_enqueue_failure_then_refetch_leaves_duplicate_pages_and_replay_is_newest(
+    aws: Aws, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Raw landed, enqueue fails, the next run fetches the page again: two raw objects
+    hold the same Tweets. Replaying both ends with the newest fetch's data."""
+    stamps = iter(["2026-10-25T08:00:00Z", "2026-10-25T09:00:00Z"] * 4)
+    monkeypatch.setattr(fetch, "utc_now_iso", lambda: next(stamps))
+    failing = FakeSqs(lambda _call, entry_ids: set(entry_ids))
+    with pytest.raises(fetch.EnqueueError):
+        run(aws, XApiStub(), failing, RawPageStore(aws.s3, BUCKET, run_id="a"))
+    good = FakeSqs()
+    run(aws, XApiStub(), good, RawPageStore(aws.s3, BUCKET, run_id="b"))
+    assert len(keys(aws)) == 3  # page 1 of run a, and both pages of run b
+
+    replayed = FakeSqs()
+    run_replay(
+        s3=aws.s3,
+        bucket=BUCKET,
+        prefix="raw/",
+        send=lambda ms: send_messages(
+            replayed.client, aws.queue_url, ms, lambda _s: None
+        ),
+    )
+    by_tweet: dict[str, str] = {}
+    for body in bodies(replayed):  # key order: run a, then run b
+        message = TweetMessage.from_json(body)
+        by_tweet[message.tweet.id] = max(
+            by_tweet.get(message.tweet.id, ""), message.fetched_at
+        )
+    newest = {TweetMessage.from_json(b).fetched_at for b in bodies(good)}
+    assert len(by_tweet) == 7
+    # every replayed Tweet's newest copy is as new as the fetch that succeeded
+    assert set(by_tweet.values()) <= {*newest, "2026-10-25T08:00:00Z"}
+    assert max(by_tweet.values()) == max(newest)
+    # the duplicate copies carry different fetched_at, so the conditional write in the
+    # processor keeps the newest whichever order they arrive in
+
+
+def test_redactions_round_trip_and_are_omitted_when_empty() -> None:
+    plain = Envelope(
+        username="u", user_id="1", fetched_at=STAMP, request={}, response={}
+    )
+    redacted = Envelope(
+        username="u",
+        user_id="1",
+        fetched_at=STAMP,
+        request={},
+        response={},
+        redactions=("5",),
+    )
+
+    assert "redactions" not in plain.to_dict()
+    assert Envelope.from_bytes(redacted.to_bytes()).redactions == ("5",)
+
+
+@pytest.mark.parametrize("bad", ["5", [5], {"a": 1}])
+def test_malformed_redactions_are_rejected(bad: Any) -> None:
+    data = Envelope(
+        username="u", user_id="1", fetched_at=STAMP, request={}, response={}
+    ).to_dict()
+    data["redactions"] = bad
+
+    with pytest.raises(RawPageError):
+        Envelope.from_bytes(gzip.compress(json.dumps(data).encode()))
+
+
+def test_replay_skips_redacted_tweets_and_their_media(aws: Aws) -> None:
+    body = json.loads((FIXTURES / "timeline_page1.json").read_text())
+    with_media = next(
+        t for t in body["data"] if t.get("attachments", {}).get("media_keys")
+    )
+    other = next(t for t in body["data"] if t["id"] != with_media["id"])
+    envelope = Envelope(
+        username=USERNAME,
+        user_id=USER_ID,
+        fetched_at=STAMP,
+        request={},
+        response=body,
+        redactions=(with_media["id"], "999"),
+    )
+    aws.s3.put_object(Bucket=BUCKET, Key="raw/1/x.json.gz", Body=envelope.to_bytes())
+    seen: list[list[TweetMessage]] = []
+
+    def collect(messages: list[TweetMessage]) -> int:
+        seen.append(messages)
+        return 0
+
+    run_replay(s3=aws.s3, bucket=BUCKET, prefix="raw/", send=collect)
+
+    ids = {m.tweet.id for m in seen[0]}
+    assert with_media["id"] not in ids
+    assert other["id"] in ids
+    assert len(ids) == len(body["data"]) - 1
+    dropped_keys = set(with_media["attachments"]["media_keys"])
+    assert not dropped_keys & {m.media_key for msg in seen[0] for m in msg.media}
+
+
+def test_folder_markers_are_skipped_and_reported(aws: Aws) -> None:
+    aws.s3.put_object(Bucket=BUCKET, Key="raw/1/", Body=b"")
+    skipped: list[str] = []
+
+    found = list(iter_raw_objects(aws.s3, BUCKET, "raw/", skipped=skipped))
+
+    assert found == []
+    assert skipped == ["raw/1/"]
+    assert list(iter_raw_objects(aws.s3, BUCKET, "raw/")) == []  # no list needed
+
+
+def test_start_after_resumes_the_listing(aws: Aws) -> None:
+    for i in range(4):
+        aws.s3.put_object(Bucket=BUCKET, Key=f"raw/1/{i}", Body=b"x")
+
+    found = [
+        k
+        for k, _ in iter_raw_objects(
+            aws.s3, BUCKET, "raw/1/", start_after="raw/1/1", page_size=1
+        )
+    ]
+
+    assert found == ["raw/1/2", "raw/1/3"]
+
+
+def test_replay_uri_gets_a_trailing_slash() -> None:
+    assert parse_s3_uri("s3://b/raw/1") == ("b", "raw/1/")

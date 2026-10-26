@@ -604,17 +604,30 @@ def test_fetch_function_gets_the_bucket_name(template: Template) -> None:
     assert env_of(template, "FetchFunction")["MEDIA_BUCKET"] == {"Ref": "MediaBucket"}
 
 
-def test_raw_pages_are_archived_and_never_expire(template: Template) -> None:
+def test_no_lifecycle_rule_can_reach_raw_pages(template: Template) -> None:
     rules = properties(template, "MediaBucket")["LifecycleConfiguration"]["Rules"]
-    (rule,) = (r for r in rules if r["Id"] == "archive-raw-pages")
+    acting = {
+        "ExpirationInDays",
+        "ExpirationDate",
+        "ExpiredObjectDeleteMarker",
+        "NoncurrentVersionExpiration",
+        "NoncurrentVersionTransitions",
+        "Transitions",
+    }
 
-    assert rule["Status"] == "Enabled"
-    assert rule["Prefix"] == "raw/"
-    assert rule["Transitions"] == [
-        {"StorageClass": "GLACIER_IR", "TransitionInDays": 90}
+    for rule in rules:
+        if acting & rule.keys():
+            # every expiring or transitioning rule names its (non-raw) prefix
+            assert rule.get("Prefix") in {"media/", "text/"}, rule["Id"]
+    noncurrent = {r["Prefix"] for r in rules if "NoncurrentVersionExpiration" in r}
+    assert noncurrent == {"media/", "text/"}
+
+
+def test_process_function_cannot_write_raw_pages(template: Template) -> None:
+    statements = policy_statements(template, "ProcessFunction")
+    (objects,) = (s for s in statements if "s3:PutObject" in _as_list(s["Action"]))
+
+    assert objects["Resource"] == [
+        {"Fn::Sub": "${MediaBucket.Arn}/media/*"},
+        {"Fn::Sub": "${MediaBucket.Arn}/text/*"},
     ]
-    expiring = {"ExpirationInDays", "ExpirationDate", "ExpiredObjectDeleteMarker"}
-    assert not expiring & rule.keys()
-    # no rule expires current objects, bucket-wide or otherwise
-    for other in rules:
-        assert not expiring & other.keys(), other["Id"]

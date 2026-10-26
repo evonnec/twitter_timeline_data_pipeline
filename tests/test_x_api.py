@@ -754,3 +754,18 @@ def test_long_post_is_parsed_with_its_full_text() -> None:
     assert tweet.text.endswith("https://t.co/FakeLong1")
     assert tweet.full_text == tweet.note_text
     assert len(tweet.note_text) > 280
+
+
+def test_unparseable_page_raises_an_error_carrying_the_raw_page() -> None:
+    body = {"data": [{"text": "no id"}], "meta": {"result_count": 1}}
+
+    def api(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=body)
+
+    with x_client(api) as client, pytest.raises(x_api.PageParseError) as info:
+        list(client.iter_timeline(USER_ID))
+
+    assert info.value.raw.body == body
+    assert info.value.raw.endpoint == f"/users/{USER_ID}/tweets"
+    assert info.value.status_code == 200
+    assert isinstance(info.value, XApiError)
