@@ -145,6 +145,7 @@ def make_message(
     *,
     media: tuple[Media, ...] = (),
     referenced: tuple[ReferencedPost, ...] = (),
+    requested: Mapping[str, bool] | None = None,
     username: str = USERNAME,
     tweet: Mapping[str, Any] | None = None,
     fetched_at: str = FETCHED_AT,
@@ -155,6 +156,7 @@ def make_message(
         tweet=make_tweet(tweet_id, **(tweet or {})),
         media=media,
         referenced=referenced,
+        requested=dict(requested or {}),
         fetched_at=fetched_at,
         schema_version=schema_version,
     )

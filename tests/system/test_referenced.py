@@ -38,7 +38,8 @@ def test_a_retweet_is_stored_with_the_full_original_text_and_author(
     (quoted,) = items[quote.id]["referenced_tweets"]
     assert (quoted["text"], quoted["author_username"]) == ("quote me", "orig_author")
     (lost,) = items[reply.id]["referenced_tweets"]
-    assert lost == {"type": "replied_to", "id": gone.id, "status": "unavailable"}
+    assert lost["status"] == "unavailable" and "text" not in lost
+    assert lost["unavailable_since"] == items[reply.id]["fetched_at"]
     assert_stored_once(sim, [retweet, quote, reply])
     assert_quiet(sim)
 

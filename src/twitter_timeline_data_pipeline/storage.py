@@ -21,11 +21,13 @@ import io
 import json
 import logging
 import mimetypes
+import os
 import posixpath
 import re
 import time
 from collections.abc import Buffer, Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
+from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Literal, cast, override
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -77,6 +79,41 @@ poster frame that can't be stored yet also makes the entry ``retrying``."""
 
 # Media is only downloaded from the X CDN; message bodies are untrusted input.
 ALLOWED_MEDIA_HOSTS = frozenset({"pbs.twimg.com", "video.twimg.com"})
+
+# TEST ONLY. Comma-separated hostnames that are also allowed, over http or https, so the
+# integration tests can serve media from a stub. template.yaml never sets it (a template
+# test enforces that), and the handlers log a WARNING when it is active.
+MEDIA_HOSTS_OVERRIDE_ENV = "MEDIA_ALLOWED_HOSTS_OVERRIDE"
+_HOSTNAME_RE = re.compile(r"[a-z0-9]([a-z0-9.-]*[a-z0-9])?")
+
+
+def media_hosts_override(environ: Mapping[str, str] | None = None) -> frozenset[str]:
+    """Extra media hosts from ``MEDIA_ALLOWED_HOSTS_OVERRIDE``; empty when unset.
+
+    Also empty, with an ERROR logged, when ``AWS_ENDPOINT_URL`` is not set: the override
+    only makes sense next to an emulated AWS, so a stray copy in a real deployment
+    (which uses the default endpoints) is ignored instead of widening the allowlist.
+
+    Raises ``ValueError`` for an entry that isn't a bare hostname (no scheme, port or
+    path), so a typo can't silently widen the allowlist.
+    """
+    env = os.environ if environ is None else environ
+    raw = env.get(MEDIA_HOSTS_OVERRIDE_ENV, "")
+    hosts = frozenset(h.strip().lower() for h in raw.split(",") if h.strip())
+    for host in hosts:
+        if not _HOSTNAME_RE.fullmatch(host):
+            raise ValueError(
+                f"{MEDIA_HOSTS_OVERRIDE_ENV}: {host!r} is not a bare hostname"
+            )
+    if hosts and not env.get("AWS_ENDPOINT_URL"):
+        logger.error(
+            "%s is set but AWS_ENDPOINT_URL is not, so this is not an emulated AWS: "
+            "ignoring the override. Remove it from this deployment.",
+            MEDIA_HOSTS_OVERRIDE_ENV,
+        )
+        return frozenset()
+    return hosts
+
 
 _KNOWN_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".gif", ".webp", ".mp4"})
 _MISSING_OBJECT_CODES = frozenset({"404", "NoSuchKey", "NotFound"})
@@ -241,7 +278,11 @@ class MediaStore:
         *,
         max_bytes: int = DEFAULT_MAX_MEDIA_BYTES,
         clock: Callable[[], float] = time.monotonic,
+        test_hosts: frozenset[str] = frozenset(),
     ) -> None:
+        """``test_hosts`` is for the integration tests only: see
+        ``media_hosts_override``."""
+        self._test_hosts = test_hosts
         self._s3 = s3_client
         self._bucket = bucket
         self._http = http_client
@@ -291,8 +332,8 @@ class MediaStore:
             "preview not stored",
         )
 
-    @staticmethod
     def _allowed_target(
+        self,
         media: Media,
         raw_url: str,
         known_type: str | None,
@@ -307,7 +348,11 @@ class MediaStore:
             host = parts.hostname
         except ValueError:  # malformed URL, e.g. an unclosed IPv6 bracket
             parts, host = None, None
-        if parts is None or parts.scheme != "https" or host not in ALLOWED_MEDIA_HOSTS:
+        allowed = parts is not None and (
+            (parts.scheme == "https" and host in ALLOWED_MEDIA_HOSTS)
+            or (parts.scheme in ("http", "https") and host in self._test_hosts)
+        )
+        if parts is None or not allowed:
             logger.warning(
                 "media %s %s: host %r is not an allowed media host",
                 media.media_key,
@@ -595,15 +640,13 @@ def estimate_item_size(value: Any) -> int:
 
 
 # How often ``put_tweet`` re-reads and retries when another write lands between its read
-# of the stored item and its put; after that the message counts as stale.
+# of the stored item and its put; after that it raises ``WriteContentionError``.
 MERGE_ATTEMPTS = 3
 # What is read from the stored item to merge from, and to guard the put with.
 _MERGE_PROJECTION = (
-    "media, referenced_tweets, entities, display_entities, fetched_at, stored_at"
+    "media, referenced_tweets, entities, display_entities, in_reply_to_user_id, "
+    "possibly_sensitive, edit_controls, withheld, fetched_at, revision"
 )
-# Characters and links that mean a text has entities (URLs, mentions, hashtags,
-# cashtags); a text without any is not worth a read to look for stored ones.
-_ENTITY_MARKERS = re.compile(r"https?://|[@#$]")
 # Fields of a stored referenced-post entry that are carried forward as a whole.
 _REFERENCE_KEYS = (
     "text",
@@ -616,81 +659,137 @@ _REFERENCE_KEYS = (
     "author_id",
     "author_username",
     "created_at",
+    "entities",
+)
+# Fields a message only carries when the API was asked for entities: when it wasn't,
+# a stored value is kept (when it was, the API's answer wins, absent included).
+_ENTITY_REQUEST_FIELDS = (
+    "entities",
+    "display_entities",
+    "possibly_sensitive",
+    "edit_controls",
+    "withheld",
 )
 
 
-def _lacks_reference_text(item: Mapping[str, Any]) -> bool:
-    return any("text" not in r for r in item.get("referenced_tweets", ()))
+class WriteContentionError(RuntimeError):
+    """The Tweet item kept changing between ``put_tweet``'s read and its put. The
+    message must be retried (nothing is stored), not treated as stale."""
 
 
-def _lacks_entities(item: Mapping[str, Any]) -> bool:
-    return "entities" not in item and any(
-        _ENTITY_MARKERS.search(str(item.get(f, ""))) for f in ("text", "display_text")
-    )
+def _decimals(value: Any) -> Any:
+    """``value`` with floats as ``Decimal(repr(f))`` (DynamoDB's resource API rejects
+    floats), so an annotation's probability is stored exactly as the API sent it."""
+    match value:
+        case float():
+            return Decimal(repr(value))
+        case dict():
+            return {k: _decimals(v) for k, v in value.items()}
+        case list():
+            return [_decimals(v) for v in value]
+        case _:
+            return value
 
 
-def needs_previous(item: Mapping[str, Any]) -> bool:
-    """Whether ``item`` lacks something the stored item may still hold, so the stored
-    item must be read and merged before the write. Add a rule here (and in
-    ``carry_forward``) for each field a later message can lose."""
-    return (
-        any(e.get("status") == "missing" for e in item.get("media", ()))
-        or _lacks_reference_text(item)
-        or _lacks_entities(item)
-    )
+def reference_s3_keys(item: Mapping[str, Any]) -> set[str]:
+    """The S3 keys of the referenced posts' offloaded texts in a stored item."""
+    return {
+        ref[name]
+        for ref in item.get("referenced_tweets") or ()
+        for name in ("text_s3_key", "display_text_s3_key")
+        if name in ref
+    }
+
+
+def _carry_references(
+    item: dict[str, Any], previous: Mapping[str, Any], fetched_at: str
+) -> None:
+    stored = {
+        (r.get("type"), r.get("id")): r for r in previous.get("referenced_tweets") or ()
+    }
+    for i, ref in enumerate(item.get("referenced_tweets", ())):
+        kept = stored.get((ref.get("type"), ref.get("id")))
+        if kept is None:
+            continue
+        if ref.get("status") == "unavailable":
+            # Deletion wins: the original is gone (deleted, protected or withheld),
+            # so its copy is dropped, not carried (``put_tweet`` deletes its S3
+            # objects). Only the fact is kept, and when it was first noted.
+            ref["unavailable_since"] = kept.get("unavailable_since", fetched_at)
+        elif "text" not in ref and "status" not in ref:
+            # The API said nothing about this original (the expansion is off): keep
+            # what is stored, marked as no longer refreshed.
+            merged = {k: kept[k] for k in (*_REFERENCE_KEYS, "status") if k in kept}
+            merged |= {"type": ref["type"], "id": ref["id"]}
+            if "unavailable_since" in kept:
+                merged["unavailable_since"] = kept["unavailable_since"]
+            if "text" in kept:
+                merged["stale_since"] = kept.get("stale_since", fetched_at)
+                merged["last_seen_fetched_at"] = kept.get(
+                    "last_seen_fetched_at", previous.get("fetched_at", fetched_at)
+                )
+            item["referenced_tweets"][i] = merged
 
 
 def carry_forward(
-    item: dict[str, Any], previous: Mapping[str, Any], fetched_at: str
+    item: dict[str, Any],
+    previous: Mapping[str, Any],
+    fetched_at: str,
+    requested: Mapping[str, bool] | None = None,
 ) -> None:
     """Merge what the stored item ``previous`` knows into the new ``item``, in place.
 
-    Enrichment is merged, not replaced: a newer fetch that no longer sees a thing must
-    not erase it (and orphan its S3 objects). Media: a key the API now omits keeps its
-    stored entry (type, fields, S3 keys), unless that entry is itself ``missing``,
-    with ``missing_since`` (this fetch's time, first noted) and ``last_seen_fetched_at``
-    (the fetch that last saw it) added. A key that is present again simply replaces it.
+    This is the one place where enrichment is merged, not replaced: a newer fetch that
+    no longer sees a thing must not erase it (and orphan its S3 objects). Add a rule
+    here for each field a later message can lose.
 
-    Referenced posts: an incoming reference without the original's text (the expansion
-    is off, or the original is now ``unavailable``) keeps the stored reference's text,
-    author and date, with the new ``status`` (if any), ``stale_since`` (this fetch's
-    time, first noted) and ``last_seen_fetched_at``. Entities: when the incoming item
-    has none, the stored ``entities`` and ``display_entities`` are kept; entities the
-    API did return replace them.
+    Media: a stored entry whose key the new item has as ``missing``, or does not list
+    at all (a re-fetch without ``attachments``), is kept whole (type, fields, S3
+    keys), unless it is itself ``missing``. A kept entry gets ``missing_since`` (the
+    first fetch that lost it) and ``last_seen_fetched_at`` (the fetch that last saw
+    it). A key that is present again simply replaces its entry.
+
+    ``in_reply_to_user_id`` (it never changes) is always kept when the new item lacks
+    it. ``entities``, ``display_entities``, ``possibly_sensitive``, ``edit_controls``
+    and ``withheld`` are kept only when the message did not ask the API for them
+    (``requested["entities"]`` false or unknown); when it did, the new answer wins.
+
+    Referenced posts: a reference the API said nothing about (the expansion is off)
+    keeps the stored copy (text, author, date, entities and a stored ``unavailable``
+    status), with ``stale_since`` (the first fetch that lacked it) and
+    ``last_seen_fetched_at``. A reference reported ``unavailable`` does NOT keep its
+    copy: deletion wins, only ``{id, type, status, unavailable_since}`` remain. One
+    with fresh text replaces the stored copy.
     """
-    old = {e.get("media_key"): e for e in previous.get("media") or ()}
-    for i, entry in enumerate(item.get("media", ())):
-        kept = old.get(entry["media_key"])
-        if (
-            entry.get("status") == "missing"
-            and kept
-            and kept.get("status") != "missing"
-        ):
-            item["media"][i] = {
+    if "in_reply_to_user_id" not in item and "in_reply_to_user_id" in previous:
+        item["in_reply_to_user_id"] = previous["in_reply_to_user_id"]
+    if not (requested or {}).get("entities"):
+        for name in _ENTITY_REQUEST_FIELDS:
+            if name not in item and name in previous:
+                item[name] = previous[name]
+    _carry_references(item, previous, fetched_at)
+    media: list[dict[str, Any]] = item.setdefault("media", [])
+    index = {e["media_key"]: i for i, e in enumerate(media)}
+    for kept in previous.get("media") or ():
+        key = kept.get("media_key")
+        i = index.get(key)
+        if i is not None and media[i].get("status") != "missing":
+            continue
+        if kept.get("status") != "missing":
+            kept = {
                 **kept,
                 "missing_since": kept.get("missing_since", fetched_at),
                 "last_seen_fetched_at": kept.get(
                     "last_seen_fetched_at", previous.get("fetched_at", fetched_at)
                 ),
             }
-    stored_refs = {
-        (r.get("type"), r.get("id")): r for r in previous.get("referenced_tweets") or ()
-    }
-    for i, ref in enumerate(item.get("referenced_tweets", ())):
-        kept_ref = stored_refs.get((ref.get("type"), ref.get("id")))
-        if "text" not in ref and kept_ref and "text" in kept_ref:
-            merged = {k: kept_ref[k] for k in _REFERENCE_KEYS if k in kept_ref}
-            merged |= {"type": ref["type"], "id": ref["id"]}
-            if status := ref.get("status") or kept_ref.get("status"):
-                merged["status"] = status
-            merged["stale_since"] = kept_ref.get("stale_since", fetched_at)
-            merged["last_seen_fetched_at"] = kept_ref.get(
-                "last_seen_fetched_at", previous.get("fetched_at", fetched_at)
-            )
-            item["referenced_tweets"][i] = merged
-    for name in ("entities", "display_entities"):
-        if name not in item and name in previous:
-            item[name] = previous[name]
+        if i is None:
+            index[key] = len(media)
+            media.append(kept)
+            item.setdefault("media_keys", []).append(key)
+        else:
+            media[i] = kept
+    item["media_count"] = len(media)
 
 
 class TweetStore:
@@ -763,7 +862,7 @@ class TweetStore:
         """
         item = self.to_item(message, media)
         if previous is not None:
-            carry_forward(item, previous, message.fetched_at)
+            carry_forward(item, previous, message.fetched_at, message.requested)
         fields = [f for f in ("text", "display_text") if f in item]
         for field in sorted(fields, key=lambda f: len(item[f]), reverse=True):
             over = (
@@ -811,7 +910,11 @@ class TweetStore:
                     "author_id": copy.author_id,
                     "author_username": copy.author_username,
                     "created_at": copy.created_at,
+                    "entities": dict(copy.entities) if copy.entities else None,
                     "status": copy.status,
+                    "unavailable_since": (
+                        message.fetched_at if copy.status == "unavailable" else None
+                    ),
                 }
             entries.append({k: v for k, v in entry.items() if v is not None})
         return entries
@@ -865,10 +968,11 @@ class TweetStore:
             "media": entries,
             "media_count": len(entries),
             "fetched_at": message.fetched_at,
+            "raw_key": message.raw_key,
             "stored_at": utc_now_iso(),
             "schema_version": message.schema_version,
         }
-        return {k: v for k, v in item.items() if v is not None}
+        return {k: _decimals(v) for k, v in item.items() if v is not None}
 
     def put_tweet(
         self, message: TweetMessage, media: Sequence[StoredMedia]
@@ -883,7 +987,13 @@ class TweetStore:
         without ``note_text`` (a preview, e.g. from a fetcher that predates long posts)
         never replaces a stored long post, whatever its ``fetched_at``: the preview
         would erase the full text. A skipped write returns ``written=False`` with the
-        stored values; any other DynamoDB error propagates.
+        stored values.
+
+        The stored item is read first (consistent) and merged in by ``carry_forward``;
+        the put is conditional on its ``revision``, which every write increments (any
+        other in-place updater of the item must ``ADD revision 1`` too, as
+        ``resolve_media`` does). ``WriteContentionError`` if it keeps changing; any
+        other DynamoDB error propagates.
         """
         is_long = bool(message.tweet.note_text)
         keep_long_post = (
@@ -905,34 +1015,32 @@ class TweetStore:
             }
             if not is_long:
                 values[":no"] = False
-            previous: dict[str, Any] | None = None
-            condition = base
-            guarded = needs_previous(self.to_item(message, media))
-            if guarded:
-                # Read what is stored and guard the put with what was read, so a write
-                # that lands in between is merged on the next attempt, not overwritten.
-                previous = cast(
-                    "dict[str, Any] | None",
-                    self._table.get_item(
-                        Key={"tweet_id": message.tweet.id},
-                        ConsistentRead=True,
-                        ProjectionExpression=_MERGE_PROJECTION,
-                    ).get("Item"),
-                )
-                guard = ["attribute_not_exists(tweet_id)"]
-                if previous is not None:
-                    guard = []
-                    for name in ("fetched_at", "stored_at"):
-                        if name in previous:
-                            values[f":read_{name}"] = previous[name]
-                            guard.append(f"{name} = :read_{name}")
-                        else:
-                            guard.append(f"attribute_not_exists({name})")
-                condition = f"({base}) AND ({' AND '.join(guard)})"
+            # Read what is stored, merge it in, and guard the put with its revision,
+            # so any write that lands in between (another put, or a media-retry
+            # update, which bumps the revision too) is merged on the next attempt,
+            # not overwritten.
+            previous = cast(
+                "dict[str, Any] | None",
+                self._table.get_item(
+                    Key={"tweet_id": message.tweet.id},
+                    ConsistentRead=True,
+                    ProjectionExpression=_MERGE_PROJECTION,
+                ).get("Item"),
+            )
+            read_revision = None if previous is None else previous.get("revision")
+            if previous is None:
+                guard = "attribute_not_exists(tweet_id)"
+            elif read_revision is None:
+                guard = "attribute_not_exists(revision)"
+            else:
+                values[":read_revision"] = read_revision
+                guard = "revision = :read_revision"
+            item = self.build_item(message, media, previous)
+            item["revision"] = int(read_revision or 0) + 1
             try:
                 self._table.put_item(
-                    Item=self.build_item(message, media, previous),
-                    ConditionExpression=condition,
+                    Item=item,
+                    ConditionExpression=f"({base}) AND {guard}",
                     ExpressionAttributeValues=values,
                     ReturnValuesOnConditionCheckFailure="ALL_OLD",
                 )
@@ -942,15 +1050,12 @@ class TweetStore:
                 ):
                     raise
                 old = cast("dict[str, Any]", exc.response.get("Item") or {})
-                # With the guard on, a failure is either a write since the read (the
-                # stored item differs from what was read) or the base condition on
-                # the state that was read, which is a stale message.
-                if guarded and (
-                    previous is None
-                    or any(
-                        old.get(n, {}).get("S") != previous.get(n)
-                        for n in ("fetched_at", "stored_at")
-                    )
+                now = old.get("revision", {}).get("N")
+                # A failure is either a write since the read (the revision moved, or
+                # the item appeared) or the base condition on the state that was
+                # read, which is a stale message.
+                if previous is None or (None if now is None else int(now)) != (
+                    None if read_revision is None else int(read_revision)
                 ):
                     logger.info(
                         "tweet %s changed while it was merged; reading it again",
@@ -958,11 +1063,29 @@ class TweetStore:
                     )
                     continue
                 return self._stale(message, old, is_long=is_long)
+            if previous is not None:
+                self._delete_orphans(
+                    reference_s3_keys(previous) - reference_s3_keys(item), message
+                )
             return PutResult(written=True)
-        logger.warning(
-            "tweet %s kept changing under its merge: treated as stale", message.tweet.id
+        raise WriteContentionError(
+            f"tweet {message.tweet.id} changed under {MERGE_ATTEMPTS} merge attempts"
         )
-        return PutResult(written=False)
+
+    def _delete_orphans(self, keys: set[str], message: TweetMessage) -> None:
+        """Delete the S3 texts of referenced posts the written item no longer holds (an
+        original that is now ``unavailable``: deletion wins). After the put, so a lost
+        race or a stale message never leaves an item pointing at a deleted object; a
+        failure is logged, not raised, because a retry would no longer see the keys."""
+        for key in sorted(keys):
+            try:
+                self._s3.delete_object(Bucket=self._bucket, Key=key)
+            except ClientError:
+                logger.exception(
+                    "could not delete %s of an unavailable original (tweet %s)",
+                    key,
+                    message.tweet.id,
+                )
 
     @staticmethod
     def _stale(
@@ -1010,7 +1133,8 @@ class TweetStore:
         try:
             self._table.update_item(
                 Key={"tweet_id": tweet_id},
-                UpdateExpression=f"SET {position} = :entry",
+                # ADD revision: this write must fail a concurrent put_tweet's guard.
+                UpdateExpression=f"SET {position} = :entry ADD revision :one",
                 ConditionExpression=(
                     f"attribute_exists(tweet_id) AND {position}.media_key = :key "
                     f"AND {position}.#status = :retrying"
@@ -1020,6 +1144,7 @@ class TweetStore:
                     ":entry": dict(entry),
                     ":key": media_key,
                     ":retrying": "retrying",
+                    ":one": 1,
                 },
             )
         except ClientError as exc:
@@ -1197,12 +1322,16 @@ class CheckpointState:
 
     ``newest_id`` is the highest Tweet ID enqueued. ``gaps`` are ranges below it (or
     manual backfills) still to fetch. ``version`` is the optimistic-lock counter; items
-    written before gaps existed have none and count as version 0.
+    written before gaps existed have none and count as version 0. ``user_id`` is the
+    numeric ID the handle resolved to, ``user_id_resolved_at`` (ISO-8601 UTC, ``Z``)
+    when it was last confirmed; items written before they existed have neither.
     """
 
     newest_id: TweetId | None = None
     gaps: tuple[Gap, ...] = ()
     version: int = 0
+    user_id: str | None = None
+    user_id_resolved_at: str | None = None
 
 
 class CheckpointStore:
@@ -1219,10 +1348,13 @@ class CheckpointStore:
         if item is None:
             return CheckpointState()
         newest = item.get("newest_id")
+        user_id = item.get("user_id")
         return CheckpointState(
             newest_id=None if newest is None else str(int(newest)),
             gaps=tuple(Gap.from_item(g) for g in item.get("gaps", ())),
             version=int(item.get("version", 0)),
+            user_id=None if user_id is None else str(user_id),
+            user_id_resolved_at=item.get("user_id_resolved_at"),
         )
 
     def save(
@@ -1242,6 +1374,10 @@ class CheckpointStore:
         }
         if state.newest_id is not None:
             item["newest_id"] = int(state.newest_id)
+        if state.user_id is not None:
+            item["user_id"] = state.user_id
+        if state.user_id_resolved_at is not None:
+            item["user_id_resolved_at"] = state.user_id_resolved_at
         # A missing version is 0: a new item or one from before versions existed.
         condition = "version = :expected"
         if expected_version == 0:
