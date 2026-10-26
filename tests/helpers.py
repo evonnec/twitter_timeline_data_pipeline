@@ -11,6 +11,7 @@ import httpx
 import pytest
 
 from twitter_timeline_data_pipeline.models import (
+    SCHEMA_VERSION,
     Media,
     Tweet,
     TweetMessage,
@@ -144,12 +145,15 @@ def make_message(
     media: tuple[Media, ...] = (),
     username: str = USERNAME,
     tweet: Mapping[str, Any] | None = None,
+    fetched_at: str = FETCHED_AT,
+    schema_version: int = SCHEMA_VERSION,
 ) -> TweetMessage:
     return TweetMessage(
         username=username,
         tweet=make_tweet(tweet_id, **(tweet or {})),
         media=media,
-        fetched_at=FETCHED_AT,
+        fetched_at=fetched_at,
+        schema_version=schema_version,
     )
 
 

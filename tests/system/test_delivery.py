@@ -2,8 +2,6 @@
 
 import json
 
-import pytest
-
 from system.checks import (
     assert_quiet,
     assert_stored,
@@ -133,11 +131,6 @@ def test_process_crash_mid_batch_redelivers_the_batch(sim: Simulation) -> None:
     assert_quiet(sim)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="#14: writes are last-write-wins, so a stale DLQ redrive overwrites "
-    "newer data",
-)
 def test_stale_redelivery_after_newer_data_does_not_win(sim: Simulation) -> None:
     """Run 1's checkpoint write fails after it enqueued five Tweets, and a 55-minute
     tweets-table outage sends those messages to the DLQ. Run 2 re-fetches the Tweets
