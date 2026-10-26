@@ -47,7 +47,7 @@ A run, step by step:
 
 ### SQS message
 
-One message per Tweet. The body is compact, ASCII-escaped JSON (so odd characters in Tweet text cannot make SQS reject it) with `"schema_version": 1`; the processor rejects any other version. This example is generated from the real model, with fake IDs:
+One message per Tweet. The body is compact UTF-8 JSON, with only the characters SQS rejects escaped (see **Size** below), and `"schema_version": 1`; the processor rejects any other version. This example is generated from the real model, with fake IDs:
 
 ```json
 {
