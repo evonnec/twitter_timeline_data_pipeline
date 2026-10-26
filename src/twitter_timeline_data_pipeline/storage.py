@@ -7,16 +7,24 @@ re-send a Tweet after a retry:
   stored item only if it is not older (by ``fetched_at`` and ``schema_version``), so a
   stale redelivery can't overwrite newer data. A repeat of the same delivery rewrites
   the same data.
+- A post too big for a DynamoDB item has its text uploaded (create-only) to a
+  deterministic S3 key first.
+- A preview-only message can't replace a stored long post.
 - Media objects get a deterministic S3 key, and an object that already exists is not
   downloaded again.
+- Media that couldn't be stored on a message's last receive is recorded as
+  ``retrying`` and queued for the media-retry function, whose conditional update
+  replaces only that entry.
 """
 
 import io
+import json
 import logging
 import mimetypes
 import posixpath
+import re
 import time
-from collections.abc import Buffer, Callable, Iterable, Iterator, Sequence
+from collections.abc import Buffer, Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, Any, Literal, cast, override
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -27,26 +35,31 @@ from botocore.exceptions import ClientError
 from twitter_timeline_data_pipeline.config import DEFAULT_MAX_MEDIA_BYTES
 from twitter_timeline_data_pipeline.models import (
     Media,
+    MediaRetry,
     TweetId,
     TweetMessage,
+    escape_disallowed_chars,
     utc_now_iso,
 )
 
 if TYPE_CHECKING:
     from mypy_boto3_dynamodb.service_resource import Table
     from mypy_boto3_s3 import S3Client
+    from mypy_boto3_sqs import SQSClient
 
 logger = logging.getLogger(__name__)
 
 type MediaStatus = Literal[
-    "stored", "exists", "unavailable", "skipped", "too_large", "failed"
+    "stored", "exists", "unavailable", "skipped", "too_large", "retrying"
 ]
 """stored: uploaded now. exists: already in S3. unavailable: the source returned a
 4xx other than 429 (or a redirect, which isn't followed). skipped: nothing to download:
 a video with only an HLS variant, or a URL that isn't https on an allowed media host.
 too_large: over the size cap, by estimate or by counted bytes; ``size_bytes`` holds the
-estimate or the count at abort, and nothing is in S3. failed: transient errors outlasted
-the record's last SQS receive, so the Tweet was written without this media."""
+estimate or the count at abort, and nothing is in S3. retrying: transient errors
+outlasted the record's last SQS receive, so the Tweet was written without this file and
+a message on the media-retry queue will store it later and replace this status;
+``source_url`` (and the planned ``s3_key``) are recorded."""
 
 # Media is only downloaded from the X CDN; message bodies are untrusted input.
 ALLOWED_MEDIA_HOSTS = frozenset({"pbs.twimg.com", "video.twimg.com"})
@@ -76,6 +89,14 @@ class StoredMedia:
     content_type: str | None = None
     source_url: str | None = None
     size_bytes: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _Target:
+    raw_url: str
+    url: str  # raw_url at full size
+    known_type: str | None
+    key: str
 
 
 class _IterReader(io.RawIOBase):
@@ -146,13 +167,23 @@ def _extension(content_type: str | None, url: str) -> str:
     return suffix if suffix in _KNOWN_EXTENSIONS else ""
 
 
+# Cap for a size estimate: any real file is far smaller, and DynamoDB can't store a
+# number like the 10**400 a malformed bit_rate would produce (the write would fail).
+MAX_SIZE_ESTIMATE = 2**63 - 1
+
+
 def estimated_size(media: Media, url: str) -> int | None:
-    """Bytes implied by the chosen variant's ``bit_rate`` and the media's duration."""
+    """Bytes implied by the chosen variant's ``bit_rate`` and the media's duration.
+
+    None when there is no usable estimate (including a non-positive one); capped at
+    ``MAX_SIZE_ESTIMATE`` so it can always be stored.
+    """
     if media.type not in ("video", "animated_gif") or not media.duration_ms:
         return None
     for variant in media.variants:
         if variant.url == url and variant.bit_rate:
-            return variant.bit_rate * media.duration_ms // 8000
+            estimate = variant.bit_rate * media.duration_ms // 8000
+            return min(estimate, MAX_SIZE_ESTIMATE) if estimate > 0 else None
     return None
 
 
@@ -184,6 +215,98 @@ class MediaStore:
         owner = message.tweet.author_id or message.username.lower()
         return f"media/{owner}/{message.tweet.id}/{media.media_key}{extension}"
 
+    def _target(self, message: TweetMessage, media: Media) -> _Target | StoredMedia:
+        """Where ``media`` is downloaded from and stored; ``skipped`` if nowhere."""
+        skipped = StoredMedia(
+            media_key=media.media_key, type=media.type, status="skipped"
+        )
+        source = media.download_source()
+        if source is None:
+            return skipped
+        raw_url, known_type = source
+        try:
+            url = _original_size_url(raw_url)
+            parts = urlsplit(url)
+            host = parts.hostname
+        except ValueError:  # malformed URL, e.g. an unclosed IPv6 bracket
+            parts, host = None, None
+        if parts is None or parts.scheme != "https" or host not in ALLOWED_MEDIA_HOSTS:
+            logger.warning(
+                "media %s skipped: host %r is not an allowed media host",
+                media.media_key,
+                host,
+            )
+            return skipped
+        return _Target(
+            raw_url=raw_url,
+            url=url,
+            known_type=known_type,
+            key=self.object_key(message, media, _extension(known_type, url)),
+        )
+
+    def _cheap_result(
+        self, media: Media, target: _Target, *, head: bool = True
+    ) -> StoredMedia | None:
+        """The outcome knowable without downloading: ``exists`` (HeadObject, skipped
+        with ``head=False``) or ``too_large`` (by the size estimate); None when a
+        download is needed. Raises for a HeadObject failure other than a missing key."""
+
+        def result(status: MediaStatus, **extra: Any) -> StoredMedia:
+            return StoredMedia(
+                media_key=media.media_key,
+                type=media.type,
+                status=status,
+                source_url=target.url,
+                **extra,
+            )
+
+        try:
+            if head:
+                found = self._s3.head_object(Bucket=self._bucket, Key=target.key)
+                return result(
+                    "exists",
+                    s3_key=target.key,
+                    content_type=found.get("ContentType"),
+                    size_bytes=found.get("ContentLength"),
+                )
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") not in _MISSING_OBJECT_CODES:
+                raise
+        # Skip before opening a connection when the message already says it's too big.
+        estimate = estimated_size(media, target.raw_url)
+        if estimate is not None and estimate > self._max_bytes:
+            logger.warning(
+                "media %s too large: estimated %d bytes", media.media_key, estimate
+            )
+            return result("too_large", size_bytes=estimate)
+        return None
+
+    def precheck(
+        self, message: TweetMessage, media: Media, *, head: bool = True
+    ) -> StoredMedia:
+        """The cheap checks without a download, for a media item that can't be stored.
+
+        Returns ``skipped``, ``too_large`` or ``exists`` when one applies, else
+        ``retrying`` with the ``source_url`` and the planned ``s3_key``. ``head=False``
+        makes no S3 call. Never raises: a failing HeadObject just leaves the item
+        ``retrying``.
+        """
+        target = self._target(message, media)
+        if isinstance(target, StoredMedia):
+            return target
+        try:
+            cheap = self._cheap_result(media, target, head=head)
+        except Exception:
+            logger.exception("cheap checks failed for media %s", media.media_key)
+            cheap = None
+        return cheap or StoredMedia(
+            media_key=media.media_key,
+            type=media.type,
+            status="retrying",
+            s3_key=target.key,
+            source_url=target.url,
+        )
+
     def store(
         self,
         message: TweetMessage,
@@ -199,28 +322,11 @@ class MediaStore:
         is still recorded.
         """
         deadline = None if budget_s is None else self._clock() + budget_s
-        source = media.download_source()
-        if source is None:
-            return StoredMedia(
-                media_key=media.media_key, type=media.type, status="skipped"
-            )
-        raw_url, known_type = source
-        try:
-            url = _original_size_url(raw_url)
-            parts = urlsplit(url)
-            host = parts.hostname
-        except ValueError:  # malformed URL, e.g. an unclosed IPv6 bracket
-            parts, host = None, None
-        if parts is None or parts.scheme != "https" or host not in ALLOWED_MEDIA_HOSTS:
-            logger.warning(
-                "media %s skipped: host %r is not an allowed media host",
-                media.media_key,
-                host,
-            )
-            return StoredMedia(
-                media_key=media.media_key, type=media.type, status="skipped"
-            )
-        key = self.object_key(message, media, _extension(known_type, url))
+        target = self._target(message, media)
+        if isinstance(target, StoredMedia):
+            return target
+        url, key = target.url, target.key
+        known_type = target.known_type
 
         def result(status: MediaStatus, **extra: Any) -> StoredMedia:
             return StoredMedia(
@@ -231,26 +337,8 @@ class MediaStore:
                 **extra,
             )
 
-        try:
-            head = self._s3.head_object(Bucket=self._bucket, Key=key)
-        except ClientError as exc:
-            if exc.response.get("Error", {}).get("Code") not in _MISSING_OBJECT_CODES:
-                raise
-        else:
-            return result(
-                "exists",
-                s3_key=key,
-                content_type=head.get("ContentType"),
-                size_bytes=head.get("ContentLength"),
-            )
-
-        # Skip before opening a connection when the message already says it's too big.
-        estimate = estimated_size(media, raw_url)
-        if estimate is not None and estimate > self._max_bytes:
-            logger.warning(
-                "media %s too large: estimated %d bytes", media.media_key, estimate
-            )
-            return result("too_large", size_bytes=estimate)
+        if (cheap := self._cheap_result(media, target)) is not None:
+            return cheap
 
         timeout: Any = httpx.USE_CLIENT_DEFAULT
         if deadline is not None:
@@ -334,11 +422,106 @@ class PutResult:
     stored_schema_version: int | None = None
 
 
+# DynamoDB items are limited to 400 KB (names and values together). A text is moved to
+# S3 when the estimated item size is over this, which leaves 50 KB for the estimate's
+# error and for the stored prefix and S3 keys. The username-created_at-index projects
+# ``text`` too, and an index entry is the key plus the projected attributes, so it
+# stays under the limit as well.
+ITEM_LIMIT_BYTES = 350_000
+# How much of an offloaded text stays in the item as a preview (code points).
+TEXT_PREVIEW_CHARS = 2_000
+
+
+# DynamoDB can't take a lone surrogate (it isn't encodable as UTF-8); the message format
+# can carry one, so a text with one is always kept whole in S3 and the item's prefix
+# shows U+FFFD in its place.
+_LONE_SURROGATE = re.compile("[\ud800-\udfff]")
+
+
+def estimate_item_size(value: Any) -> int:
+    """Approximate DynamoDB size: attribute names and UTF-8 string values, 21 bytes per
+    number (the most one takes), 1 per boolean, and 3 per container plus 1 per element
+    for the structure. It errs high; DynamoDB's own count is a bit lower."""
+    match value:
+        case dict():
+            return 3 + sum(
+                len(k.encode()) + 1 + estimate_item_size(v) for k, v in value.items()
+            )
+        case list() | tuple():
+            return 3 + sum(1 + estimate_item_size(v) for v in value)
+        case str():
+            return len(value.encode("utf-8", "surrogatepass"))
+        case bool():
+            return 1
+        case _:
+            return 21
+
+
 class TweetStore:
     """Writes Tweet metadata to the tweets table (partition key ``tweet_id``)."""
 
-    def __init__(self, table: Table) -> None:
+    def __init__(self, table: Table, s3_client: S3Client, bucket: str) -> None:
         self._table = table
+        self._s3 = s3_client
+        self._bucket = bucket
+
+    @staticmethod
+    def text_key(message: TweetMessage, field: str = "text") -> str:
+        """``text/<author_id>/<tweet_id>.json`` (``<tweet_id>.display_text.json`` for
+        the preview), with the same owner rule as media."""
+        owner = message.tweet.author_id or message.username.lower()
+        suffix = "" if field == "text" else f".{field}"
+        return f"text/{owner}/{message.tweet.id}{suffix}.json"
+
+    def _offload(self, message: TweetMessage, item: dict[str, Any], field: str) -> None:
+        """Upload ``item[field]`` to S3 and leave a prefix and pointer in the item.
+
+        The object is the text as a JSON string (strict UTF-8; characters SQS and UTF-8
+        reject are escaped the same way as in the message), so any text, a lone
+        surrogate included, reads back exactly with ``json.loads``. The write is
+        create-only: a redelivery, or a stale message for the same Tweet (same ID, same
+        text), finds it already there and writes nothing.
+        """
+        key = self.text_key(message, field)
+        text: str = item[field]
+        body = escape_disallowed_chars(json.dumps(text, ensure_ascii=False))
+        try:
+            self._s3.put_object(
+                Bucket=self._bucket,
+                Key=key,
+                Body=body.encode("utf-8"),
+                ContentType="application/json",
+                Metadata={"tweet-id": message.tweet.id},
+                IfNoneMatch="*",
+            )
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") != "PreconditionFailed":
+                raise
+        item[field] = _LONE_SURROGATE.sub("\ufffd", text[:TEXT_PREVIEW_CHARS])
+        item[f"{field}_truncated"] = True
+        item[f"{field}_s3_key"] = key
+
+    def build_item(
+        self, message: TweetMessage, media: Sequence[StoredMedia]
+    ) -> dict[str, Any]:
+        """``to_item``, with texts moved to S3 until the estimated size fits.
+
+        While the item is over ``ITEM_LIMIT_BYTES``, the longer of ``text`` and
+        ``display_text`` (when longer than the preview) is offloaded: the item keeps a
+        prefix (cut on a code point), ``<field>_truncated: true`` and
+        ``<field>_s3_key``. A text with a lone surrogate is offloaded regardless of
+        size. Items that fit make no S3 call. This runs before the conditional write.
+        """
+        item = self.to_item(message, media)
+        fields = [f for f in ("text", "display_text") if f in item]
+        for field in sorted(fields, key=lambda f: len(item[f]), reverse=True):
+            over = (
+                estimate_item_size(item) > ITEM_LIMIT_BYTES
+                and len(item[field]) > TEXT_PREVIEW_CHARS
+            )
+            if over or _LONE_SURROGATE.search(item[field]):
+                self._offload(message, item, field)
+        return item
 
     @staticmethod
     def to_item(message: TweetMessage, media: Sequence[StoredMedia]) -> dict[str, Any]:
@@ -383,24 +566,35 @@ class TweetStore:
         not later than this message's and the stored ``schema_version`` (absent on
         legacy items) is not higher. ``fetched_at`` is an ISO 8601 UTC string with
         second precision, so string comparison is chronological. A tie rewrites the
-        item with the same data, which keeps a redelivery idempotent. A skipped stale
-        write returns ``written=False`` with the stored values; any other DynamoDB
-        error propagates.
+        item with the same data, which keeps a redelivery idempotent. A message
+        without ``note_text`` (a preview, e.g. from a fetcher that predates long posts)
+        never replaces a stored long post, whatever its ``fetched_at``: the preview
+        would erase the full text. A skipped write returns ``written=False`` with the
+        stored values; any other DynamoDB error propagates.
         """
+        is_long = bool(message.tweet.note_text)
+        keep_long_post = (
+            ""
+            if is_long
+            else " AND (attribute_not_exists(is_long_post) OR is_long_post = :no)"
+        )
+        values: dict[str, Any] = {
+            ":fetched_at": message.fetched_at,
+            ":schema_version": message.schema_version,
+        }
+        if not is_long:
+            values[":no"] = False
         try:
             self._table.put_item(
-                Item=self.to_item(message, media),
+                Item=self.build_item(message, media),
                 ConditionExpression=(
                     "attribute_not_exists(tweet_id) OR ("
                     "(attribute_not_exists(fetched_at) "
                     "OR fetched_at <= :fetched_at) AND "
                     "(attribute_not_exists(schema_version) "
-                    "OR schema_version <= :schema_version))"
+                    f"OR schema_version <= :schema_version){keep_long_post})"
                 ),
-                ExpressionAttributeValues={
-                    ":fetched_at": message.fetched_at,
-                    ":schema_version": message.schema_version,
-                },
+                ExpressionAttributeValues=values,
                 ReturnValuesOnConditionCheckFailure="ALL_OLD",
             )
         except ClientError as exc:
@@ -409,6 +603,12 @@ class TweetStore:
             ):
                 old = cast("dict[str, Any]", exc.response.get("Item") or {})
                 version = old.get("schema_version", {}).get("N")
+                if not is_long and old.get("is_long_post", {}).get("BOOL"):
+                    logger.info(
+                        "preview-only message for tweet %s not stored: the stored "
+                        "item is a long post",
+                        message.tweet.id,
+                    )
                 return PutResult(
                     written=False,
                     stored_fetched_at=old.get("fetched_at", {}).get("S"),
@@ -416,6 +616,83 @@ class TweetStore:
                 )
             raise
         return PutResult(written=True)
+
+    def get_media(self, tweet_id: TweetId) -> list[dict[str, Any]] | None:
+        """The item's ``media`` entries (strongly consistent), None if no such item."""
+        item = self._table.get_item(
+            Key={"tweet_id": tweet_id},
+            ConsistentRead=True,
+            ProjectionExpression="media",
+        ).get("Item")
+        if item is None:
+            return None
+        return cast("list[dict[str, Any]]", item.get("media") or [])
+
+    def resolve_media(
+        self,
+        tweet_id: TweetId,
+        index: int,
+        media_key: str,
+        entry: Mapping[str, Any],
+    ) -> bool:
+        """Replace ``media[index]`` with ``entry`` if it is still the ``retrying`` entry
+        for ``media_key`` of an item that exists; return whether it was replaced.
+
+        False means the item changed since it was read (another delivery stored the
+        file, or a newer fetch rewrote the item), so there is nothing left to do. Any
+        other DynamoDB error propagates.
+        """
+        position = f"media[{int(index)}]"
+        try:
+            self._table.update_item(
+                Key={"tweet_id": tweet_id},
+                UpdateExpression=f"SET {position} = :entry",
+                ConditionExpression=(
+                    f"attribute_exists(tweet_id) AND {position}.media_key = :key "
+                    f"AND {position}.#status = :retrying"
+                ),
+                ExpressionAttributeNames={"#status": "status"},
+                ExpressionAttributeValues={
+                    ":entry": dict(entry),
+                    ":key": media_key,
+                    ":retrying": "retrying",
+                },
+            )
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") == (
+                "ConditionalCheckFailedException"
+            ):
+                return False
+            raise
+        return True
+
+
+# Delay before a media-retry message becomes visible: gives a CDN outage or a brief
+# throttle time to pass before the first retry.
+MEDIA_RETRY_DELAY_SECONDS = 300
+
+
+class MediaRetryQueue:
+    """Sends media-retry messages to their SQS queue."""
+
+    def __init__(
+        self,
+        sqs_client: SQSClient,
+        queue_url: str,
+        *,
+        delay_seconds: int = MEDIA_RETRY_DELAY_SECONDS,
+    ) -> None:
+        self._sqs = sqs_client
+        self._queue_url = queue_url
+        self._delay = delay_seconds
+
+    def send(self, retry: MediaRetry) -> None:
+        """Enqueue ``retry``; any SQS error propagates."""
+        self._sqs.send_message(
+            QueueUrl=self._queue_url,
+            MessageBody=retry.to_json(),
+            DelaySeconds=self._delay,
+        )
 
 
 def _check_id(value: str | None) -> None:

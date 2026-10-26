@@ -1,12 +1,13 @@
 import json
 import logging
 from collections.abc import Callable
-from typing import Any
+from typing import Any, cast
 
 import httpx
 import pytest
 from conftest import Aws
 from helpers import (
+    KISS,
     TOKEN,
     USER_ID,
     FakeSqs,
@@ -20,6 +21,7 @@ from helpers import (
 )
 from hypothesis import given
 from hypothesis import strategies as st
+from mypy_boto3_s3 import S3Client
 
 from twitter_timeline_data_pipeline import credentials
 from twitter_timeline_data_pipeline.config import ConfigError
@@ -43,6 +45,7 @@ from twitter_timeline_data_pipeline.storage import (
     CheckpointStore,
     Gap,
     TweetStore,
+    estimate_item_size,
 )
 from twitter_timeline_data_pipeline.x_api import AuthError, NotFoundError, XApiError
 
@@ -682,6 +685,7 @@ WORST_CASES = {
     "zwj-family": "\U0001f468\u200d\U0001f469\u200d\U0001f467\u200d\U0001f466",
     "tag-flag": ENGLAND_FLAG,
     "cjk": "\u6f22",
+    "zwj-kiss": KISS,
 }
 
 
@@ -704,20 +708,15 @@ def worst_case_message(unit: str) -> TweetMessage:
     )
 
 
-def approx_item_size(item: Any) -> int:
-    """Approximate DynamoDB item size: UTF-8 bytes of names and strings, plus 8 per
-    number or boolean and 3 per container as an allowance for the structure."""
-    match item:
-        case dict():
-            return 3 + sum(
-                len(k.encode()) + approx_item_size(v) for k, v in item.items()
-            )
-        case list() | tuple():
-            return 3 + sum(approx_item_size(v) for v in item)
-        case str():
-            return len(item.encode())
-        case _:
-            return 8
+class FakeS3:
+    """Records ``put_object`` calls."""
+
+    def __init__(self) -> None:
+        self.puts: list[dict[str, Any]] = []
+
+    def put_object(self, **kwargs: Any) -> dict[str, Any]:
+        self.puts.append(kwargs)
+        return {}
 
 
 @pytest.mark.parametrize("unit", WORST_CASES.values(), ids=WORST_CASES.keys())
@@ -727,13 +726,21 @@ def test_worst_case_posts_fit_one_message_and_one_dynamodb_item(unit: str) -> No
     body = message.to_json()
 
     assert len(body.encode()) < SQS_MAX_MESSAGE_BYTES
-    assert len(body.encode()) < 400_000
     assert TweetMessage.from_json(body) == message
-    item = TweetStore.to_item(message, [])
-    item["media"] = [
-        {"media_key": m.media_key, "alt_text": m.alt_text} for m in message.media
-    ]
-    assert approx_item_size(item) < 400_000
+    s3 = FakeS3()
+    store = TweetStore(cast(Any, None), cast("S3Client", s3), "bucket")
+    item = store.build_item(message, [])
+    # The item never holds more than the estimate allows; what it leaves out is in S3,
+    # in full.
+    assert estimate_item_size(item) < 400_000
+    text = unit * 12_500
+    if item.get("text_truncated"):
+        assert [json.loads(c["Body"]) for c in s3.puts] == [text]
+    else:
+        assert s3.puts == []
+        assert item["text"] == text
+    if len(text.encode()) > 400_000:
+        assert item["text_truncated"] is True
 
 
 def test_a_long_post_is_enqueued_in_full(aws: Aws) -> None:

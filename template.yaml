@@ -3,7 +3,8 @@ Transform: AWS::Serverless-2016-10-31
 Description: >-
   Serverless pipeline: a scheduled Lambda pulls an X (Twitter) user's timeline and
   queues one SQS message per Tweet; a second Lambda stores Tweet metadata in DynamoDB
-  and media in S3.
+  and media in S3. Media that still can't be stored on a message's last receive is
+  recorded as retrying and handled by a third Lambda through its own retry queue.
 
 Parameters:
   TwitterUsername:
@@ -42,7 +43,18 @@ Parameters:
     MaxValue: 1000
     Description: >-
       Receives before a message moves to the dead-letter queue. On the last one the
-      Tweet is written even if its media keeps failing.
+      Tweet is written even if its media keeps failing: that media is recorded as
+      retrying and queued for the media-retry function. A record that fails some other
+      way on its last receive still moves to the dead-letter queue.
+  MediaRetryMaxReceiveCount:
+    Type: Number
+    Default: 10
+    MinValue: 1
+    MaxValue: 1000
+    Description: >-
+      Receives of a media-retry message before it moves to the media-retry dead-letter
+      queue (which has an alarm). Receives are at least the retry queue's visibility
+      timeout apart.
   LogLevel:
     Type: String
     Default: INFO
@@ -95,10 +107,12 @@ Resources:
             - {AttributeName: username, KeyType: HASH}
             - {AttributeName: created_at, KeyType: RANGE}
           # Listings need only these; INCLUDE keeps GSI write units and storage well
-          # below ALL. Fetch other attributes with GetItem on tweet_id.
+          # below ALL. Fetch other attributes with GetItem on tweet_id. text may be a
+          # prefix of an offloaded text; text_truncated and text_s3_key say so.
           Projection:
             ProjectionType: INCLUDE
-            NonKeyAttributes: [text, media_count, public_metrics]
+            NonKeyAttributes:
+              [text, text_truncated, text_s3_key, media_count, public_metrics]
       PointInTimeRecoverySpecification:
         PointInTimeRecoveryEnabled: true
       SSESpecification:
@@ -197,6 +211,33 @@ Resources:
         deadLetterTargetArn: !GetAtt TweetsDeadLetterQueue.Arn
         maxReceiveCount: !Ref MaxReceiveCount
 
+  # Media that couldn't be stored by the last receive of its Tweet message: one message
+  # per media item, consumed by MediaRetryFunction.
+  MediaRetryDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600  # 14 days
+      MaximumMessageSize: 1048576  # matches MediaRetryQueue
+      SqsManagedSseEnabled: true
+      RedriveAllowPolicy:
+        redrivePermission: byQueue
+        sourceQueueArns:
+          # Built from the name, not !GetAtt: MediaRetryQueue already depends on this queue.
+          - !Sub "arn:${AWS::Partition}:sqs:${AWS::Region}:${AWS::AccountId}:${AWS::StackName}-media-retry"
+
+  MediaRetryQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${AWS::StackName}-media-retry"  # fixed so the DLQ can name it
+      SqsManagedSseEnabled: true
+      MessageRetentionPeriod: 1209600  # 14 days
+      # 6 x MediaRetryFunction timeout (300 s); BatchSize 1 has no batching window.
+      VisibilityTimeout: 1800
+      MaximumMessageSize: 1048576  # same as TweetsQueue
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt MediaRetryDeadLetterQueue.Arn
+        maxReceiveCount: !Ref MediaRetryMaxReceiveCount
+
   # --- Log groups ------------------------------------------------------------
   FetchFunctionLogGroup:
     Type: AWS::Logs::LogGroup
@@ -208,9 +249,17 @@ Resources:
     Properties:
       RetentionInDays: 30
 
+  MediaRetryFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 30
+
   # --- Functions -------------------------------------------------------------
   FetchFunction:
     Type: AWS::Serverless::Function
+    # Deploy the processor first: it understands note_text and offloads big texts to
+    # S3, so it must be live before the fetcher can send long posts.
+    DependsOn: ProcessFunction
     Properties:
       Description: Pulls a user's timeline from the X API and queues one message per Tweet.
       Handler: twitter_timeline_data_pipeline.handlers.fetch.handler
@@ -263,9 +312,12 @@ Resources:
           MEDIA_BUCKET: !Ref MediaBucket
           MAX_MEDIA_BYTES: !Ref MaxMediaBytes
           MAX_RECEIVE_COUNT: !Ref MaxReceiveCount
+          MEDIA_RETRY_QUEUE_URL: !Ref MediaRetryQueue
       Policies:
         - DynamoDBWritePolicy:
             TableName: !Ref TweetsTable
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt MediaRetryQueue.QueueName
         - Version: "2012-10-17"
           Statement:
             - Effect: Allow
@@ -286,6 +338,43 @@ Resources:
             ScalingConfig:
               MaximumConcurrency: 5
 
+  MediaRetryFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: Stores media the process function gave up on and updates its Tweet item.
+      Handler: twitter_timeline_data_pipeline.handlers.media_retry.handler
+      Timeout: 300  # room for a large video
+      MemorySize: 512
+      LoggingConfig:
+        LogGroup: !Ref MediaRetryFunctionLogGroup
+      Environment:
+        Variables:
+          TWEETS_TABLE: !Ref TweetsTable
+          MEDIA_BUCKET: !Ref MediaBucket
+          MAX_MEDIA_BYTES: !Ref MaxMediaBytes
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:UpdateItem]
+              Resource: !GetAtt TweetsTable.Arn
+            - Effect: Allow
+              Action: [s3:PutObject, s3:GetObject, s3:AbortMultipartUpload]
+              Resource: !Sub "${MediaBucket.Arn}/*"
+            # ListBucket makes HeadObject return 404 instead of 403 for missing keys.
+            - Effect: Allow
+              Action: s3:ListBucket
+              Resource: !GetAtt MediaBucket.Arn
+      Events:
+        MediaRetryQueueEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt MediaRetryQueue.Arn
+            BatchSize: 1
+            FunctionResponseTypes: [ReportBatchItemFailures]
+            ScalingConfig:
+              MaximumConcurrency: 2  # bounds concurrent big downloads
+
   # --- Alarms ----------------------------------------------------------------
   DeadLetterQueueNotEmptyAlarm:
     Type: AWS::CloudWatch::Alarm
@@ -295,6 +384,24 @@ Resources:
       MetricName: ApproximateNumberOfMessagesVisible
       Dimensions:
         - {Name: QueueName, Value: !GetAtt TweetsDeadLetterQueue.QueueName}
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref AWS::NoValue]
+
+  MediaRetryDeadLetterQueueNotEmptyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: >-
+        Media could not be stored even after the media-retry attempts; see the
+        runbook to inspect and redrive the media-retry dead-letter queue.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - {Name: QueueName, Value: !GetAtt MediaRetryDeadLetterQueue.QueueName}
       Statistic: Maximum
       Period: 300
       EvaluationPeriods: 1
@@ -340,6 +447,10 @@ Outputs:
     Value: !Ref TweetsQueue
   DeadLetterQueueUrl:
     Value: !Ref TweetsDeadLetterQueue
+  MediaRetryQueueUrl:
+    Value: !Ref MediaRetryQueue
+  MediaRetryDeadLetterQueueUrl:
+    Value: !Ref MediaRetryDeadLetterQueue
   TweetsTableName:
     Value: !Ref TweetsTable
   StateTableName:
@@ -352,3 +463,5 @@ Outputs:
     Value: !Ref FetchFunction
   ProcessFunctionName:
     Value: !Ref ProcessFunction
+  MediaRetryFunctionName:
+    Value: !Ref MediaRetryFunction

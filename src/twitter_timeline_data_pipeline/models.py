@@ -1,4 +1,4 @@
-"""Data model shared by both Lambdas.
+"""Data model shared by the Lambdas.
 
 The fetch Lambda turns X API v2 timeline pages into ``TweetMessage`` objects and sends
 each one to SQS as JSON. The process Lambda parses that JSON back. Every message
@@ -26,6 +26,13 @@ SCHEMA_VERSION = 1
 # rejects (or UTF-8 can't encode) is matched here: surrogate code points (a lone
 # surrogate can't be encoded) plus U+FFFE and U+FFFF.
 _DISALLOWED_CHARS = re.compile("[\ud800-\udfff\ufffe\uffff]")
+
+
+def escape_disallowed_chars(json_text: str) -> str:
+    """Escape (as ``\\uXXXX``) the characters in JSON text that SQS rejects or UTF-8
+    can't encode, so the text encodes as strict UTF-8 and parses back unchanged."""
+    return _DISALLOWED_CHARS.sub(lambda m: f"\\u{ord(m[0]):04x}", json_text)
+
 
 type TweetId = str
 type MediaKey = str
@@ -258,7 +265,7 @@ class TweetMessage:
         # UTF-8, escaping only what SQS rejects or UTF-8 can't encode. Escaping every
         # non-ASCII character inflated emoji 3 to 6 times and ate the size limit.
         body = json.dumps(self.to_dict(), separators=(",", ":"), ensure_ascii=False)
-        return _DISALLOWED_CHARS.sub(lambda m: f"\\u{ord(m[0]):04x}", body)
+        return escape_disallowed_chars(body)
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> Self:
@@ -271,6 +278,93 @@ class TweetMessage:
             username=str(data["username"]),
             tweet=Tweet.from_dict(data["tweet"]),
             media=tuple(Media.from_dict(m) for m in data.get("media") or ()),
+            fetched_at=normalize_fetched_at(data["fetched_at"]),
+            schema_version=version,
+        )
+
+    @classmethod
+    def from_json(cls, body: str) -> Self:
+        """Parse an SQS body. Raises ``MessageError`` for anything malformed."""
+        try:
+            data = json.loads(body, parse_constant=_reject_constant)
+            if not isinstance(data, dict):
+                raise MessageError(f"expected a JSON object, got {type(data).__name__}")
+            return cls.from_dict(data)
+        except MessageError:
+            raise
+        except (
+            ValueError,
+            KeyError,
+            TypeError,
+            AttributeError,
+            OverflowError,
+            RecursionError,
+        ) as exc:
+            raise MessageError(f"malformed message: {exc!r}") from exc
+
+
+MEDIA_RETRY_KIND = "media_retry"
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class MediaRetry:
+    """The media-retry queue message: one media item whose Tweet is already stored.
+
+    ``kind`` separates it from a ``TweetMessage`` (which has no such field), so one
+    can't be mistaken for the other if a message lands on the wrong queue.
+    """
+
+    tweet_id: TweetId
+    username: str
+    media: Media
+    author_id: str | None = None
+    fetched_at: str = field(default_factory=utc_now_iso)
+    schema_version: int = SCHEMA_VERSION
+
+    def to_dict(self) -> JSONObject:
+        return {
+            "kind": MEDIA_RETRY_KIND,
+            "schema_version": self.schema_version,
+            "tweet_id": self.tweet_id,
+            "username": self.username,
+            "author_id": self.author_id,
+            "fetched_at": self.fetched_at,
+            "media": asdict(self.media),
+        }
+
+    def to_json(self) -> str:
+        body = json.dumps(self.to_dict(), separators=(",", ":"), ensure_ascii=False)
+        return _DISALLOWED_CHARS.sub(lambda m: f"\\u{ord(m[0]):04x}", body)
+
+    def to_tweet_message(self) -> TweetMessage:
+        """A minimal message with what the media store needs to name the S3 object."""
+        return TweetMessage(
+            username=self.username,
+            tweet=Tweet(id=self.tweet_id, text="", author_id=self.author_id),
+            media=(self.media,),
+            fetched_at=self.fetched_at,
+            schema_version=self.schema_version,
+        )
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> Self:
+        if data.get("kind") != MEDIA_RETRY_KIND:
+            raise MessageError(
+                f"not a {MEDIA_RETRY_KIND} message: {data.get('kind')!r}"
+            )
+        version = data.get("schema_version")
+        if type(version) is not int or version != SCHEMA_VERSION:
+            raise MessageError(
+                f"unsupported schema_version {version!r}; expected {SCHEMA_VERSION}"
+            )
+        tweet_id = data["tweet_id"]
+        if not isinstance(tweet_id, str) or not tweet_id:
+            raise MessageError(f"tweet_id must be a non-empty string: {tweet_id!r}")
+        return cls(
+            tweet_id=tweet_id,
+            username=str(data["username"]),
+            author_id=_opt_str(data.get("author_id")),
+            media=Media.from_dict(data["media"]),
             fetched_at=normalize_fetched_at(data["fetched_at"]),
             schema_version=version,
         )
