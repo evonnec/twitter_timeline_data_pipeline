@@ -30,6 +30,13 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
+# LocalStack accepts any credentials, but the host-side provisioning and test clients
+# need some to sign requests (CI runners have none). The function containers get theirs
+# from the generated env files.
+export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-test}"
+export AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-test}"
+export AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-us-east-1}"
+
 BUNDLE_DIR="${BUNDLE_DIR:-build/lambda}"
 LOCALSTACK_IMAGE="${LOCALSTACK_IMAGE:-localstack/localstack:4.14.0}" # last release that needs no auth token
 LAMBDA_IMAGE="${LAMBDA_IMAGE:-public.ecr.aws/lambda/python:3.14}"
