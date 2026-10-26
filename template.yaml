@@ -33,7 +33,7 @@ Parameters:
   LogLevel:
     Type: String
     Default: INFO
-    AllowedValues: [DEBUG, INFO, WARNING, ERROR]
+    AllowedValues: [DEBUG, INFO, WARN, ERROR]
   AlarmTopicArn:
     Type: String
     Default: ""
@@ -41,6 +41,8 @@ Parameters:
 
 Conditions:
   HasAlarmTopic: !Not [!Equals [!Ref AlarmTopicArn, ""]]
+  # SAM treats any non-empty `Enabled` string as true, so map the parameter to State.
+  ScheduleIsEnabled: !Equals [!Ref ScheduleEnabled, "true"]
 
 Globals:
   Function:
@@ -176,8 +178,8 @@ Resources:
       Handler: twitter_timeline_data_pipeline.handlers.fetch.handler
       Timeout: 300
       MemorySize: 256
-      # Runs never overlap, so the per-user checkpoint can't race.
-      ReservedConcurrentExecutions: 1
+      # No reserved concurrency: the checkpoint write is conditional, so overlapping runs
+      # only cause duplicates, which processing tolerates.
       LoggingConfig:
         LogGroup: !Ref FetchFunctionLogGroup
       Environment:
@@ -206,7 +208,7 @@ Resources:
           Type: Schedule
           Properties:
             Schedule: !Ref ScheduleExpression
-            Enabled: !Ref ScheduleEnabled
+            State: !If [ScheduleIsEnabled, ENABLED, DISABLED]
 
   ProcessFunction:
     Type: AWS::Serverless::Function
@@ -227,7 +229,7 @@ Resources:
         - Version: "2012-10-17"
           Statement:
             - Effect: Allow
-              Action: [s3:PutObject, s3:GetObject]
+              Action: [s3:PutObject, s3:GetObject, s3:AbortMultipartUpload]
               Resource: !Sub "${MediaBucket.Arn}/*"
             # ListBucket makes HeadObject return 404 instead of 403 for missing keys.
             - Effect: Allow

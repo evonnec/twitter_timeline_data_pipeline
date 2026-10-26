@@ -150,8 +150,9 @@ def test_batch_size_fits_a_single_send_batch(template: Template) -> None:
     assert sqs_event(template)["BatchSize"] <= 10
 
 
-def test_fetch_function_never_runs_concurrently(template: Template) -> None:
-    assert properties(template, "FetchFunction")["ReservedConcurrentExecutions"] == 1
+def test_fetch_function_has_no_reserved_concurrency(template: Template) -> None:
+    # The checkpoint write is conditional, so overlapping runs only duplicate work.
+    assert "ReservedConcurrentExecutions" not in properties(template, "FetchFunction")
 
 
 def test_fetch_function_is_not_retried_by_lambda(template: Template) -> None:
@@ -276,3 +277,34 @@ def test_process_function_can_head_missing_media_without_403(
 
 def _as_list(value: str | list[str]) -> list[str]:
     return [value] if isinstance(value, str) else value
+
+
+def test_schedule_state_follows_the_enabled_parameter(template: Template) -> None:
+    events = properties(template, "FetchFunction")["Events"]
+    (event,) = (e for e in events.values() if e["Type"] == "Schedule")
+    schedule = event["Properties"]
+
+    assert template["Conditions"]["ScheduleIsEnabled"] == {
+        "Fn::Equals": [{"Ref": "ScheduleEnabled"}, "true"]
+    }
+    assert schedule["State"] == {"Fn::If": ["ScheduleIsEnabled", "ENABLED", "DISABLED"]}
+    assert "Enabled" not in schedule  # SAM would treat any non-empty string as true
+
+
+def test_log_level_parameter_only_allows_lambda_levels(template: Template) -> None:
+    allowed = template["Parameters"]["LogLevel"]["AllowedValues"]
+
+    assert allowed == ["DEBUG", "INFO", "WARN", "ERROR"]
+    assert template["Parameters"]["LogLevel"]["Default"] in allowed
+
+
+def test_process_function_can_abort_multipart_uploads(template: Template) -> None:
+    statements = [
+        s
+        for policy in properties(template, "ProcessFunction")["Policies"]
+        if isinstance(policy, dict) and "Statement" in policy
+        for s in policy["Statement"]
+    ]
+    actions = {a for s in statements for a in _as_list(s["Action"])}
+
+    assert "s3:AbortMultipartUpload" in actions

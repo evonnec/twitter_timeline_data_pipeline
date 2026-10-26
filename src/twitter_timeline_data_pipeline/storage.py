@@ -16,7 +16,7 @@ import posixpath
 from collections.abc import Buffer, Iterator, Sequence
 from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, Any, Literal, cast, override
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import httpx
 from botocore.exceptions import ClientError
@@ -35,8 +35,12 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 type MediaStatus = Literal["stored", "exists", "unavailable", "skipped"]
-"""stored: uploaded now. exists: already in S3. unavailable: the source returned
-403/404/410. skipped: nothing downloadable (e.g. a video with only an HLS variant)."""
+"""stored: uploaded now. exists: already in S3. unavailable: the source returned a
+4xx other than 429 (or a redirect, which isn't followed). skipped: nothing to download:
+a video with only an HLS variant, or a URL that isn't https on an allowed media host."""
+
+# Media is only downloaded from the X CDN; message bodies are untrusted input.
+ALLOWED_MEDIA_HOSTS = frozenset({"pbs.twimg.com", "video.twimg.com"})
 
 _KNOWN_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".gif", ".webp", ".mp4"})
 _MISSING_OBJECT_CODES = frozenset({"404", "NoSuchKey", "NotFound"})
@@ -91,7 +95,13 @@ def _original_size_url(url: str) -> str:
     """Photos on the media CDN default to a reduced size; ``name=orig`` is full size."""
     parts = urlsplit(url)
     if parts.hostname == "pbs.twimg.com" and parts.path.startswith("/media/"):
-        return urlunsplit(parts._replace(query="name=orig"))
+        query = [
+            (k, v)
+            for k, v in parse_qsl(parts.query, keep_blank_values=True)
+            if k != "name"
+        ]
+        query.append(("name", "orig"))
+        return urlunsplit(parts._replace(query=urlencode(query)))
     return url
 
 
@@ -136,6 +146,16 @@ class MediaStore:
             )
         raw_url, known_type = source
         url = _original_size_url(raw_url)
+        parts = urlsplit(url)
+        if parts.scheme != "https" or parts.hostname not in ALLOWED_MEDIA_HOSTS:
+            logger.warning(
+                "media %s skipped: host %r is not an allowed media host",
+                media.media_key,
+                parts.hostname,
+            )
+            return StoredMedia(
+                media_key=media.media_key, type=media.type, status="skipped"
+            )
         key = self.object_key(message, media, _extension(known_type, url))
 
         def result(status: MediaStatus, **extra: Any) -> StoredMedia:
@@ -161,11 +181,12 @@ class MediaStore:
             )
 
         try:
-            with self._http.stream("GET", url, follow_redirects=True) as response:
+            # Redirects stay off so a media host can't bounce the download elsewhere.
+            with self._http.stream("GET", url, follow_redirects=False) as response:
                 status = response.status_code
                 if status == 429 or status >= 500:
                     raise TransientMediaError(f"HTTP {status} fetching {url}")
-                if status >= 400:
+                if status >= 300:
                     logger.warning(
                         "media %s unavailable: HTTP %s", media.media_key, status
                     )

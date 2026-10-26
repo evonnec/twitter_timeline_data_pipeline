@@ -6,6 +6,10 @@ import pytest
 import twitter_timeline_data_pipeline as package
 
 
+def test_user_agent_carries_the_version() -> None:
+    assert f"twitter-timeline-data-pipeline/{package.__version__}" == package.USER_AGENT
+
+
 def test_version_is_a_string() -> None:
     assert isinstance(package.__version__, str)
 
