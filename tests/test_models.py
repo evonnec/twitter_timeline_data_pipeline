@@ -1,11 +1,21 @@
 import json
 import logging
+import re
 from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import pytest
-from helpers import FETCHED_AT, XApiStub, make_message, photo, x_client
+from helpers import (
+    FETCHED_AT,
+    FIXTURES,
+    XApiStub,
+    long_post_api_object,
+    make_message,
+    photo,
+    x_client,
+)
 
 from twitter_timeline_data_pipeline.models import (
     SCHEMA_VERSION,
@@ -306,13 +316,24 @@ def test_message_json_round_trip_preserves_everything() -> None:
     assert TweetMessage.from_json(original.to_json()) == original
 
 
-def test_message_json_is_compact_and_ascii_escaped() -> None:
+def test_message_json_is_compact_utf8() -> None:
     body = make_message(tweet={"text": "caf\u00e9 \U0001f680"}).to_json()
 
     assert ", " not in body
     assert ": " not in body
-    assert body.isascii()
-    assert "\\u00e9" in body
+    assert "caf\u00e9 \U0001f680" in body  # not ASCII-escaped
+    assert "\\u00e9" not in body
+
+
+def test_message_json_still_escapes_control_characters() -> None:
+    body = make_message(tweet={"text": "a\x00b\x1fc\nd"}).to_json()
+
+    assert "\x00" not in body
+    assert "\x1f" not in body
+    assert TweetMessage.from_json(body).tweet.text == "a\x00b\x1fc\nd"
+
+
+SQS_ALLOWED = re.compile("[\t\n\r\x20-\ud7ff\ue000-\ufffd\U00010000-\U0010ffff]*")
 
 
 @pytest.mark.parametrize(
@@ -323,17 +344,32 @@ def test_message_json_is_compact_and_ascii_escaped() -> None:
         "a\ud83db",
         "\uffff",
         "x\ufffe",
+        "\U0001f600",
+        "\U0001f468\u200d\U0001f469\u200d\U0001f467",
+        "\U0001f3f4\U000e0067\U000e0062\U000e007f",
+        "\udfff\ud800\uffff\ufffe\U0010ffff",
     ],
-    ids=["non-ascii", "lone-surrogate", "embedded-surrogate", "uffff", "ufffe"],
+    ids=[
+        "non-ascii",
+        "lone-surrogate",
+        "embedded-surrogate",
+        "uffff",
+        "ufffe",
+        "astral-emoji",
+        "zwj",
+        "tag-flag",
+        "mixed-edges",
+    ],
 )
 def test_message_json_round_trips_awkward_text(text: str) -> None:
-    message = make_message(tweet={"text": text})
+    message = make_message(tweet={"text": text, "note_text": text})
 
     body = message.to_json()
 
     body.encode("utf-8")  # a lone surrogate would raise here if left unescaped
-    assert body.isascii()
+    assert SQS_ALLOWED.fullmatch(body)
     assert TweetMessage.from_json(body).tweet.text == text
+    assert TweetMessage.from_json(body).tweet.note_text == text
 
 
 def test_message_to_dict_carries_schema_version_and_fetched_at() -> None:
@@ -519,3 +555,118 @@ def test_normalize_username_strips_one_at_and_lowercases(
     given: str, expected: str
 ) -> None:
     assert normalize_username(given) == expected
+
+
+def message_data(**overrides: Any) -> dict[str, Any]:
+    data: dict[str, Any] = json.loads(make_message().to_json())
+    data.update(overrides)
+    return data
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("2026-10-25T01:00:00+01:00", "2026-10-25T00:00:00Z"),
+        ("2026-10-25 23:59:59Z", "2026-10-25T23:59:59Z"),
+        ("2026-10-25T12:00:00.500Z", "2026-10-25T12:00:00Z"),
+        ("2026-10-25T12:00:00Z", "2026-10-25T12:00:00Z"),
+    ],
+)
+def test_from_dict_normalizes_fetched_at_to_utc_seconds(
+    raw: str, expected: str
+) -> None:
+    assert TweetMessage.from_dict(message_data(fetched_at=raw)).fetched_at == expected
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [None, 20261025, ["2026-10-25T00:00:00Z"], "yesterday", "", "2026-10-25T00:00:00"],
+)
+def test_from_dict_rejects_a_bad_fetched_at(raw: object) -> None:
+    with pytest.raises(MessageError, match="fetched_at"):
+        TweetMessage.from_dict(message_data(fetched_at=raw))
+
+
+def test_from_dict_rejects_a_far_future_fetched_at() -> None:
+    with pytest.raises(MessageError, match="future"):
+        TweetMessage.from_dict(message_data(fetched_at="2999-01-01T00:00:00Z"))
+
+
+def test_from_dict_accepts_a_slightly_future_fetched_at() -> None:
+    soon = (datetime.now(UTC) + timedelta(minutes=1)).isoformat()
+
+    assert TweetMessage.from_dict(message_data(fetched_at=soon))
+
+
+def test_from_dict_rejects_a_boolean_schema_version() -> None:
+    with pytest.raises(MessageError, match="unsupported schema_version"):
+        TweetMessage.from_dict(message_data(schema_version=True))
+
+
+# ---- long posts (note_tweet) and schema compatibility ----------------------
+
+
+def test_tweet_from_api_reads_note_tweet_text() -> None:
+    post = long_post_api_object()
+
+    tweet = Tweet.from_api(post)
+
+    assert tweet.note_text == post["note_tweet"]["text"]
+    assert tweet.text == post["text"]
+    assert tweet.full_text == tweet.note_text
+
+
+def test_full_text_is_text_for_a_short_post() -> None:
+    tweet = Tweet.from_api({"id": "1", "text": "short"})
+
+    assert tweet.note_text is None
+    assert tweet.full_text == "short"
+
+
+def test_long_post_survives_a_message_round_trip() -> None:
+    tweet = Tweet.from_api(long_post_api_object())
+    message = TweetMessage(username="u", tweet=tweet, fetched_at=FETCHED_AT)
+
+    data = json.loads(message.to_json())
+    parsed = TweetMessage.from_json(message.to_json())
+
+    assert data["tweet"]["note_text"] == tweet.note_text
+    assert "note_tweet" not in data["tweet"]  # flat key, entities are out of scope
+    assert parsed == message
+
+
+def test_schema_version_stays_1_for_the_additive_note_text_field() -> None:
+    assert SCHEMA_VERSION == 1
+
+
+def test_golden_v1_message_without_note_text_parses() -> None:
+    """A body in the format produced before ``note_text`` existed, kept as a fixture."""
+    body = (FIXTURES / "message_v1.json").read_text()
+    assert "note_text" not in body
+
+    parsed = TweetMessage.from_json(body)
+
+    assert parsed.schema_version == 1
+    assert parsed.tweet.note_text is None
+    assert parsed.tweet.full_text == "old format"
+
+
+def test_unknown_keys_are_ignored_at_message_and_tweet_level() -> None:
+    """What a previous reader relied on: extra keys never matter, so a newer writer's
+    additive fields don't break it."""
+    data = json.loads((FIXTURES / "message_v1.json").read_text())
+    data["future_field"] = 1
+    data["tweet"]["future_field"] = 2
+
+    parsed = TweetMessage.from_dict(data)
+
+    assert parsed == TweetMessage.from_dict(
+        json.loads((FIXTURES / "message_v1.json").read_text())
+    )
+
+
+def test_note_post_is_accepted_as_the_renamed_field() -> None:
+    tweet = Tweet.from_api({"id": "1", "text": "p", "note_post": {"text": "full"}})
+
+    assert tweet.note_text == "full"
+    assert tweet.full_text == "full"

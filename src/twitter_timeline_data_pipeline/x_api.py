@@ -40,6 +40,7 @@ TWEET_FIELDS = (
     "created_at",
     "edit_history_tweet_ids",
     "lang",
+    "note_tweet",
     "public_metrics",
     "referenced_tweets",
 )

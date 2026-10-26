@@ -7,6 +7,7 @@ import pytest
 from conftest import Aws
 from helpers import (
     GIF_URL,
+    LONG_POST_ID,
     PHOTO_URL,
     USER_ID,
     VIDEO_HI_URL,
@@ -16,6 +17,9 @@ from helpers import (
     ddb_get,
     ddb_items,
     install_x_api,
+    long_post_api_object,
+    long_post_timeline,
+    make_message,
     sqs_record,
     synthetic_timeline,
 )
@@ -250,3 +254,47 @@ def test_media_gone_for_good_is_recorded_not_retried(
     assert result == {"batchItemFailures": []}
     assert PHOTO_KEY not in s3_keys(pipeline)
     assert item(pipeline, PHOTO_TWEET)["media"][0]["status"] == "unavailable"
+
+
+def test_redriving_an_older_message_after_a_newer_one_leaves_the_item_unchanged(
+    pipeline: Aws,
+) -> None:
+    """A DLQ redrive days later must not replace newer metrics (review repro 3)."""
+
+    def message(likes: int, fetched_at: str) -> dict[str, Any]:
+        return sqs_record(
+            f"m{likes}",
+            make_message(
+                "7",
+                tweet={"public_metrics": {"like_count": likes}},
+                fetched_at=fetched_at,
+            ).to_json(),
+        )
+
+    newer = message(5000, "2026-10-25T12:00:00Z")
+    older = message(10, "2026-10-20T12:00:00Z")
+
+    assert process_handler({"Records": [newer]}, None) == {"batchItemFailures": []}
+    assert process_handler({"Records": [older]}, None) == {"batchItemFailures": []}
+
+    stored = item(pipeline, "7")
+    assert stored["public_metrics"] == {"like_count": 5000}
+    assert stored["fetched_at"] == "2026-10-25T12:00:00Z"
+
+
+def test_long_post_is_stored_in_full(
+    pipeline_env: Aws, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    install_x_api(monkeypatch, fetch, long_post_timeline())
+    post = long_post_api_object()
+
+    fetched = fetch_handler({"username": USERNAME}, None)
+    processed = process_handler({"Records": drain(pipeline_env)}, None)
+
+    assert fetched["enqueued"] == 1
+    assert processed == {"batchItemFailures": []}
+    stored = item(pipeline_env, LONG_POST_ID)
+    assert stored["text"] == post["note_tweet"]["text"]
+    assert len(stored["text"]) > 280
+    assert stored["display_text"] == post["text"]
+    assert stored["is_long_post"] is True

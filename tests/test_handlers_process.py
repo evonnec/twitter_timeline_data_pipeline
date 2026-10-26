@@ -30,7 +30,7 @@ from twitter_timeline_data_pipeline.handlers.process import (
     process_records,
 )
 from twitter_timeline_data_pipeline.models import Media, TweetMessage
-from twitter_timeline_data_pipeline.storage import MediaStore, TweetStore
+from twitter_timeline_data_pipeline.storage import MediaStore, PutResult, TweetStore
 
 SAMPLE_EVENT = Path(__file__).parent.parent / "events" / "sqs.json"
 SAMPLE_PHOTO_URL = "https://pbs.twimg.com/media/ExamplePhoto1.jpg"
@@ -51,6 +51,10 @@ def photo_message(tweet_id: str, url: str = PHOTO_URL) -> TweetMessage:
     return make_message(tweet_id, media=(item,), tweet={"media_keys": [item.media_key]})
 
 
+OLD = "2026-10-20T12:00:00Z"
+NEW = "2026-10-25T12:00:00Z"
+
+
 class ExplodingTweetStore(TweetStore):
     """Fails like a DynamoDB outage for one tweet; behaves normally otherwise."""
 
@@ -58,10 +62,10 @@ class ExplodingTweetStore(TweetStore):
         super().__init__(table)
         self._bad = bad_tweet_id
 
-    def put_tweet(self, message: TweetMessage, media: Any) -> None:
+    def put_tweet(self, message: TweetMessage, media: Any) -> PutResult:
         if message.tweet.id == self._bad:
             raise RuntimeError("simulated DynamoDB outage")
-        super().put_tweet(message, media)
+        return super().put_tweet(message, media)
 
 
 def stored_tweet_ids(aws: Aws) -> set[str]:
@@ -121,6 +125,44 @@ def test_empty_batch_has_no_failures(aws: Aws, cdn: CdnStub) -> None:
     )
 
     assert failed == []
+
+
+def test_stale_record_is_skipped_without_failing_and_logged(
+    aws: Aws, cdn: CdnStub, caplog: pytest.LogCaptureFixture
+) -> None:
+    newer = make_message(
+        GOOD, tweet={"public_metrics": {"like_count": 5000}}, fetched_at=NEW
+    )
+    pic = photo(f"3_{GOOD}")  # the stale message still carries media
+    older = make_message(
+        GOOD, media=(pic,), tweet={"media_keys": [pic.media_key]}, fetched_at=OLD
+    )
+    store = TweetStore(aws.tweets_table)
+    media_store = MediaStore(aws.s3, aws.bucket, cdn.client())
+    process_records(
+        [sqs_record("new", body(newer))], media_store=media_store, tweet_store=store
+    )
+
+    with caplog.at_level(logging.INFO):
+        failed = process_records(
+            [sqs_record("old", body(older))],
+            media_store=media_store,
+            tweet_store=store,
+        )
+
+    assert failed == []
+    assert any(
+        m.startswith(f"stale write skipped for tweet {GOOD}")
+        and f"stored fetched_at {NEW}, schema_version 1" in m
+        for m in caplog.messages
+    )
+    assert not any(m.startswith("stored tweet") for m in caplog.messages)
+    stored = ddb_get(aws.tweets_table, tweet_id=GOOD)
+    assert stored["fetched_at"] == NEW
+    assert stored["public_metrics"] == {"like_count": 5000}
+    assert (
+        len(s3_keys(aws)) == 1
+    )  # known limitation: the stale record's media step still ran
 
 
 def test_all_good_batch_has_no_failures(aws: Aws, cdn: CdnStub) -> None:
@@ -303,9 +345,9 @@ def test_unstarted_records_are_reported_and_untouched_when_time_runs_low(
     puts: list[str] = []
 
     class SpyTweetStore(TweetStore):
-        def put_tweet(self, message: TweetMessage, media: Any) -> None:
+        def put_tweet(self, message: TweetMessage, media: Any) -> PutResult:
             puts.append(message.tweet.id)
-            super().put_tweet(message, media)
+            return super().put_tweet(message, media)
 
     failed = process_records(
         records,
@@ -596,9 +638,9 @@ def test_cheapest_records_run_first_and_unknown_size_videos_last(
     order: list[str] = []
 
     class Spy(TweetStore):
-        def put_tweet(self, message: TweetMessage, media: Any) -> None:
+        def put_tweet(self, message: TweetMessage, media: Any) -> PutResult:
             order.append(message.tweet.id)
-            super().put_tweet(message, media)
+            return super().put_tweet(message, media)
 
     process_records(
         records,

@@ -3,28 +3,35 @@ from collections.abc import Iterator
 from typing import Any, cast
 from urllib.parse import urlsplit
 
+import boto3
 import httpx
 import pytest
 from botocore.exceptions import ClientError
 from conftest import STATE_TABLE, Aws
 from helpers import (
     GIF_URL,
+    LONG_POST_ID,
     PHOTO_URL,
     USER_ID,
     VIDEO_HI_URL,
     CdnStub,
     as_items,
     ddb_get,
+    long_post_api_object,
     make_message,
     photo,
 )
+from hypothesis import given, settings
+from hypothesis import strategies as st
+from moto import mock_aws
 from mypy_boto3_s3 import S3Client
 
-from twitter_timeline_data_pipeline.models import Media, TweetMessage
+from twitter_timeline_data_pipeline.models import Media, Tweet, TweetMessage
 from twitter_timeline_data_pipeline.storage import (
     ALLOWED_MEDIA_HOSTS,
     CheckpointStore,
     MediaStore,
+    PutResult,
     StoredMedia,
     TransientMediaError,
     TweetStore,
@@ -460,6 +467,7 @@ def test_to_item_contains_every_field() -> None:
         "username": "example_user",
         "author_id": USER_ID,
         "text": f"tweet {TWEET_ID}",
+        "is_long_post": False,
         "created_at": "2026-10-20T12:00:00.000Z",
         "conversation_id": "1700000000000000001",
         "lang": "en",
@@ -481,6 +489,27 @@ def test_to_item_contains_every_field() -> None:
         "fetched_at": "2026-10-25T00:00:00Z",
         "schema_version": 1,
     }
+
+
+def test_to_item_stores_the_full_text_of_a_long_post() -> None:
+    post = long_post_api_object()
+    message = TweetMessage(
+        username="example_user", tweet=Tweet.from_api(post), fetched_at="x"
+    )
+
+    item = TweetStore.to_item(message, [])
+
+    assert item["tweet_id"] == LONG_POST_ID
+    assert item["text"] == post["note_tweet"]["text"]
+    assert item["display_text"] == post["text"]
+    assert item["is_long_post"] is True
+
+
+def test_to_item_flags_a_short_post_as_not_long_and_has_no_display_text() -> None:
+    item = TweetStore.to_item(make_message(), [])
+
+    assert item["is_long_post"] is False
+    assert "display_text" not in item
 
 
 def test_to_item_drops_none_values_at_every_level() -> None:
@@ -535,14 +564,152 @@ def test_put_tweet_is_queryable_via_username_index(aws: Aws) -> None:
     ]
 
 
-def test_put_tweet_twice_replaces_the_item(aws: Aws) -> None:
-    store = TweetStore(aws.tweets_table)
-    store.put_tweet(make_message(tweet={"public_metrics": {"like_count": 1}}), [])
-    store.put_tweet(make_message(tweet={"public_metrics": {"like_count": 9}}), [])
+OLDER = "2026-10-20T12:00:00Z"
+NEWER = "2026-10-25T12:00:00Z"
 
+
+def likes(count: int, fetched_at: str, **kwargs: Any) -> TweetMessage:
+    return make_message(
+        tweet={"public_metrics": {"like_count": count}},
+        fetched_at=fetched_at,
+        **kwargs,
+    )
+
+
+def stored_item(aws: Aws) -> dict[str, Any]:
     assert aws.tweets_table.scan()["Count"] == 1
-    item = ddb_get(aws.tweets_table, tweet_id=TWEET_ID)
-    assert item["public_metrics"] == {"like_count": 9}
+    return ddb_get(aws.tweets_table, tweet_id=TWEET_ID)
+
+
+def test_put_tweet_newer_then_older_skips_the_older(aws: Aws) -> None:
+    store = TweetStore(aws.tweets_table)
+
+    assert store.put_tweet(likes(5000, NEWER), []).written is True
+    assert store.put_tweet(likes(10, OLDER), []).written is False
+
+    item = stored_item(aws)
+    assert item["public_metrics"] == {"like_count": 5000}
+    assert item["fetched_at"] == NEWER
+
+
+def test_put_tweet_older_then_newer_replaces_the_item(aws: Aws) -> None:
+    store = TweetStore(aws.tweets_table)
+
+    assert store.put_tweet(likes(10, OLDER), []).written is True
+    assert store.put_tweet(likes(5000, NEWER), []).written is True
+
+    item = stored_item(aws)
+    assert item["public_metrics"] == {"like_count": 5000}
+    assert item["fetched_at"] == NEWER
+
+
+def test_put_tweet_with_equal_fetched_at_rewrites_idempotently(aws: Aws) -> None:
+    store = TweetStore(aws.tweets_table)
+
+    assert store.put_tweet(likes(7, NEWER), []).written is True
+    assert store.put_tweet(likes(7, NEWER), []).written is True
+    assert (
+        store.put_tweet(likes(8, NEWER), []).written is True
+    )  # the tie rule: last one wins
+
+    assert stored_item(aws)["public_metrics"] == {"like_count": 8}
+
+
+def test_put_tweet_older_schema_version_cannot_overwrite_a_newer_one(
+    aws: Aws,
+) -> None:
+    store = TweetStore(aws.tweets_table)
+
+    assert store.put_tweet(likes(1, OLDER, schema_version=2), []).written is True
+    # fetched later, but in the old format
+    assert store.put_tweet(likes(2, NEWER, schema_version=1), []).written is False
+
+    item = stored_item(aws)
+    assert item["schema_version"] == 2
+    assert item["public_metrics"] == {"like_count": 1}
+
+
+def test_put_tweet_newer_schema_version_can_overwrite_an_older_one(aws: Aws) -> None:
+    store = TweetStore(aws.tweets_table)
+
+    assert store.put_tweet(likes(1, OLDER, schema_version=1), []).written is True
+    assert store.put_tweet(likes(2, NEWER, schema_version=2), []).written is True
+
+    assert stored_item(aws)["schema_version"] == 2
+
+
+def test_put_tweet_overwrites_a_legacy_item_without_schema_version(aws: Aws) -> None:
+    aws.tweets_table.put_item(
+        Item={"tweet_id": TWEET_ID, "username": "u", "fetched_at": OLDER}
+    )
+
+    assert TweetStore(aws.tweets_table).put_tweet(likes(3, NEWER), []).written
+
+    item = stored_item(aws)
+    assert item["schema_version"] == 1
+    assert item["public_metrics"] == {"like_count": 3}
+
+
+def test_put_tweet_overwrites_an_item_without_fetched_at(aws: Aws) -> None:
+    aws.tweets_table.put_item(Item={"tweet_id": TWEET_ID, "username": "u"})
+
+    assert TweetStore(aws.tweets_table).put_tweet(likes(3, NEWER), []).written
+
+    assert stored_item(aws)["fetched_at"] == NEWER
+
+
+def test_put_tweet_stale_result_reports_the_stored_values(aws: Aws) -> None:
+    store = TweetStore(aws.tweets_table)
+    store.put_tweet(likes(1, NEWER, schema_version=2), [])
+
+    result = store.put_tweet(likes(2, OLDER), [])
+
+    assert result == PutResult(
+        written=False, stored_fetched_at=NEWER, stored_schema_version=2
+    )
+
+
+def test_put_tweet_reraises_other_dynamodb_errors(aws: Aws) -> None:
+    class Failing:
+        def put_item(self, **_: Any) -> None:
+            raise ClientError(
+                {"Error": {"Code": "ProvisionedThroughputExceededException"}},
+                "PutItem",
+            )
+
+    store = TweetStore(cast(Any, Failing()))
+
+    with pytest.raises(ClientError, match="ProvisionedThroughputExceeded"):
+        store.put_tweet(likes(1, NEWER), [])
+
+
+@settings(max_examples=25, deadline=None)
+@given(
+    fetched=st.lists(
+        st.sampled_from([f"2026-10-{day:02d}T00:00:00Z" for day in range(1, 6)]),
+        min_size=1,
+        max_size=8,
+    )
+)
+def test_any_delivery_order_ends_with_the_greatest_fetched_at(
+    fetched: list[str],
+) -> None:
+    with mock_aws():
+        table = boto3.resource("dynamodb", region_name="us-east-1").create_table(
+            TableName="tweets-prop",
+            BillingMode="PAY_PER_REQUEST",
+            KeySchema=[{"AttributeName": "tweet_id", "KeyType": "HASH"}],
+            AttributeDefinitions=[{"AttributeName": "tweet_id", "AttributeType": "S"}],
+        )
+        store = TweetStore(table)
+        # like_count is the delivery's own fetched_at day, so the winner is visible
+        for stamp in fetched:
+            day = int(stamp[8:10])
+            store.put_tweet(likes(day, stamp), [])
+
+        item = ddb_get(table, tweet_id=TWEET_ID)
+        assert item["fetched_at"] == max(fetched)
+        assert item["public_metrics"] == {"like_count": int(max(fetched)[8:10])}
 
 
 # ---- CheckpointStore ---------------------------------------------------------

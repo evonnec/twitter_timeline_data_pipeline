@@ -14,9 +14,12 @@ from helpers import (
     ddb_get,
     install_x_api,
     load_fixture,
+    long_post_timeline,
     synthetic_timeline,
     x_client,
 )
+from hypothesis import given
+from hypothesis import strategies as st
 
 from twitter_timeline_data_pipeline import credentials
 from twitter_timeline_data_pipeline.config import ConfigError
@@ -26,13 +29,16 @@ from twitter_timeline_data_pipeline.handlers.fetch import (
     RETRY_BACKOFF_SECONDS,
     SEND_RETRIES,
     SQS_BATCH_SIZE,
+    SQS_MAX_MESSAGE_BYTES,
     EnqueueError,
     FetchResult,
+    MessageTooLargeError,
+    _chunk_bodies,
     handler,
     run_fetch,
 )
-from twitter_timeline_data_pipeline.models import TweetMessage
-from twitter_timeline_data_pipeline.storage import CheckpointStore
+from twitter_timeline_data_pipeline.models import Media, Tweet, TweetMessage
+from twitter_timeline_data_pipeline.storage import CheckpointStore, TweetStore
 from twitter_timeline_data_pipeline.x_api import AuthError, NotFoundError, XApiError
 
 USERNAME = "example_user"
@@ -683,3 +689,141 @@ def test_handler_reuses_cached_aws_clients(
 
     assert fetch.sqs_client.cache_info().hits >= 1
     assert fetch.checkpoint_store.cache_info().misses == 1
+
+
+# ---- message size ------------------------------------------------------------
+
+ENGLAND_FLAG = "\U0001f3f4" + "".join(
+    chr(c) for c in (0xE0067, 0xE0062, 0xE0065, 0xE006E, 0xE0067, 0xE007F)
+)
+WORST_CASES = {
+    "emoji": "\U0001f600",
+    "skin-tone": "\U0001f44d\U0001f3fd",
+    "zwj-family": "\U0001f468\u200d\U0001f469\u200d\U0001f467\u200d\U0001f466",
+    "tag-flag": ENGLAND_FLAG,
+    "cjk": "\u6f22",
+}
+
+
+def worst_case_message(unit: str) -> TweetMessage:
+    """12,500 repeats of ``unit`` plus four photos with 1,000-character alt text."""
+    media = tuple(
+        Media(
+            media_key=f"3_{n}",
+            type="photo",
+            url=f"https://pbs.twimg.com/media/{n}.jpg",
+            alt_text="\u6f22" * 1_000,
+        )
+        for n in range(4)
+    )
+    return TweetMessage(
+        username=USERNAME,
+        tweet=Tweet(id="1", text="preview", note_text=unit * 12_500),
+        media=media,
+        fetched_at="2026-10-25T00:00:00Z",
+    )
+
+
+def approx_item_size(item: Any) -> int:
+    """Approximate DynamoDB item size: UTF-8 bytes of names and strings, plus 8 per
+    number or boolean and 3 per container as an allowance for the structure."""
+    match item:
+        case dict():
+            return 3 + sum(
+                len(k.encode()) + approx_item_size(v) for k, v in item.items()
+            )
+        case list() | tuple():
+            return 3 + sum(approx_item_size(v) for v in item)
+        case str():
+            return len(item.encode())
+        case _:
+            return 8
+
+
+@pytest.mark.parametrize("unit", WORST_CASES.values(), ids=WORST_CASES.keys())
+def test_worst_case_posts_fit_one_message_and_one_dynamodb_item(unit: str) -> None:
+    message = worst_case_message(unit)
+
+    body = message.to_json()
+
+    assert len(body.encode()) < SQS_MAX_MESSAGE_BYTES
+    assert len(body.encode()) < 400_000
+    assert TweetMessage.from_json(body) == message
+    item = TweetStore.to_item(message, [])
+    item["media"] = [
+        {"media_key": m.media_key, "alt_text": m.alt_text} for m in message.media
+    ]
+    assert approx_item_size(item) < 400_000
+
+
+def test_a_long_post_is_enqueued_in_full(aws: Aws) -> None:
+    sqs = FakeSqs()
+
+    result = run(aws, long_post_timeline(), sqs)
+
+    assert result.enqueued == 1
+    body = TweetMessage.from_json(sqs.calls[0][0]["MessageBody"])
+    assert body.tweet.note_text is not None
+    assert len(body.tweet.note_text) > 280
+
+
+def test_an_oversized_message_fails_the_run_and_loses_nothing(
+    aws: Aws, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(fetch, "SQS_MAX_MESSAGE_BYTES", 600)
+    big, small = ids(2)
+    original = TweetMessage.to_json
+
+    def to_json(self: TweetMessage) -> str:
+        body = original(self)
+        return body + " " * 1_000 if self.tweet.id == big else body
+
+    monkeypatch.setattr(TweetMessage, "to_json", to_json)
+    sqs = FakeSqs()
+
+    with pytest.raises(MessageTooLargeError, match=f"tweet {big}: .* over the 600"):
+        run(aws, synthetic_timeline([big, small]), sqs)
+
+    assert sqs.calls == []  # nothing sent, nothing silently dropped
+    assert CheckpointStore(aws.state_table).get(USERNAME) is None
+    assert issubclass(MessageTooLargeError, EnqueueError)
+
+
+# ---- batch total-size chunking ----------------------------------------------
+
+
+def test_two_large_bodies_go_out_in_separate_calls(
+    aws: Aws, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original = TweetMessage.to_json
+    monkeypatch.setattr(
+        TweetMessage, "to_json", lambda self: original(self) + " " * 600_000
+    )
+    sqs = FakeSqs()
+
+    result = run(aws, synthetic_timeline(ids(2)), sqs)
+
+    assert sqs.sizes == [1, 1]
+    assert result.enqueued == 2
+
+
+def test_ten_small_bodies_still_go_out_in_one_call(aws: Aws) -> None:
+    sqs = FakeSqs()
+
+    run(aws, synthetic_timeline(ids(10)), sqs)
+
+    assert sqs.sizes == [10]
+
+
+@given(sizes=st.lists(st.integers(1, SQS_MAX_MESSAGE_BYTES), max_size=60))
+def test_chunks_respect_both_limits_and_keep_every_body_in_order(
+    sizes: list[int],
+) -> None:
+    bodies = [f"{i:04d}".ljust(max(size, 4), "x") for i, size in enumerate(sizes)]
+
+    chunks = list(_chunk_bodies(bodies))
+
+    for chunk in chunks:
+        assert 1 <= len(chunk) <= SQS_BATCH_SIZE
+        assert sum(len(b.encode()) for b in chunk) <= SQS_MAX_MESSAGE_BYTES
+    assert [b for chunk in chunks for b in chunk] == bodies
