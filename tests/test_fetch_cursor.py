@@ -3,6 +3,7 @@
 import itertools
 import logging
 import math
+import os
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -19,7 +20,7 @@ from fake_timeline import (
     sent_ids,
 )
 from helpers import USERNAME, FakeSqs, install_x_api, x_client
-from hypothesis import HealthCheck, given, settings
+from hypothesis import HealthCheck, example, given, settings
 from hypothesis import strategies as st
 
 from twitter_timeline_data_pipeline.handlers import fetch
@@ -509,6 +510,56 @@ def test_overlapping_run_cannot_regress_newest_id_or_drop_a_gap(
     assert set(sent_ids(sqs_a)) | set(sent_ids(sqs_b)) == set(range(101, 121))
 
 
+# ---- a Tweet that arrives between the new-Tweets check and a gap request ----------
+
+
+def test_gap_page_cannot_move_newest_id_past_a_tweet_that_arrived_mid_run(
+    aws: Aws,
+) -> None:
+    # Property-test find: newest_id is 11 and a backfill gap (12, 14) is open. Tweets
+    # 12 and 13 arrive after the new-Tweets check but before the gap request, which
+    # returns only 13. Saving newest_id=13 would have hidden 12 forever.
+    timeline = FakeTimeline(11)
+    seed(aws, 11, Gap(until_id="14", since_id="12"))
+    arrived = False
+
+    def inject(n: int, _r: httpx.Request) -> httpx.Response | None:
+        nonlocal arrived
+        if n == 2 and not arrived:
+            arrived = True
+            timeline.add(2)
+        return None
+
+    timeline.inject = inject
+    sqs = FakeSqs()
+
+    run(aws, timeline, sqs, max_results=5, max_pages=3)
+
+    assert state(aws).newest_id == "11"
+    assert sent_ids(sqs) == [13]
+    run_until_done(aws, timeline, sqs, max_results=5)
+    assert sorted(set(sent_ids(sqs))) == [12, 13]
+
+
+@pytest.mark.parametrize(
+    ("backfill", "newest", "expected"),
+    [
+        (Gap("30", "10"), "15", Gap("16", "10")),  # top above newest: clamped
+        (Gap("12", "10"), "15", Gap("12", "10")),  # already below: untouched
+        (Gap(None, "10"), "15", Gap("16", "10")),  # open top: anchored
+        (Gap("30", "15"), "15", None),  # all above newest_id
+        (Gap("30", "14"), "15", Gap("16", "14")),  # only ID 15 remains
+        (Gap("16", "15"), "20", None),  # no IDs between the bounds
+        (Gap("30", "10"), None, Gap("30", "10")),  # no state yet: as given
+        (None, "15", None),
+    ],
+)
+def test_backfill_top_is_clamped_to_newest_id(
+    backfill: Gap | None, newest: str | None, expected: Gap | None
+) -> None:
+    assert fetch._anchored(backfill, newest) == expected
+
+
 # ---- legacy state ----------------------------------------------------------------
 
 
@@ -683,6 +734,9 @@ def test_handler_rejects_a_malformed_backfill_before_touching_anything(
 # ---- properties: no ID above the initial checkpoint is ever missed ---------------
 
 
+EXAMPLES = int(os.environ.get("CURSOR_PROPERTY_EXAMPLES", "70"))
+
+
 def covered(tweet_id: int, state: CheckpointState) -> bool:
     """Whether the cursor accounts for ``tweet_id``: above newest_id, or in a gap."""
     if state.newest_id is None or tweet_id > int(state.newest_id):
@@ -703,7 +757,7 @@ _round = st.tuples(
 
 
 @settings(
-    max_examples=80,
+    max_examples=EXAMPLES,
     deadline=None,
     suppress_health_check=[HealthCheck.function_scoped_fixture],
 )
@@ -802,8 +856,16 @@ def test_no_tweet_above_the_initial_checkpoint_is_ever_missed(
         assert len(accepted) - len(set(accepted)) <= max_results * enqueue_failures
 
 
+@example(
+    initial=0,
+    has_checkpoint=False,
+    window=15,
+    arrivals=11,
+    runs=[(1, 5, 0, 0, 0, 0, 0), (3, 5, 2, 0, 2, 0, 0)],
+    backfill=Gap(until_id="14", since_id="12"),
+)
 @settings(
-    max_examples=60,
+    max_examples=EXAMPLES,
     deadline=None,
     suppress_health_check=[HealthCheck.function_scoped_fixture],
 )

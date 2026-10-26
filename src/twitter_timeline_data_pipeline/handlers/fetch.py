@@ -320,7 +320,10 @@ class _Run:
                 if page.next_token
                 else []
             )
-            self.commit(ids, [*others, *remaining])
+            # Not `ids`: only the new-Tweets phase may raise newest_id. A gap page can
+            # contain a Tweet that arrived after this run's new-Tweets check, and
+            # moving newest_id past it would leave it above no cursor and below none.
+            self.commit([], [*others, *remaining])
         if pages:
             return
         # The first request came back cleanly empty (no data, no token, no errors).
@@ -354,17 +357,19 @@ class _Run:
 
 
 def _anchored(backfill: Gap | None, newest_id: TweetId | None) -> Gap | None:
-    """Give an open-topped backfill the newest known Tweet as its top.
+    """Clamp a backfill's top to just above the newest known Tweet.
 
     Everything above ``newest_id`` is the new-Tweets phase's job, so the backfill
-    only needs to cover what is at or below it; that also keeps it from overlapping
-    the open-ended gap a first run leaves.
+    only needs to cover what is at or below it. That also keeps it from overlapping
+    the open-ended gap a first run leaves. A backfill with no IDs left is dropped.
     """
-    if backfill is None or backfill.until_id is not None or newest_id is None:
+    if backfill is None or newest_id is None:
         return backfill
-    if backfill.since_id is not None and int(backfill.since_id) >= int(newest_id):
-        return None  # entirely above newest_id
-    return replace(backfill, until_id=str(int(newest_id) + 1))
+    top = int(newest_id) + 1
+    until = top if backfill.until_id is None else min(int(backfill.until_id), top)
+    if backfill.since_id is not None and int(backfill.since_id) >= until - 1:
+        return None  # nothing between the bounds, or all of it above newest_id
+    return replace(backfill, until_id=str(until))
 
 
 def run_fetch(
