@@ -1,0 +1,331 @@
+name: CI
+
+# Job graph:
+#   lint, format, typecheck, test, template  (parallel; lint also checks uv.lock is current)
+#     -> build                     (wheel + sdist + Lambda bundle, smoke-tested, uploaded as the "dist" and "lambda" artifacts)
+#       -> release                 (v* tag pushes only: checks the tag is semver and matches the project version, creates a GitHub Release)
+#         -> publish-pypi          (v* tag pushes only, and only if the repo variable PUBLISH_TO_PYPI is 'true')
+#
+# Python: no job passes `python-version` to setup-uv, except the test matrix. uv reads
+# `.python-version` itself and downloads a managed CPython if the runner doesn't have it.
+# Passing `python-version` exports UV_PYTHON, which overrides `.python-version`; the matrix
+# needs exactly that to run the suite on more than one interpreter.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  # No branch filter: stacked PRs target other PR branches, not just main.
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint (ruff) and lockfile
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install uv
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          # auto = cache on for branch and PR runs, off for tag pushes, so release builds start clean.
+          enable-cache: auto
+          cache-dependency-glob: |
+            uv.lock
+            pyproject.toml
+      - name: Check uv.lock is up to date
+        run: uv lock --check
+      - name: Install dependencies
+        run: uv sync --locked
+      - name: Run ruff check
+        run: uv run ruff check --output-format=github .
+
+  format:
+    name: Format (ruff)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install uv
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          # auto = cache on for branch and PR runs, off for tag pushes, so release builds start clean.
+          enable-cache: auto
+          cache-dependency-glob: |
+            uv.lock
+            pyproject.toml
+      - name: Install dependencies
+        run: uv sync --locked
+      - name: Run ruff format --check
+        run: uv run ruff format --check --diff .
+
+  typecheck:
+    name: Type check (mypy)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install uv
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          # auto = cache on for branch and PR runs, off for tag pushes, so release builds start clean.
+          enable-cache: auto
+          cache-dependency-glob: |
+            uv.lock
+            pyproject.toml
+      - name: Install dependencies
+        run: uv sync --locked
+      - name: Run mypy
+        run: uv run mypy
+
+  test:
+    name: Test (pytest, Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      # Let both legs finish: a 3.15 failure shouldn't hide a 3.14 result, or the reverse.
+      fail-fast: false
+      matrix:
+        # 3.14 is the Lambda runtime; 3.15 shows readiness for the next one.
+        python-version: ["3.14", "3.15"]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install uv
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          # Exports UV_PYTHON so every uv command below uses this matrix interpreter.
+          python-version: ${{ matrix.python-version }}
+          # auto = cache on for branch and PR runs, off for tag pushes, so release builds start clean.
+          enable-cache: auto
+          cache-dependency-glob: |
+            uv.lock
+            pyproject.toml
+      - name: Install dependencies
+        run: uv sync --locked
+      - name: Run pytest
+        run: >-
+          uv run pytest
+          --junitxml=junit.xml
+          --cov=twitter_timeline_data_pipeline
+          --cov-report=term
+          --cov-report=xml
+      - name: Upload test and coverage reports
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: reports-py${{ matrix.python-version }}
+          path: |
+            junit.xml
+            coverage.xml
+          if-no-files-found: warn
+          retention-days: 14
+
+  template:
+    name: Validate template (cfn-lint) and scripts (shellcheck)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install uv
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          # auto = cache on for branch and PR runs, off for tag pushes, so release builds start clean.
+          enable-cache: auto
+          cache-dependency-glob: |
+            uv.lock
+            pyproject.toml
+      - name: Install dependencies
+        run: uv sync --locked
+      - name: Run cfn-lint
+        run: uv run cfn-lint template.yaml
+      - name: Run shellcheck
+        run: uvx --from shellcheck-py shellcheck scripts/*.sh
+
+  build:
+    name: Build wheel, sdist and Lambda bundle
+    needs: [lint, format, typecheck, test, template]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      PACKAGE: twitter_timeline_data_pipeline # import name
+      ENTRY_POINT: twitter-pipeline # console script in [project.scripts]; change here if renamed
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install uv
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          # These files get published, so this job never restores a cache.
+          enable-cache: false
+      # Builds the sdist, then the wheel from the sdist, into dist/. --no-sources builds from
+      # the published metadata only, ignoring any [tool.uv.sources] overrides.
+      - name: Build
+        run: uv build --no-sources
+      - name: Smoke-test the wheel in an isolated environment
+        run: |
+          shopt -s nullglob
+          wheels=(dist/*.whl)
+          if (( ${#wheels[@]} != 1 )); then
+            echo "::error::Expected exactly one wheel in dist/, found ${#wheels[@]}"
+            exit 1
+          fi
+          wheel=${wheels[0]}
+          # A throwaway environment that holds the wheel and its runtime dependencies and
+          # nothing from the project. python -I keeps the checkout off sys.path.
+          uv run --isolated --no-project --with "$wheel" \
+            python -I -c 'import importlib, sys; m = importlib.import_module(sys.argv[1]); print(m.__name__, "imported from", m.__file__)' "$PACKAGE"
+          uv run --isolated --no-project --with "$wheel" "$ENTRY_POINT" --help
+          uv run --isolated --no-project --with "$wheel" "$ENTRY_POINT" --version
+      # The bundle holds Python 3.14 arm64 Linux wheels (see the script), the same as a local
+      # deploy. build/ is git-ignored; the zip goes in build/release/.
+      - name: Build the Lambda bundle
+        run: |
+          scripts/build_lambda.sh
+          version=$(uv version --short)
+          mkdir -p build/release
+          zip_path="$PWD/build/release/${PACKAGE}-${version}-lambda-arm64.zip"
+          (cd build/lambda && zip -qr -X "$zip_path" .)
+          ls -l build/release
+      - name: Upload dist
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload Lambda bundle
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: lambda
+          path: build/release/*.zip
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: GitHub Release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write # create the release and upload its assets
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install uv
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          # Release jobs never restore a cache.
+          enable-cache: false
+      # The tag must be semver (vMAJOR.MINOR.PATCH[-prerelease]) and name the project version.
+      # uv writes versions as PEP 440 (1.2.3rc1), so a semver prerelease tag (v1.2.3-rc.1) is
+      # mapped to that spelling before the comparison.
+      - name: Check tag is semver and matches project version
+        run: |
+          tag=$GITHUB_REF_NAME
+          version=$(uv version --short)
+          semver='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'
+          if [[ ! "$tag" =~ $semver ]]; then
+            echo "::error::Tag $tag is not semantic versioning (expected vMAJOR.MINOR.PATCH or vMAJOR.MINOR.PATCH-prerelease)"
+            exit 1
+          fi
+          expected=${tag#v}
+          if [[ "$expected" == *-* ]]; then
+            core=${expected%%-*}
+            pre=${expected#*-}
+            pre=${pre/#alpha/a}
+            pre=${pre/#beta/b}
+            expected="$core${pre//./}"
+          fi
+          if [[ "$expected" != "$version" ]]; then
+            echo "::error::Tag $tag does not match version $version in pyproject.toml (expected tag v$version, or its semver spelling)"
+            exit 1
+          fi
+      - name: Download dist
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist
+          path: dist
+      - name: Download Lambda bundle
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: lambda
+          path: lambda
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          flags=()
+          # A hyphen in the tag means a prerelease suffix.
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then
+            flags+=(--prerelease)
+          fi
+          gh release create "$GITHUB_REF_NAME" dist/* lambda/*.zip \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            --verify-tag \
+            "${flags[@]}"
+
+  # PyPI trusted publishing, off by default. This repo is private, so publishing would make
+  # the package public on PyPI; GitHub Releases (wheel, sdist, Lambda zip) are the default
+  # distribution channel. One-time setup before setting PUBLISH_TO_PYPI to 'true':
+  #   1. On PyPI, add a pending trusted publisher (Account settings -> Publishing; or the
+  #      project's Settings -> Publishing once it exists) for GitHub Actions with:
+  #        owner and repository: this repo's owner / twitter_timeline_data_pipeline,
+  #        workflow filename: ci.yml, environment name: pypi
+  #   2. In this repo, create the "pypi" environment (Settings -> Environments), ideally
+  #      limited to v* tags with required reviewers.
+  #   3. Set the repository variable PUBLISH_TO_PYPI to 'true'.
+  # Runs after `release`, so a tag that isn't valid semver or doesn't match the project version never reaches PyPI.
+  publish-pypi:
+    name: Publish to PyPI
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && vars.PUBLISH_TO_PYPI == 'true'
+    needs: [build, release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: pypi
+      url: https://pypi.org/project/twitter-timeline-data-pipeline/
+    permissions:
+      id-token: write # OIDC token for trusted publishing; no API token is stored
+    steps:
+      - name: Download dist
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist
+          path: dist
+      - name: Install uv
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          enable-cache: false
+      # --check-url skips files already on PyPI, so a re-run after a partial upload succeeds.
+      - name: Publish
+        run: uv publish --trusted-publishing always --check-url https://pypi.org/simple/ dist/*

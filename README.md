@@ -190,6 +190,44 @@ uv run mypy                  # strict type check of src/
 uv build                     # build the sdist and wheel into dist/
 ```
 
+## Continuous integration and releases
+
+`.github/workflows/ci.yml` runs on every pull request, on pushes to `main` and on `v*` tags. Each job installs uv and uses the locked dependencies (`uv sync --locked`).
+
+| Job | What it runs |
+| --- | --- |
+| Lint | `uv lock --check` (lockfile is current) and `ruff check` |
+| Format | `ruff format --check` |
+| Type check | `mypy` (strict) |
+| Test | `pytest` with coverage on Python 3.14 and 3.15; 3.15 shows readiness for the next Lambda runtime. JUnit and coverage reports are uploaded as artifacts |
+| Validate template | `cfn-lint template.yaml` and `shellcheck scripts/*.sh` |
+| Build | After all of the above: `uv build`, a smoke test of the wheel in an isolated environment (import, `--help`, `--version`), and the Lambda bundle zipped as `twitter_timeline_data_pipeline-<version>-lambda-arm64.zip` |
+| GitHub Release | On `v*` tags only: checks the tag, then creates the release |
+
+### Cutting a release
+
+Versions follow [semantic versioning](https://semver.org). The version lives in `pyproject.toml`, and the tag must match it.
+
+```bash
+uv version --bump patch      # or minor, or major
+git commit -am "release v$(uv version --short)"
+# open a PR, let CI pass, merge it, then from an up-to-date main:
+git tag "v$(uv version --short)"
+git push origin "v$(uv version --short)"
+```
+
+For a prerelease, add a second bump: `uv version --bump minor --bump rc` gives `0.2.0rc1`, and `uv version --bump rc` moves to `0.2.0rc2`. `uv version --bump stable` drops the suffix. uv writes prereleases in Python's spelling (`0.2.0rc1`) and the tag uses the semver spelling (`v0.2.0-rc.1`; `-alpha.N` and `-beta.N` work the same way). The release job maps one to the other.
+
+The release job fails unless the tag is valid semver (`vMAJOR.MINOR.PATCH`, optionally `-prerelease`, no leading zeros) and equals the version in `pyproject.toml`. It then creates a GitHub Release with generated notes and attaches the wheel, the sdist and the Lambda zip. A tag with a prerelease suffix is marked as a prerelease.
+
+### Publishing to PyPI (off by default)
+
+This repository is private, and publishing to PyPI would make the package public, so GitHub Releases are the distribution channel. The `publish-pypi` job runs after the release job and only when the repository variable `PUBLISH_TO_PYPI` is `true`. To enable it:
+
+1. On PyPI, add a trusted publisher for this repository with workflow `ci.yml` and environment `pypi`.
+2. Create the `pypi` environment in the repository settings, ideally limited to `v*` tags with required reviewers.
+3. Set the repository variable `PUBLISH_TO_PYPI` to `true`.
+
 ## Running locally
 
 The `twitter-pipeline` command runs the fetch step from a terminal. A dry run needs only a bearer token and makes no AWS calls:
