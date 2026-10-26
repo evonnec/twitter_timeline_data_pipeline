@@ -42,7 +42,7 @@ flowchart LR
 A run, step by step:
 
 1. EventBridge invokes `FetchFunction` on the schedule (`rate(1 hour)` by default). The event may carry `{"username": "..."}`; otherwise the `TWITTER_USERNAME` setting is used. The name is normalized once (leading `@` removed, lower-cased) and used everywhere below.
-2. The function reads the bearer token from Secrets Manager (cached in memory for 15 minutes), resolves the username to a user ID, and reads the account's cursor from the state table: the newest Tweet ID already fetched, plus any *gaps* (ID ranges known to be unfetched; see the [state table](#state-table-statetable)).
+2. The function reads the bearer token from Secrets Manager (cached in memory for 15 minutes), reads the account's cursor from the state table, and takes the user ID from it (the handle is looked up only when the stored ID is missing or older than `USER_ID_TTL_HOURS`; see [identity changes](#identity-changes)): the newest Tweet ID already fetched, plus any *gaps* (ID ranges known to be unfetched; see the [state table](#state-table-statetable)).
 3. New Tweets first. It pages through `GET /2/users/:id/tweets` with `since_id` set to the newest ID, newest first, in pages of `MAX_RESULTS` Tweets. A first run has no `since_id`. `MAX_PAGES` is a budget of API requests, counting empty and failed ones; when gaps exist it is at least 2, one request is kept for the oldest gap, and the rest go to the new Tweets and the newest gaps.
 4. Each page becomes one message per Tweet, sent to the queue with `SendMessageBatch` (10 at a time; only entries SQS reports as failed are retried).
 5. After each page is fully enqueued, the cursor is saved. While the page still has a `next_token`, the not-yet-fetched rest is recorded as a gap just below the lowest ID seen; a page without `next_token` closes it. So a run that hits the cap, a rate limit or an error leaves a gap, never a hole.
@@ -176,6 +176,8 @@ One item per account: partition key `username` (S, lower case) and
 | --- | --- | --- |
 | `newest_id` | N | Highest Tweet ID reached by the new-Tweets phase (a gap page can enqueue a higher one, which is re-fetched later). Never decreases. Absent until the first Tweet. |
 | `gaps` | L of M | Exclusive ID ranges known to be unfetched, each `{until_id, since_id, empty_runs, first_empty_at}` (N; `empty_runs` and the ISO-8601 UTC `first_empty_at` only when `empty_runs` is above 0). A missing `since_id` means "down to the end of what the API serves" (about the 3,200 most recent posts); a missing `until_id` means "up from the newest Tweet". |
+| `user_id` | S | Numeric user ID the handle resolved to. Absent on items written before this existed (the next run looks the handle up and stores it). |
+| `user_id_resolved_at` | S | ISO-8601 UTC time (`...Z`) the ID was last confirmed by a lookup. The ID is reused until it is `USER_ID_TTL_HOURS` old, then looked up again (and this time refreshed if unchanged). |
 | `version` | N | Optimistic lock, incremented on every write. |
 | `updated_at` | S | UTC timestamp of the last write. |
 
@@ -184,6 +186,17 @@ The list is kept normalized on every save: overlapping or adjacent gaps are merg
 **Empty responses never end a range by themselves.** A `200` with `errors` and no data (for example an account that turned protected) raises an error instead of reading as "no more Tweets"; an empty page that still has a `next_token` is followed. A gap is dropped only after 3 consecutive empty runs spanning at least 24 hours (`empty_runs`, `first_empty_at`), so a short API incident cannot erase a range that still holds data. A run counts as empty when no page for the gap carried data and the walk ended on a clean empty response (no data, no errors, no `next_token`; empty pages that still pointed onward don't prevent it). Both fields reset whenever data comes back. Because the API sends a `next_token` on the last page, every run's new-Tweets walk ends on such an empty response, which is recorded as the gap's first empty run without a second request. A gap that has reached its last run waits out the 24 hours without being asked again (it costs no requests and doesn't count as unfinished), then gets one request first in its next run to drop. Gaps that came back empty are checked after the ones that may still hold Tweets, so a burst isn't starved by them. If the API recovers during the wait, the Tweets in such a gap arrive at the end of it, delayed but not lost. The drop is logged at WARNING as `dropping gap for <user> (since_id=..., until_id=...): out of the API's reach`, stable text for a metric filter to match. That is how a range that has aged out of the API's window finally goes away.
 
 Every write is conditional on the `version` that run read (a missing `version` counts as 0, so items written before gaps existed are read as they are and upgraded on the first write). If another run got there first, the write fails, the run stops fetching, logs a warning and returns `stopped_reason: "state_conflict"`. Anything it already enqueued is a harmless duplicate, `newest_id` never moves backwards, and no gap is dropped.
+
+#### Identity changes
+
+The checkpoint belongs to the account, not just the handle. If the account renames and someone else registers the old handle, the lookup returns a different user ID. Whenever a lookup (or the `user_id` in the fetch event) differs from the stored `user_id`, the run raises `IdentityChangedError`: nothing is ingested, the state item is left untouched, and the invocation fails (so the `Errors` alarm fires). It logs at ERROR, stable text for a metric filter to match: `identity changed for handle <handle>: stored user_id <old>, now <new>; nothing ingested`. A timeline response of "user not found" for a stored ID also triggers a fresh lookup, with the same check.
+
+To resolve it, decide which account you want:
+
+- You still want the original account: it has a new handle now. Delete the state item as below (or fetch under the new handle, which has its own cursor) and run with the new handle; the stored Tweets stay. Re-pointing the old handle's state at the original ID would mix its cursor with a different handle.
+- You deliberately want the new account under this handle: delete the state item (`aws dynamodb delete-item --table-name <StateTable> --key '{"username": {"S": "<handle>"}}'`, which restarts that handle's cursor from scratch) or set `user_id` on it to the new ID with `update-item`.
+
+The event may carry `"user_id": "<numeric id>"` to skip the lookup; it is checked against the stored ID the same way. The CLI `--dry-run` has no state table and resolves the handle on every call.
 
 ### S3 media bucket
 
@@ -324,6 +337,7 @@ Other options: `--max-pages`, `--max-results` (5 to 100), `--since-id` and `--lo
 | `MEDIA_BUCKET` | process, media-retry | none | Name of the media bucket |
 | `MAX_RESULTS` | fetch | `100` | Tweets per API page, 5 to 100 |
 | `MAX_PAGES` | fetch | `5` | Maximum pages per run, at least 1 |
+| `USER_ID_TTL_HOURS` | fetch | `24` | Hours a stored user ID is reused before the handle is looked up again; 0 looks it up on every run. Set from the `UserIdTtlHours` parameter |
 | `X_API_BASE_URL` | fetch | `https://api.x.com/2` | API base URL, for testing against a stub |
 | `HTTP_TIMEOUT_SECONDS` | both | `10` | Timeout for API and media HTTP requests, must be above 0 |
 | `MAX_MEDIA_BYTES` | process, media-retry | `536870912` (512 MiB) | Largest media file stored, must be above 0 |
@@ -551,7 +565,7 @@ The script reads the table and bucket names from the stack outputs, runs `sam de
 - Metrics (`public_metrics`) are a snapshot at fetch time and are not refreshed.
 - Videos that only have HLS variants (no `video/mp4`) are recorded with status `skipped` and nothing is downloaded.
 - Media whose download returns a 4xx other than 429, or a redirect, is recorded as `unavailable`; the Tweet is still stored. Media at a non-https URL or a host other than the two X CDN hosts is recorded as `skipped`. 429 and 5xx responses and timeouts are retried.
-- One account is fetched per stack through `TwitterUsername`. The fetch event can override the username; names are normalized to lower case, with each account keeping its own cursor.
+- One account is fetched per stack through `TwitterUsername`. The fetch event can override the username (and may carry `user_id`); names are normalized to lower case, with each account keeping its own cursor.
 - The bearer token is app-only, so protected accounts and private data are not available.
 
 ## Python 3.14 features used

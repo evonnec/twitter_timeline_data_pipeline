@@ -835,12 +835,16 @@ class CheckpointState:
 
     ``newest_id`` is the highest Tweet ID enqueued. ``gaps`` are ranges below it (or
     manual backfills) still to fetch. ``version`` is the optimistic-lock counter; items
-    written before gaps existed have none and count as version 0.
+    written before gaps existed have none and count as version 0. ``user_id`` is the
+    numeric ID the handle resolved to, ``user_id_resolved_at`` (ISO-8601 UTC, ``Z``)
+    when it was last confirmed; items written before they existed have neither.
     """
 
     newest_id: TweetId | None = None
     gaps: tuple[Gap, ...] = ()
     version: int = 0
+    user_id: str | None = None
+    user_id_resolved_at: str | None = None
 
 
 class CheckpointStore:
@@ -857,10 +861,13 @@ class CheckpointStore:
         if item is None:
             return CheckpointState()
         newest = item.get("newest_id")
+        user_id = item.get("user_id")
         return CheckpointState(
             newest_id=None if newest is None else str(int(newest)),
             gaps=tuple(Gap.from_item(g) for g in item.get("gaps", ())),
             version=int(item.get("version", 0)),
+            user_id=None if user_id is None else str(user_id),
+            user_id_resolved_at=item.get("user_id_resolved_at"),
         )
 
     def save(
@@ -880,6 +887,10 @@ class CheckpointStore:
         }
         if state.newest_id is not None:
             item["newest_id"] = int(state.newest_id)
+        if state.user_id is not None:
+            item["user_id"] = state.user_id
+        if state.user_id_resolved_at is not None:
+            item["user_id_resolved_at"] = state.user_id_resolved_at
         # A missing version is 0: a new item or one from before versions existed.
         condition = "version = :expected"
         if expected_version == 0:

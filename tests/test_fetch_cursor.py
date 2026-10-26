@@ -5,6 +5,7 @@ import logging
 import math
 import os
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -73,7 +74,12 @@ def run(
 
 
 def state(aws: Aws, username: str = USERNAME) -> CheckpointState:
-    return CheckpointStore(aws.state_table).load(username)
+    """The stored cursor, without the identity fields (tested in test_user_id.py)."""
+    return replace(
+        CheckpointStore(aws.state_table).load(username),
+        user_id=None,
+        user_id_resolved_at=None,
+    )
 
 
 def seed(aws: Aws, newest_id: int, *gaps: Gap) -> None:
@@ -760,7 +766,8 @@ def test_backfill_entirely_above_newest_is_a_no_op(aws: Aws) -> None:
 
     run(aws, timeline, FakeSqs(), backfill=Gap(since_id="30"))
 
-    assert state(aws) == CheckpointState("30", (), 1)  # untouched since seed
+    # The cursor is untouched; the run only stored the user ID (version 2).
+    assert state(aws) == CheckpointState("30", (), 2)
 
 
 def test_conflict_summary_reports_the_stored_gaps(aws: Aws) -> None:

@@ -9,19 +9,15 @@ from system.harness import USER_ID
 OTHER_USER_ID = "2000000002"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="#15: the handle is resolved on every run and never checked against the "
-    "user ID the checkpoint belongs to",
-)
 def test_handle_taken_over_by_another_account_is_not_ingested(
     make_sim: MakeSim,
 ) -> None:
     """The account renames itself and another account registers the old handle and
     posts. (Snowflake IDs are global, so its posts are newer than the checkpoint.)
 
-    Expected: the next run stores none of the other account's posts and fails, so the
-    fetch alarm fires.
+    Expected: none of the other account's posts is ever stored. Within the user-ID TTL
+    the cached ID still reads the original account; once it expires the lookup returns
+    the other account's ID and the run fails, so the fetch alarm fires.
     """
     sim = make_sim()
     x, user = sim.x, sim.username
@@ -31,6 +27,8 @@ def test_handle_taken_over_by_another_account_is_not_ingested(
     x.add_user(user, OTHER_USER_ID)
     for _ in range(2):
         x.post(user)
+
+    sim.advance(25 * 3600)  # past the 24 h user-ID TTL
 
     (run,) = sim.run(1)
 
