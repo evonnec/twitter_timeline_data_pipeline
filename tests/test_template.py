@@ -650,6 +650,37 @@ def test_process_function_cannot_write_raw_pages(template: Template) -> None:
     ]
 
 
+def test_process_function_s3_access_is_exactly_this_and_never_deletes(
+    template: Template,
+) -> None:
+    statements = [
+        s
+        for s in policy_statements(template, "ProcessFunction")
+        if any(a.startswith("s3:") for a in _as_list(s["Action"]))
+    ]
+
+    assert [
+        (
+            s["Effect"],
+            sorted(_as_list(s["Action"])),
+            s["Resource"] if isinstance(s["Resource"], list) else [s["Resource"]],
+        )
+        for s in statements
+    ] == [
+        (
+            "Allow",
+            ["s3:AbortMultipartUpload", "s3:GetObject", "s3:PutObject"],
+            [
+                {"Fn::Sub": "${MediaBucket.Arn}/media/*"},
+                {"Fn::Sub": "${MediaBucket.Arn}/text/*"},
+            ],
+        ),
+        ("Allow", ["s3:GetObject"], [{"Fn::Sub": "${MediaBucket.Arn}/raw/*"}]),
+        ("Allow", ["s3:ListBucket"], [{"Fn::GetAtt": ["MediaBucket", "Arn"]}]),
+    ]
+    assert "s3:DeleteObject" not in TEMPLATE.read_text()
+
+
 def test_no_function_sets_the_test_only_media_host_override(template: Template) -> None:
     for name, props in functions(template).items():
         assert MEDIA_HOSTS_OVERRIDE_ENV not in props.get("Environment", {}).get(

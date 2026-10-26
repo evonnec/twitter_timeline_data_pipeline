@@ -205,22 +205,37 @@ class ReferencedTweet:
     id: TweetId
 
 
+_LONE_SURROGATES = re.compile("[\ud800-\udfff]")
+
+
+def _no_surrogates(text: str) -> str:
+    """``text`` with each lone surrogate replaced by U+FFFD (DynamoDB rejects them)."""
+    return _LONE_SURROGATES.sub("\ufffd", text)
+
+
 def _clean_json(value: Any) -> Any:
     """``value`` as plain JSON: integers clamped, ``None`` entries dropped, non-finite
-    floats written as strings (the store turns the other floats into ``Decimal``)."""
+    floats written as strings (the store turns the other floats into ``Decimal``) and
+    lone surrogates in any string (keys included) replaced by U+FFFD."""
     match value:
         case dict():
-            return {str(k): _clean_json(v) for k, v in value.items() if v is not None}
+            return {
+                _no_surrogates(str(k)): _clean_json(v)
+                for k, v in value.items()
+                if v is not None
+            }
         case list() | tuple():
             return [_clean_json(v) for v in value if v is not None]
-        case bool() | str():
+        case bool():
             return value
+        case str():
+            return _no_surrogates(value)
         case int():
             return clamp_int(value)
         case float() if math.isfinite(value):
             return value
         case _:
-            return str(value)
+            return _no_surrogates(str(value))
 
 
 # Entity kind -> the keys kept for each entry. Offsets (``start``/``end``) index the
@@ -264,15 +279,18 @@ def compact_entities(data: Any) -> dict[str, Any] | None:
     return out or None
 
 
-def _split_entities(data: Mapping[str, Any]) -> tuple[Any, Any]:
-    """``(entities, display_entities)`` of an API post: for a long post the entities
-    of ``note_tweet`` (they index the full text) and the Tweet-level ones (they index
-    the preview); else the Tweet-level ones and None."""
+def split_entities(
+    data: Mapping[str, Any],
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """``(entities, display_entities)`` of an API post. For a long post (one with
+    ``note_tweet.text``) ``entities`` are those of the note (they index the full text)
+    and ``display_entities`` the Tweet-level ones (they index the preview); a note
+    without entities leaves ``entities`` empty, so the preview's never pass for the
+    full text's. For any other post: the Tweet-level ones and None."""
     note = data.get("note_tweet") or data.get("note_post") or {}
     entities = compact_entities(data.get("entities"))
-    note_entities = compact_entities(note.get("entities"))
-    if note_entities is not None and note.get("text"):
-        return note_entities, entities
+    if note.get("text"):
+        return compact_entities(note.get("entities")), entities
     return entities, None
 
 
@@ -287,8 +305,10 @@ class ReferencedPost:
 
     ``text`` is the API's text (for a retweet of a long post it is cut at about 140
     characters and ``note_text`` holds the whole body). ``status`` is ``unavailable``
-    when the expansion was requested but the API returned nothing for the post
-    (deleted, withheld or protected); only ``id`` and ``type`` are known then.
+    only when the API's ``errors`` named the post as not found or not authorized
+    (``unavailable_reason``: ``not_found`` or ``not_authorized``); only ``id`` and
+    ``type`` are known then. A post the response says nothing about is a bare
+    reference (no status).
     """
 
     id: TweetId
@@ -299,10 +319,13 @@ class ReferencedPost:
     author_username: str | None = None
     created_at: str | None = None
     status: str | None = None
+    unavailable_reason: str | None = None
     entities: Mapping[str, Any] | None = None
     note_text_omitted: bool = False
     """True when ``note_text`` was left out to keep the message under SQS's size limit:
     the processor fills it in from the raw page (``TweetMessage.raw_key``)."""
+    entities_omitted: bool = False
+    """The same for ``entities``."""
 
     @property
     def full_text(self) -> str | None:
@@ -325,7 +348,7 @@ class ReferencedPost:
             author_id=author_id,
             author_username=(usernames or {}).get(author_id or ""),
             created_at=_opt_str(data.get("created_at")),
-            entities=_split_entities(data)[0],
+            entities=split_entities(data)[0],
         )
 
     @classmethod
@@ -339,8 +362,10 @@ class ReferencedPost:
             author_username=_opt_str(data.get("author_username")),
             created_at=_opt_str(data.get("created_at")),
             status=_opt_str(data.get("status")),
+            unavailable_reason=_opt_str(data.get("unavailable_reason")),
             entities=compact_entities(data.get("entities")),
             note_text_omitted=bool(data.get("note_text_omitted")),
+            entities_omitted=bool(data.get("entities_omitted")),
         )
 
 
@@ -366,6 +391,9 @@ class Tweet:
     # truncated preview, kept only when they differ.
     entities: Mapping[str, Any] | None = None
     display_entities: Mapping[str, Any] | None = None
+    entities_omitted: bool = False
+    """True when ``entities`` and ``display_entities`` were left out to keep the
+    message under SQS's size limit; the processor fills them in from the raw page."""
     in_reply_to_user_id: str | None = None
     possibly_sensitive: bool | None = None
     edit_controls: Mapping[str, Any] | None = None
@@ -391,7 +419,7 @@ class Tweet:
         attachments = data.get("attachments") or {}
         # X is renaming the field (the docs and OpenAPI spec show ``note_post``).
         note = data.get("note_tweet") or data.get("note_post") or {}
-        entities, display_entities = _split_entities(data)
+        entities, display_entities = split_entities(data)
         return cls._build(
             data,
             media_keys=attachments.get("media_keys") or (),
@@ -409,6 +437,7 @@ class Tweet:
             note_text=data.get("note_text"),
             entities=compact_entities(data.get("entities")),
             display_entities=compact_entities(data.get("display_entities")),
+            entities_omitted=bool(data.get("entities_omitted")),
         )
 
     @classmethod
@@ -420,6 +449,7 @@ class Tweet:
         note_text: Any,
         entities: dict[str, Any] | None,
         display_entities: dict[str, Any] | None,
+        entities_omitted: bool = False,
     ) -> Self:
         return cls(
             id=str(data["id"]),
@@ -446,6 +476,7 @@ class Tweet:
             note_text=_opt_str(note_text),
             entities=entities,
             display_entities=display_entities,
+            entities_omitted=entities_omitted,
             in_reply_to_user_id=_opt_str(data.get("in_reply_to_user_id")),
             possibly_sensitive=(
                 None
@@ -483,18 +514,47 @@ class TweetMessage:
     message from an older fetcher parses with None."""
 
     @property
-    def has_omitted_notes(self) -> bool:
-        return any(r.note_text_omitted for r in self.referenced)
+    def has_omitted(self) -> bool:
+        """Whether anything was left out to fit SQS's limit (to be read back from the
+        raw page)."""
+        return self.tweet.entities_omitted or any(
+            r.note_text_omitted or r.entities_omitted for r in self.referenced
+        )
 
     def without_referenced_notes(self) -> Self:
         """This message with every referenced post's ``note_text`` left out (and marked
-        ``note_text_omitted``): the body for a message that is over SQS's size limit.
-        The full text stays in the raw page, which the processor reads it back from."""
+        ``note_text_omitted``): the first stage for a message that is over SQS's size
+        limit. The full text stays in the raw page, which the processor reads it back
+        from."""
         return replace(
             self,
             referenced=tuple(
                 replace(r, note_text=None, note_text_omitted=True) if r.note_text else r
                 for r in self.referenced
+            ),
+        )
+
+    def without_referenced_entities(self) -> Self:
+        """This message with every referenced post's ``entities`` left out (and marked
+        ``entities_omitted``): the second stage."""
+        return replace(
+            self,
+            referenced=tuple(
+                replace(r, entities=None, entities_omitted=True) if r.entities else r
+                for r in self.referenced
+            ),
+        )
+
+    def without_entities(self) -> Self:
+        """This message with the Tweet's own ``entities`` and ``display_entities`` left
+        out (and marked ``entities_omitted``): the last stage."""
+        tweet = self.tweet
+        if not (tweet.entities or tweet.display_entities):
+            return self
+        return replace(
+            self,
+            tweet=replace(
+                tweet, entities=None, display_entities=None, entities_omitted=True
             ),
         )
 
@@ -683,6 +743,10 @@ class TimelinePage:
     # entry here known to be unavailable rather than simply not requested.
     included: Mapping[TweetId, ReferencedPost] = field(default_factory=dict)
     requested: Mapping[str, bool] = field(default_factory=dict)
+    # Post ID -> ``not_found`` / ``not_authorized`` for each post the response's
+    # ``errors`` array names as such (a deleted or protected original). Nothing else
+    # marks a reference unavailable.
+    unavailable: Mapping[TweetId, str] = field(default_factory=dict)
 
     def _referenced(self, tweet: Tweet) -> tuple[ReferencedPost, ...]:
         expanded = self.requested.get("expansions", False)
@@ -690,21 +754,26 @@ class TimelinePage:
         for ref in tweet.referenced_tweets:
             if (post := self.included.get(ref.id)) is not None:
                 out.append(replace(post, type=ref.type))
-                continue
-            if expanded:
-                logger.warning(
-                    "%s tweet %s of tweet %s missing from includes",
-                    ref.type,
-                    ref.id,
-                    tweet.id,
+            elif (reason := self.unavailable.get(ref.id)) is not None:
+                out.append(
+                    ReferencedPost(
+                        id=ref.id,
+                        type=ref.type,
+                        status="unavailable",
+                        unavailable_reason=reason,
+                    )
                 )
-            out.append(
-                ReferencedPost(
-                    id=ref.id,
-                    type=ref.type,
-                    status="unavailable" if expanded else None,
-                )
-            )
+            else:
+                # The response says nothing about this post: a bare reference, which
+                # never marks it unavailable nor replaces a stored copy.
+                if expanded:
+                    logger.warning(
+                        "%s tweet %s of tweet %s missing from includes",
+                        ref.type,
+                        ref.id,
+                        tweet.id,
+                    )
+                out.append(ReferencedPost(id=ref.id, type=ref.type))
         return tuple(out)
 
     def cursor_ids(self) -> list[int]:
