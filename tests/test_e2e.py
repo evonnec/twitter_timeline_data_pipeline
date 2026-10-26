@@ -7,6 +7,7 @@ import pytest
 from conftest import Aws
 from helpers import (
     GIF_URL,
+    LONG_POST_ID,
     PHOTO_URL,
     USER_ID,
     VIDEO_HI_URL,
@@ -16,6 +17,8 @@ from helpers import (
     ddb_get,
     ddb_items,
     install_x_api,
+    long_post_api_object,
+    long_post_timeline,
     sqs_record,
     synthetic_timeline,
 )
@@ -250,3 +253,21 @@ def test_media_gone_for_good_is_recorded_not_retried(
     assert result == {"batchItemFailures": []}
     assert PHOTO_KEY not in s3_keys(pipeline)
     assert item(pipeline, PHOTO_TWEET)["media"][0]["status"] == "unavailable"
+
+
+def test_long_post_is_stored_in_full(
+    pipeline_env: Aws, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    install_x_api(monkeypatch, fetch, long_post_timeline())
+    post = long_post_api_object()
+
+    fetched = fetch_handler({"username": USERNAME}, None)
+    processed = process_handler({"Records": drain(pipeline_env)}, None)
+
+    assert fetched["enqueued"] == 1
+    assert processed == {"batchItemFailures": []}
+    stored = item(pipeline_env, LONG_POST_ID)
+    assert stored["text"] == post["note_tweet"]["text"]
+    assert len(stored["text"]) > 280
+    assert stored["display_text"] == post["text"]
+    assert stored["is_long_post"] is True

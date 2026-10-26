@@ -239,7 +239,10 @@ class TweetStore:
             "tweet_id": tweet.id,
             "username": message.username,
             "author_id": tweet.author_id,
-            "text": tweet.text,
+            # A long post's full text; the API's truncated preview goes to display_text.
+            "text": tweet.full_text,
+            "display_text": tweet.text if tweet.note_text else None,
+            "is_long_post": bool(tweet.note_text),
             "created_at": tweet.created_at,
             "conversation_id": tweet.conversation_id,
             "lang": tweet.lang,

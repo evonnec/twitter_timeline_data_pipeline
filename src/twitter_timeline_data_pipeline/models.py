@@ -14,6 +14,10 @@ from typing import Any, NoReturn, Self
 
 logger = logging.getLogger(__name__)
 
+# Stays 1 on purpose. ``note_text`` is an additive, optional field: a reader builds a
+# Tweet from explicit keys and ignores unknown ones, so an old processor still parses
+# a new message (it just stores the preview), and a new processor reading an old
+# message gets ``note_text=None``. Bump only for a change a reader can't ignore.
 SCHEMA_VERSION = 1
 
 type TweetId = str
@@ -150,20 +154,39 @@ class Tweet:
     public_metrics: Mapping[str, int] = field(default_factory=dict)
     edit_history_tweet_ids: tuple[TweetId, ...] = ()
     media_keys: tuple[MediaKey, ...] = ()
+    # Full text of a long post (over 280 characters), from ``note_tweet.text``. For
+    # those posts ``text`` is only a truncated preview.
+    note_text: str | None = None
+
+    @property
+    def full_text(self) -> str:
+        """The whole post: ``note_text`` for a long post, else ``text``."""
+        return self.note_text or self.text
 
     @classmethod
     def from_api(cls, data: Mapping[str, Any]) -> Self:
         """Build from an API Tweet object (media keys live under ``attachments``)."""
         attachments = data.get("attachments") or {}
-        return cls._build(data, media_keys=attachments.get("media_keys") or ())
+        note = data.get("note_tweet") or {}
+        return cls._build(
+            data,
+            media_keys=attachments.get("media_keys") or (),
+            note_text=note.get("text"),
+        )
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> Self:
         """Build from the ``tweet`` object of an SQS message (flat ``media_keys``)."""
-        return cls._build(data, media_keys=data.get("media_keys") or ())
+        return cls._build(
+            data,
+            media_keys=data.get("media_keys") or (),
+            note_text=data.get("note_text"),
+        )
 
     @classmethod
-    def _build(cls, data: Mapping[str, Any], *, media_keys: Any) -> Self:
+    def _build(
+        cls, data: Mapping[str, Any], *, media_keys: Any, note_text: Any
+    ) -> Self:
         return cls(
             id=str(data["id"]),
             text=str(data["text"]),
@@ -182,6 +205,7 @@ class Tweet:
                 str(i) for i in data.get("edit_history_tweet_ids") or ()
             ),
             media_keys=tuple(str(k) for k in media_keys),
+            note_text=_opt_str(note_text),
         )
 
 

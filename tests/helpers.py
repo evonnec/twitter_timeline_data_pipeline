@@ -209,6 +209,28 @@ def synthetic_timeline(
     return handler
 
 
+LONG_POST_ID = "1700000000000000009"
+
+
+def long_post_timeline() -> Handler:
+    """An X API serving ``timeline_long_post.json`` (one long post) for the timeline."""
+    stub = XApiStub()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path != f"/2/users/{USER_ID}/tweets":
+            return stub(request)
+        stub.requests.append(request)
+        return httpx.Response(200, json=load_fixture("timeline_long_post.json"))
+
+    return handler
+
+
+def long_post_api_object() -> dict[str, Any]:
+    """The long post's API object, as the fixture holds it."""
+    post: dict[str, Any] = load_fixture("timeline_long_post.json")["data"][0]
+    return post
+
+
 class FakeSqs:
     """Records ``send_message_batch`` calls; ``fail`` picks the entry Ids to reject.
 

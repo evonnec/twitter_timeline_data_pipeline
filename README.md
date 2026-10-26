@@ -55,6 +55,7 @@ One message per Tweet. The body is compact, ASCII-escaped JSON (so odd character
   "tweet": {
     "id": "1850000000000000001",
     "text": "Launch day. https://t.co/abc",
+    "note_text": null,
     "created_at": "2024-10-25T14:30:00.000Z",
     "author_id": "11348282",
     "conversation_id": "1850000000000000001",
@@ -89,6 +90,12 @@ One message per Tweet. The body is compact, ASCII-escaped JSON (so odd character
 
 You can regenerate it with `TweetMessage(...).to_json()` from `twitter_timeline_data_pipeline.models`.
 
+**Long posts.** For a post over 280 characters the API's `text` is only a truncated preview; the full body is in `note_tweet.text`, which the fetch Lambda requests. It travels as `tweet.note_text` (`null` for a short post). Entities of the long text are not collected.
+
+**Compatibility.** `note_text` is an additive, optional field, so `schema_version` stays 1. A reader builds a Tweet from explicit keys and ignores unknown ones, so a processor from before this field still parses a new message (and stores the preview), and a new processor reading an old message gets `note_text = null`. The version only changes for a change a reader cannot ignore.
+
+**Size guard.** The fetch Lambda checks each body against 256 KiB, the SQS default message size limit (queues can be configured for more; 256 KiB is the conservative choice). A body over the limit is logged at ERROR with the Tweet ID and size, skipped without stopping the run, and counted as `oversized` in the run summary. The largest possible post (25,000 weighted characters: 12,500 emoji or 12,500 CJK characters) is about 150 KB or 75 KB once ASCII-escaped, so this should only trigger on a malformed payload.
+
 ### Tweets table (`TweetsTable`)
 
 | Item | Value |
@@ -104,7 +111,9 @@ You can regenerate it with `TweetMessage(...).to_json()` from `twitter_timeline_
 | `tweet_id` | S | Tweet ID |
 | `username` | S | Normalized account name (lower case) |
 | `author_id` | S | |
-| `text` | S | |
+| `text` | S | The full text; for a long post, `note_tweet.text` |
+| `display_text` | S | Only for a long post: the API's truncated preview |
+| `is_long_post` | BOOL | `true` when the post has a `note_tweet`, else `false` |
 | `created_at` | S | ISO 8601 |
 | `conversation_id` | S | |
 | `lang` | S | |

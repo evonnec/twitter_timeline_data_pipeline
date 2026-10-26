@@ -5,7 +5,14 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from helpers import FETCHED_AT, XApiStub, make_message, photo, x_client
+from helpers import (
+    FETCHED_AT,
+    XApiStub,
+    long_post_api_object,
+    make_message,
+    photo,
+    x_client,
+)
 
 from twitter_timeline_data_pipeline.models import (
     SCHEMA_VERSION,
@@ -519,3 +526,75 @@ def test_normalize_username_strips_one_at_and_lowercases(
     given: str, expected: str
 ) -> None:
     assert normalize_username(given) == expected
+
+
+# ---- long posts (note_tweet) and schema compatibility ----------------------
+
+
+def test_tweet_from_api_reads_note_tweet_text() -> None:
+    post = long_post_api_object()
+
+    tweet = Tweet.from_api(post)
+
+    assert tweet.note_text == post["note_tweet"]["text"]
+    assert tweet.text == post["text"]
+    assert tweet.full_text == tweet.note_text
+
+
+def test_full_text_is_text_for_a_short_post() -> None:
+    tweet = Tweet.from_api({"id": "1", "text": "short"})
+
+    assert tweet.note_text is None
+    assert tweet.full_text == "short"
+
+
+def test_long_post_survives_a_message_round_trip() -> None:
+    tweet = Tweet.from_api(long_post_api_object())
+    message = TweetMessage(username="u", tweet=tweet, fetched_at=FETCHED_AT)
+
+    data = json.loads(message.to_json())
+    parsed = TweetMessage.from_json(message.to_json())
+
+    assert data["tweet"]["note_text"] == tweet.note_text
+    assert "note_tweet" not in data["tweet"]  # flat key, entities are out of scope
+    assert parsed == message
+
+
+def test_schema_version_stays_1_for_the_additive_note_text_field() -> None:
+    assert SCHEMA_VERSION == 1
+
+
+def test_a_message_without_note_text_still_parses() -> None:
+    """A body written before ``note_text`` existed: the new reader gets None."""
+    body = json.dumps(
+        {
+            "username": "u",
+            "tweet": {"id": "1", "text": "old format"},
+            "media": [],
+            "fetched_at": FETCHED_AT,
+            "schema_version": 1,
+        }
+    )
+
+    parsed = TweetMessage.from_json(body)
+
+    assert parsed.tweet.note_text is None
+    assert parsed.tweet.full_text == "old format"
+
+
+def test_a_reader_that_ignores_unknown_keys_parses_a_message_with_note_text() -> None:
+    """The reverse direction: a reader builds from explicit keys, as the previous
+    version did, so the extra ``note_text`` key is simply never looked at."""
+    message = TweetMessage(
+        username="u",
+        tweet=Tweet.from_api(long_post_api_object()),
+        fetched_at=FETCHED_AT,
+    )
+    tweet_data = json.loads(message.to_json())["tweet"]
+    assert "note_text" in tweet_data
+
+    previous_reader = {"id": str(tweet_data["id"]), "text": str(tweet_data["text"])}
+
+    assert previous_reader["text"] == message.tweet.text
+    assert Tweet.from_dict(tweet_data).note_text == message.tweet.note_text
+    assert Tweet.from_dict({k: v for k, v in tweet_data.items() if k != "note_text"})

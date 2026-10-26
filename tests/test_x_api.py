@@ -11,6 +11,7 @@ from helpers import (
     XApiStub,
     http_client,
     load_fixture,
+    long_post_timeline,
     x_client,
 )
 
@@ -502,6 +503,7 @@ def test_iter_timeline_sends_field_params_and_follows_pagination() -> None:
     assert first.url.path == f"/2/users/{USER_ID}/tweets"
     assert first.url.params["max_results"] == "50"
     assert first.url.params["tweet.fields"] == ",".join(TWEET_FIELDS)
+    assert "note_tweet" in first.url.params["tweet.fields"].split(",")
     assert first.url.params["expansions"] == ",".join(EXPANSIONS)
     assert first.url.params["media.fields"] == ",".join(MEDIA_FIELDS)
     assert "pagination_token" not in first.url.params
@@ -682,3 +684,14 @@ def test_token_never_appears_in_logs_or_exception_text(
     assert all(secret not in text for text in rendered)
     # It was sent, but only in the Authorization header.
     assert handler.calls[0].headers["Authorization"] == f"Bearer {secret}"
+
+
+def test_long_post_is_parsed_with_its_full_text() -> None:
+    with x_client(long_post_timeline()) as client:
+        (page,) = list(client.iter_timeline(USER_ID))
+
+    (tweet,) = page.tweets
+    assert tweet.note_text is not None
+    assert tweet.text.endswith("https://t.co/FakeLong1")
+    assert tweet.full_text == tweet.note_text
+    assert len(tweet.note_text) > 280

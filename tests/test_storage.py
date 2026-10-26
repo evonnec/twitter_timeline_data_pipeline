@@ -8,18 +8,20 @@ from botocore.exceptions import ClientError
 from conftest import STATE_TABLE, Aws
 from helpers import (
     GIF_URL,
+    LONG_POST_ID,
     PHOTO_URL,
     USER_ID,
     VIDEO_HI_URL,
     CdnStub,
     as_items,
     ddb_get,
+    long_post_api_object,
     make_message,
     photo,
 )
 from mypy_boto3_s3 import S3Client
 
-from twitter_timeline_data_pipeline.models import Media, TweetMessage
+from twitter_timeline_data_pipeline.models import Media, Tweet, TweetMessage
 from twitter_timeline_data_pipeline.storage import (
     ALLOWED_MEDIA_HOSTS,
     CheckpointStore,
@@ -458,6 +460,7 @@ def test_to_item_contains_every_field() -> None:
         "username": "example_user",
         "author_id": USER_ID,
         "text": f"tweet {TWEET_ID}",
+        "is_long_post": False,
         "created_at": "2026-10-20T12:00:00.000Z",
         "conversation_id": "1700000000000000001",
         "lang": "en",
@@ -479,6 +482,27 @@ def test_to_item_contains_every_field() -> None:
         "fetched_at": "2026-10-25T00:00:00Z",
         "schema_version": 1,
     }
+
+
+def test_to_item_stores_the_full_text_of_a_long_post() -> None:
+    post = long_post_api_object()
+    message = TweetMessage(
+        username="example_user", tweet=Tweet.from_api(post), fetched_at="x"
+    )
+
+    item = TweetStore.to_item(message, [])
+
+    assert item["tweet_id"] == LONG_POST_ID
+    assert item["text"] == post["note_tweet"]["text"]
+    assert item["display_text"] == post["text"]
+    assert item["is_long_post"] is True
+
+
+def test_to_item_flags_a_short_post_as_not_long_and_has_no_display_text() -> None:
+    item = TweetStore.to_item(make_message(), [])
+
+    assert item["is_long_post"] is False
+    assert "display_text" not in item
 
 
 def test_to_item_drops_none_values_at_every_level() -> None:

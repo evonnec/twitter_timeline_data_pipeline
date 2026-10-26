@@ -14,9 +14,12 @@ from helpers import (
     ddb_get,
     install_x_api,
     load_fixture,
+    long_post_timeline,
     synthetic_timeline,
     x_client,
 )
+from hypothesis import given
+from hypothesis import strategies as st
 
 from twitter_timeline_data_pipeline import credentials
 from twitter_timeline_data_pipeline.config import ConfigError
@@ -26,12 +29,14 @@ from twitter_timeline_data_pipeline.handlers.fetch import (
     RETRY_BACKOFF_SECONDS,
     SEND_RETRIES,
     SQS_BATCH_SIZE,
+    SQS_MAX_MESSAGE_BYTES,
     EnqueueError,
     FetchResult,
+    _chunk_bodies,
     handler,
     run_fetch,
 )
-from twitter_timeline_data_pipeline.models import TweetMessage
+from twitter_timeline_data_pipeline.models import Tweet, TweetMessage
 from twitter_timeline_data_pipeline.storage import CheckpointStore
 from twitter_timeline_data_pipeline.x_api import AuthError, NotFoundError, XApiError
 
@@ -468,6 +473,7 @@ def test_handler_end_to_end(pipeline_env: Aws, monkeypatch: pytest.MonkeyPatch) 
         "tweets": 7,
         "enqueued": 7,
         "truncated": False,
+        "oversized": 0,
     }
     assert len(received(pipeline_env)) == 7
     assert CheckpointStore(pipeline_env.state_table).get(USERNAME) == NEWEST
@@ -683,3 +689,116 @@ def test_handler_reuses_cached_aws_clients(
 
     assert fetch.sqs_client.cache_info().hits >= 1
     assert fetch.checkpoint_store.cache_info().misses == 1
+
+
+# ---- message size guard -----------------------------------------------------
+
+
+def max_length_message(char: str) -> TweetMessage:
+    """A post at X's 25,000 weighted-character limit: emoji and CJK count double."""
+    return TweetMessage(
+        username=USERNAME,
+        tweet=Tweet(id="1", text="preview", note_text=char * 12_500),
+        fetched_at="2026-10-25T00:00:00Z",
+    )
+
+
+@pytest.mark.parametrize("char", ["\U0001f600", "\u6f22"], ids=["emoji", "cjk"])
+def test_a_maximum_length_post_fits_an_sqs_message_despite_ascii_escaping(
+    char: str,
+) -> None:
+    body = max_length_message(char).to_json()
+
+    assert body.isascii()
+    assert len(body.encode()) < SQS_MAX_MESSAGE_BYTES
+    assert TweetMessage.from_json(body).tweet.note_text == char * 12_500
+
+
+def test_a_long_post_is_enqueued_in_full(aws: Aws) -> None:
+    sqs = FakeSqs()
+
+    result = run(aws, long_post_timeline(), sqs)
+
+    assert (result.enqueued, result.oversized) == (1, 0)
+    body = TweetMessage.from_json(sqs.calls[0][0]["MessageBody"])
+    assert body.tweet.note_text is not None
+    assert len(body.tweet.note_text) > 280
+
+
+def test_an_oversized_message_is_skipped_logged_and_counted(
+    aws: Aws, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(fetch, "SQS_MAX_MESSAGE_BYTES", 600)
+    big, small = ids(2)
+    api = synthetic_timeline([big, small])
+    original = TweetMessage.to_json
+
+    def to_json(self: TweetMessage) -> str:
+        body = original(self)
+        return body + " " * 1_000 if self.tweet.id == big else body
+
+    monkeypatch.setattr(TweetMessage, "to_json", to_json)
+    sqs = FakeSqs()
+
+    with caplog.at_level(logging.ERROR, logger=fetch.logger.name):
+        result = run(aws, api, sqs)
+
+    assert (result.tweets, result.enqueued, result.oversized) == (2, 1, 1)
+    assert sent_ids(sqs) == [small]
+    assert result.newest_id == big  # the skipped Tweet doesn't stall the checkpoint
+    assert CheckpointStore(aws.state_table).get(USERNAME) == big
+    (record,) = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert big in record.getMessage()
+    assert "600 byte limit" in record.getMessage()
+
+
+def test_a_batch_of_only_oversized_messages_sends_nothing(
+    aws: Aws, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(fetch, "SQS_MAX_MESSAGE_BYTES", 10)
+    sqs = FakeSqs()
+
+    result = run(aws, synthetic_timeline(ids(3)), sqs)
+
+    assert sqs.calls == []
+    assert (result.enqueued, result.oversized) == (0, 3)
+
+
+# ---- batch total-size chunking ----------------------------------------------
+
+
+def test_two_large_bodies_go_out_in_separate_calls(
+    aws: Aws, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original = TweetMessage.to_json
+    monkeypatch.setattr(
+        TweetMessage, "to_json", lambda self: original(self) + " " * 150_000
+    )
+    sqs = FakeSqs()
+
+    result = run(aws, synthetic_timeline(ids(2)), sqs)
+
+    assert sqs.sizes == [1, 1]
+    assert (result.enqueued, result.oversized) == (2, 0)
+
+
+def test_ten_small_bodies_still_go_out_in_one_call(aws: Aws) -> None:
+    sqs = FakeSqs()
+
+    run(aws, synthetic_timeline(ids(10)), sqs)
+
+    assert sqs.sizes == [10]
+
+
+@given(sizes=st.lists(st.integers(1, SQS_MAX_MESSAGE_BYTES), max_size=60))
+def test_chunks_respect_both_limits_and_keep_every_body_in_order(
+    sizes: list[int],
+) -> None:
+    bodies = [f"{i:04d}".ljust(max(size, 4), "x") for i, size in enumerate(sizes)]
+
+    chunks = list(_chunk_bodies(bodies))
+
+    for chunk in chunks:
+        assert 1 <= len(chunk) <= SQS_BATCH_SIZE
+        assert sum(len(b.encode()) for b in chunk) <= SQS_MAX_MESSAGE_BYTES
+    assert [b for chunk in chunks for b in chunk] == bodies

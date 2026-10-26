@@ -9,10 +9,9 @@ oldest Tweet fetched are skipped (logged as a warning).
 
 import dataclasses
 import functools
-import itertools
 import logging
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -22,6 +21,7 @@ from twitter_timeline_data_pipeline.config import ConfigError, Settings
 from twitter_timeline_data_pipeline.credentials import clear_cache, get_bearer_token
 from twitter_timeline_data_pipeline.models import (
     TweetId,
+    TweetMessage,
     is_newer,
     normalize_username,
 )
@@ -37,6 +37,9 @@ logger = logging.getLogger(__name__)
 SQS_BATCH_SIZE = 10  # SendMessageBatch limit
 SEND_RETRIES = 2  # extra attempts for entries SQS reports as Failed
 RETRY_BACKOFF_SECONDS = 0.5
+# SQS's default message size limit. Larger queue limits exist (up to 1 MiB), but
+# 256 KiB is the conservative default and what the template's queue gets.
+SQS_MAX_MESSAGE_BYTES = 256 * 1024
 
 
 class EnqueueError(RuntimeError):
@@ -54,6 +57,8 @@ class FetchResult:
     enqueued: int
     truncated: bool
     """The page cap cut the run short: the last page still had a ``next_token``."""
+    oversized: int = 0
+    """Tweets skipped because their message body exceeded ``SQS_MAX_MESSAGE_BYTES``."""
 
 
 def _send_batch(
@@ -84,6 +89,46 @@ def _send_batch(
     raise EnqueueError(f"{len(pending)} messages still failing after retries")
 
 
+def _fit_bodies(messages: Sequence[TweetMessage]) -> tuple[list[str], int]:
+    """The JSON bodies that fit an SQS message, and how many Tweets were skipped.
+
+    One oversized body must not stall the timeline, so it is logged and dropped.
+    """
+    bodies = []
+    for message in messages:
+        body = message.to_json()
+        size = len(body.encode())
+        if size > SQS_MAX_MESSAGE_BYTES:
+            logger.error(
+                "tweet %s skipped: message body is %d bytes, over the %d byte limit",
+                message.tweet.id,
+                size,
+                SQS_MAX_MESSAGE_BYTES,
+            )
+            continue
+        bodies.append(body)
+    return bodies, len(messages) - len(bodies)
+
+
+def _chunk_bodies(bodies: Sequence[str]) -> Iterator[list[str]]:
+    """Group bodies into SendMessageBatch calls: at most ``SQS_BATCH_SIZE`` entries and
+    ``SQS_MAX_MESSAGE_BYTES`` in total (SQS limits the whole call, not just each
+    message). A body under the per-message limit always fits alone."""
+    chunk: list[str] = []
+    total = 0
+    for body in bodies:
+        size = len(body.encode())
+        if chunk and (
+            len(chunk) == SQS_BATCH_SIZE or total + size > SQS_MAX_MESSAGE_BYTES
+        ):
+            yield chunk
+            chunk, total = [], 0
+        chunk.append(body)
+        total += size
+    if chunk:
+        yield chunk
+
+
 def run_fetch(
     *,
     username: str,
@@ -107,7 +152,7 @@ def run_fetch(
     user_id = x_client.get_user_id(username)
     since_id = since_id or checkpoints.get(username)
 
-    pages = tweets = enqueued = 0
+    pages = tweets = enqueued = oversized = 0
     newest_id: TweetId | None = None
     oldest_id: TweetId | None = None
     for page in x_client.iter_timeline(
@@ -116,8 +161,10 @@ def run_fetch(
         pages += 1
         messages = page.messages(username)
         tweets += len(messages)
-        for chunk in itertools.batched(messages, SQS_BATCH_SIZE, strict=False):
-            _send_batch(sqs, queue_url, [m.to_json() for m in chunk], sleep)
+        bodies, skipped = _fit_bodies(messages)
+        oversized += skipped
+        for chunk in _chunk_bodies(bodies):
+            _send_batch(sqs, queue_url, chunk, sleep)
             enqueued += len(chunk)
         for tweet in page.tweets:
             if is_newer(tweet.id, newest_id):
@@ -150,6 +197,7 @@ def run_fetch(
         tweets=tweets,
         enqueued=enqueued,
         truncated=truncated,
+        oversized=oversized,
     )
 
 
