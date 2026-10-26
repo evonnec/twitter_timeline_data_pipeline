@@ -268,15 +268,18 @@ jobs:
         uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
         with:
           platforms: arm64
+          # Pinned by digest, like the other images the job runs.
+          image: tonistiigi/binfmt@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
       - name: Start LocalStack, the stub X API, and the three function containers
         env:
           # Only needed for LocalStack releases after the pinned one; see the script.
           LOCALSTACK_AUTH_TOKEN: ${{ secrets.LOCALSTACK_AUTH_TOKEN }}
         run: scripts/integration_test.sh up
       - name: Run the integration tests
+        timeout-minutes: 20
         run: scripts/integration_test.sh test
       - name: Print container logs
-        if: failure()
+        if: ${{ failure() || cancelled() }}
         run: scripts/integration_test.sh logs
       - name: Stop everything
         if: ${{ !cancelled() }}

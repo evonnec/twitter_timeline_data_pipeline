@@ -31,6 +31,8 @@ class Poller:
     batch_size: int = 10
     deliveries: dict[str, list[int]] = field(default_factory=dict)
     """message id -> receive count of each delivery to the function, in order."""
+    batches: list[list[str]] = field(default_factory=list)
+    """The message ids of each invocation, in order."""
     failures: list[str] = field(default_factory=list)
     """Every id the function reported as failed, one entry per report."""
 
@@ -66,6 +68,7 @@ class Poller:
             self.deliveries.setdefault(r["messageId"], []).append(
                 int(r["attributes"]["ApproximateReceiveCount"])
             )
+        self.batches.append([r["messageId"] for r in records])
         result = self.invoke({"Records": records}).payload
         failed = [f["itemIdentifier"] for f in result["batchItemFailures"]]
         self.failures += failed

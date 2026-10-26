@@ -1,7 +1,7 @@
 """The test-only ``MEDIA_ALLOWED_HOSTS_OVERRIDE`` allowlist extension."""
 
 import pytest
-from conftest import Aws
+from conftest import BUCKET, TWEETS_TABLE, Aws
 from helpers import CdnStub, ddb_get, make_message, photo, sqs_record
 
 from twitter_timeline_data_pipeline.handlers import process
@@ -14,20 +14,44 @@ from twitter_timeline_data_pipeline.storage import (
 STUB_URL = "http://cdn-stub:8080/media/Stub.jpg"
 
 
+EMULATED = {"AWS_ENDPOINT_URL": "http://localstack:4566"}
+
+
 def test_override_is_empty_when_unset_or_blank() -> None:
     assert media_hosts_override({}) == frozenset()
     assert media_hosts_override({MEDIA_HOSTS_OVERRIDE_ENV: " , "}) == frozenset()
+
+
+def test_override_is_ignored_with_an_error_without_an_aws_endpoint_override(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level("ERROR"):
+        hosts = media_hosts_override({MEDIA_HOSTS_OVERRIDE_ENV: "cdn-stub"})
+
+    assert hosts == frozenset()
+    (record,) = caplog.records
+    assert record.levelname == "ERROR"
+    assert "ignoring the override" in record.getMessage()
+
+
+def test_a_blank_aws_endpoint_override_counts_as_unset() -> None:
+    env = {MEDIA_HOSTS_OVERRIDE_ENV: "cdn-stub", "AWS_ENDPOINT_URL": ""}
+    assert media_hosts_override(env) == frozenset()
 
 
 def test_override_reads_the_process_environment_by_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv(MEDIA_HOSTS_OVERRIDE_ENV, "cdn-stub")
+    monkeypatch.setenv("AWS_ENDPOINT_URL", "http://localstack:4566")
     assert media_hosts_override() == {"cdn-stub"}
 
 
 def test_override_splits_trims_and_lowercases() -> None:
-    env = {MEDIA_HOSTS_OVERRIDE_ENV: " CDN-Stub, host.docker.internal ,"}
+    env = {
+        **EMULATED,
+        MEDIA_HOSTS_OVERRIDE_ENV: " CDN-Stub, host.docker.internal ,",
+    }
     assert media_hosts_override(env) == {"cdn-stub", "host.docker.internal"}
 
 
@@ -36,7 +60,7 @@ def test_override_splits_trims_and_lowercases() -> None:
 )
 def test_override_rejects_anything_but_a_bare_hostname(bad: str) -> None:
     with pytest.raises(ValueError, match="bare hostname"):
-        media_hosts_override({MEDIA_HOSTS_OVERRIDE_ENV: bad})
+        media_hosts_override({**EMULATED, MEDIA_HOSTS_OVERRIDE_ENV: bad})
 
 
 def store(aws: Aws, cdn: CdnStub, hosts: frozenset[str]) -> MediaStore:
@@ -94,6 +118,12 @@ def test_the_handlers_warn_loudly_once_and_pass_the_hosts_to_the_store(
     cdn = CdnStub()
     cdn.serve(STUB_URL, b"jpeg", "image/jpeg")
     monkeypatch.setattr(process, "_http_client", lambda _t: cdn.client())
+    # Build the (cached) AWS clients on moto first; the endpoint variable that unlocks
+    # the override would otherwise send them to a custom URL.
+    process._s3_client()
+    process._sqs_client()
+    process._tweet_store(TWEETS_TABLE, BUCKET)
+    monkeypatch.setenv("AWS_ENDPOINT_URL", EMULATED["AWS_ENDPOINT_URL"])
     monkeypatch.setenv(MEDIA_HOSTS_OVERRIDE_ENV, "cdn-stub")
     message = make_message(media=(photo(url=STUB_URL),))
     record = sqs_record("m1", message.to_json())
@@ -109,6 +139,29 @@ def test_the_handlers_warn_loudly_once_and_pass_the_hosts_to_the_store(
     assert len(warnings) == 1
     assert warnings[0].levelname == "WARNING"
     assert "never be set in a real deployment" in warnings[0].getMessage()
+
+
+def test_the_handler_ignores_the_override_without_an_aws_endpoint_override(
+    pipeline_env: Aws,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    cdn = CdnStub()
+    cdn.serve(STUB_URL, b"jpeg", "image/jpeg")
+    monkeypatch.setattr(process, "_http_client", lambda _t: cdn.client())
+    monkeypatch.setenv(MEDIA_HOSTS_OVERRIDE_ENV, "cdn-stub")  # AWS_ENDPOINT_URL unset
+    message = make_message(media=(photo(url=STUB_URL),))
+
+    with caplog.at_level("ERROR"):
+        result = process.handler(
+            {"Records": [sqs_record("m1", message.to_json())]}, None
+        )
+
+    assert result == {"batchItemFailures": []}
+    assert cdn.requests == []  # the media was skipped, not downloaded
+    (item,) = ddb_get(pipeline_env.tweets_table, tweet_id=message.tweet.id)["media"]
+    assert item["status"] == "skipped"
+    assert "ignoring the override" in caplog.text
 
 
 def test_no_warning_and_no_extra_hosts_when_unset(

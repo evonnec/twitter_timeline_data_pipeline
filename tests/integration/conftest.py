@@ -29,16 +29,20 @@ if TYPE_CHECKING:
     from mypy_boto3_sqs import SQSClient
 
 
-def endpoint() -> str | None:
-    """LocalStack's URL from here; empty means the default AWS endpoints (moto)."""
-    return os.environ.get("IT_AWS_ENDPOINT_URL") or None
-
-
 def env(name: str) -> str:
-    try:
-        return os.environ[name]
-    except KeyError:
+    value = os.environ.get(name)
+    if not value:
         pytest.fail(f"{name} is not set; run these through scripts/integration_test.sh")
+    return value
+
+
+def endpoint() -> str:
+    """LocalStack's URL. Required: without it boto3 would use real AWS, and the
+    ``clean_slate`` fixture deletes items and objects."""
+    url = env("IT_AWS_ENDPOINT_URL")
+    if "amazonaws.com" in url:
+        pytest.fail(f"IT_AWS_ENDPOINT_URL={url} is real AWS; refusing to run")
+    return url
 
 
 @pytest.fixture(scope="session")
@@ -102,11 +106,16 @@ def media_retry() -> Invoke:
 class Stub:
     """The stub X API and CDN, as seen from the tests."""
 
-    def __init__(self, base_url: str) -> None:
+    def __init__(self, base_url: str, internal_url: str) -> None:
         self.base_url = base_url
+        self.internal_url = internal_url
+        """The same server as the Lambda containers reach it (media URLs use this)."""
 
     def reset(self) -> None:
         httpx.post(f"{self.base_url}/__reset").raise_for_status()
+
+    def flaky_media_up(self) -> None:
+        httpx.post(f"{self.base_url}/__flaky/up").raise_for_status()
 
     def requests(self) -> list[dict[str, Any]]:
         response = httpx.get(f"{self.base_url}/__requests")
@@ -117,7 +126,7 @@ class Stub:
 
 @pytest.fixture
 def stub() -> Stub:
-    server = Stub(env("IT_STUB_URL"))
+    server = Stub(env("IT_STUB_URL"), env("IT_STUB_URL_INTERNAL"))
     server.reset()
     return server
 
@@ -164,6 +173,20 @@ def clean_slate(
                 Bucket=resources.bucket, Key=v["Key"], VersionId=v["VersionId"]
             )
     yield
+
+
+@pytest.fixture
+def media_retry_poller(
+    sqs: SQSClient, resources: Resources, media_retry: Invoke
+) -> Poller:
+    return Poller(
+        sqs=sqs,
+        queue_url=resources.media_retry.url,
+        queue_arn=resources.media_retry.arn,
+        region=resources.region,
+        invoke=media_retry,
+        batch_size=resources.media_retry.batch_size,
+    )
 
 
 @pytest.fixture

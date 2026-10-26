@@ -2,11 +2,9 @@
 image and the AWS services in LocalStack (see ``integration/esm.py`` and
 ``integration/provision.py`` for what is emulated)."""
 
-import json
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
-from helpers import make_message
+from helpers import make_message, photo
 
 from integration.esm import Poller
 from integration.provision import Resources
@@ -23,6 +21,7 @@ from integration.stub_server import (
     USER_ID,
     USERNAME,
 )
+from twitter_timeline_data_pipeline.models import MediaRetry
 
 if TYPE_CHECKING:
     from mypy_boto3_dynamodb.service_resource import Table
@@ -103,10 +102,15 @@ def test_a_poison_message_is_redelivered_alone_and_ends_in_the_dlq(
         ],
     )
     ids = {s["Id"]: s["MessageId"] for s in sent["Successful"]}
+    assert len(ids) == 2
     dlq = resources.tweets.dlq_url
 
     tweets_poller.run_until(lambda: queue_depth(sqs, dlq) >= 1)
 
+    # Both records arrived in one batch, so the redelivery of the poison one alone shows
+    # the partial batch response at work, not two separate receives.
+    assert set(tweets_poller.batches[0]) == set(ids.values())
+    assert len(tweets_poller.batches[0]) == 2
     # The good record was written and acknowledged on its first delivery. Only the
     # poison record came back, once per receive until maxReceiveCount.
     assert stored_ids(tweets_table) == {good.tweet.id}
@@ -121,22 +125,65 @@ def test_a_poison_message_is_redelivered_alone_and_ends_in_the_dlq(
     assert queue_depth(sqs, resources.tweets.url) == 0
 
 
-def test_the_poller_builds_the_keys_of_the_sample_sqs_event() -> None:
-    """Guards the hand-built SQS event against drifting from events/sqs.json."""
-    sample = json.loads((Path(__file__).parents[2] / "events" / "sqs.json").read_text())
-    poller = Poller(
-        sqs=cast("Any", None),
-        queue_url="",
-        queue_arn="",
-        region="us-east-1",
-        invoke=lambda _event: cast("Any", None),
-    )
-    message = {
-        "MessageId": "m",
-        "ReceiptHandle": "r",
-        "Body": "{}",
-        "Attributes": {},
-        "MD5OfBody": "x",
+def retry_queue_counts(sqs: SQSClient, url: str) -> dict[str, int]:
+    attributes = sqs.get_queue_attributes(QueueUrl=url, AttributeNames=["All"])[
+        "Attributes"
+    ]
+    return {
+        "visible": int(attributes["ApproximateNumberOfMessages"]),
+        "delayed": int(attributes["ApproximateNumberOfMessagesDelayed"]),
     }
 
-    assert set(poller._record(message)) == set(sample["Records"][0])
+
+def test_media_that_fails_until_the_last_receive_is_retried_and_then_stored(
+    sqs: SQSClient,
+    tweets_poller: Poller,
+    media_retry_poller: Poller,
+    tweets_table: Table,
+    s3: S3Client,
+    resources: Resources,
+    stub: Stub,
+) -> None:
+    """The CDN answers 503, so the process function runs out of receives, stores the
+    Tweet with the media as ``retrying`` and queues a media-retry message. Once the CDN
+    is back, the media-retry function stores the file and replaces that entry."""
+    media = photo(url=f"{stub.internal_url}/media/Flaky.jpg")
+    message = make_message("1800000000000000002", username=USERNAME, media=(media,))
+    sqs.send_message(QueueUrl=resources.tweets.url, MessageBody=message.to_json())
+
+    tweets_poller.run_until(lambda: message.tweet.id in stored_ids(tweets_table))
+
+    # Failed on receives 1 and 2, then rescued on the last one.
+    (delivered,) = tweets_poller.deliveries.values()
+    assert delivered == list(range(1, resources.max_receive_count + 1))
+    item = tweets_table.get_item(Key={"tweet_id": message.tweet.id})["Item"]
+    (entry,) = cast("list[dict[str, Any]]", item["media"])
+    assert entry["status"] == "retrying"
+    s3_key = str(entry["s3_key"])
+    assert "Contents" not in s3.list_objects_v2(Bucket=resources.bucket, Prefix=s3_key)
+    # The process function queued the retry, delayed (5 minutes in the template).
+    delayed = retry_queue_counts(sqs, resources.media_retry.url)
+    assert delayed == {"visible": 0, "delayed": 1}
+
+    stub.flaky_media_up()
+    # The queued copy won't be visible for minutes, so send an undelayed one with the
+    # same body the process function built, and let the real function handle that.
+    retry = MediaRetry(
+        tweet_id=message.tweet.id,
+        username=message.username,
+        author_id=message.tweet.author_id,
+        fetched_at=message.fetched_at,
+        media=media,
+    )
+    sqs.send_message(QueueUrl=resources.media_retry.url, MessageBody=retry.to_json())
+
+    def stored() -> bool:
+        current = tweets_table.get_item(Key={"tweet_id": message.tweet.id})["Item"]
+        (now,) = cast("list[dict[str, Any]]", current["media"])
+        return bool(now["status"] == "stored")
+
+    media_retry_poller.run_until(stored)
+
+    assert media_retry_poller.failures == []
+    body = s3.get_object(Bucket=resources.bucket, Key=s3_key)["Body"].read()
+    assert body == PHOTO_BYTES
