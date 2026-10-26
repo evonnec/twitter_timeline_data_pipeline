@@ -549,7 +549,7 @@ def test_handler_missing_settings_lists_every_missing_variable(
         handler({"username": USERNAME}, None)
 
     assert str(info.value) == (
-        "missing required environment variables: QUEUE_URL, STATE_TABLE"
+        "missing required environment variables: QUEUE_URL, STATE_TABLE, MEDIA_BUCKET"
     )
 
 

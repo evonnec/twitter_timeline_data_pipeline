@@ -349,6 +349,27 @@ class Simulation:
                 moved += 1
         return moved
 
+    def replay(self, prefix: str = "raw/") -> int:
+        """``twitter-pipeline replay``: re-enqueue the messages of the raw pages under
+        ``prefix`` (from the operator's own clients, as the CLI would)."""
+        from twitter_timeline_data_pipeline.handlers.fetch import send_messages
+        from twitter_timeline_data_pipeline.replay import run_replay
+
+        url = self.queue.url
+        return run_replay(
+            s3=self.s3,
+            bucket=self.bucket,
+            prefix=prefix,
+            send=lambda ms: send_messages(self.sqs, url, ms, self.clock.sleep),
+        ).enqueued
+
+    def wipe_tweets(self) -> int:
+        """Delete every item of the tweets table (a disaster, or a bad migration)."""
+        items = list(self.tweets())
+        for tweet_id in items:
+            self.tweets_table.delete_item(Key={"tweet_id": tweet_id})
+        return len(items)
+
     # --- observation -----------------------------------------------------------------
 
     def tweets(self) -> dict[str, dict[str, Any]]:
@@ -393,6 +414,16 @@ class Simulation:
         return str(int(item["newest_id"]))
 
     def objects(self) -> dict[str, StoredObject]:
+        """The media and text objects (everything outside ``raw/``)."""
+        return {
+            k: o for k, o in self._all_objects().items() if not k.startswith("raw/")
+        }
+
+    def raw_objects(self) -> dict[str, StoredObject]:
+        """The landed raw API pages."""
+        return {k: o for k, o in self._all_objects().items() if k.startswith("raw/")}
+
+    def _all_objects(self) -> dict[str, StoredObject]:
         found: dict[str, StoredObject] = {}
         versions = self.s3.list_object_versions(Bucket=self.bucket).get("Versions", [])
         counts: dict[str, int] = {}

@@ -165,6 +165,14 @@ Resources:
             Transitions:
               - StorageClass: INTELLIGENT_TIERING
                 TransitionInDays: 0
+          # Raw API pages are the only copy of fields the processor doesn't keep, and
+          # the API can't serve old posts again: archive them, never expire them.
+          - Id: archive-raw-pages
+            Status: Enabled
+            Prefix: raw/
+            Transitions:
+              - StorageClass: GLACIER_IR
+                TransitionInDays: 90
 
   MediaBucketPolicy:
     Type: AWS::S3::BucketPolicy
@@ -275,6 +283,7 @@ Resources:
           BEARER_TOKEN_SECRET_ARN: !Ref BearerTokenSecret
           QUEUE_URL: !Ref TweetsQueue
           STATE_TABLE: !Ref StateTable
+          MEDIA_BUCKET: !Ref MediaBucket
           MAX_PAGES: !Ref MaxPages
           MAX_RESULTS: !Ref MaxResults
       Policies:
@@ -287,6 +296,10 @@ Resources:
             - Effect: Allow
               Action: [dynamodb:GetItem, dynamodb:PutItem]
               Resource: !GetAtt StateTable.Arn
+            # Raw API pages only: the fetcher can't touch media/ or text/ objects.
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub "${MediaBucket.Arn}/raw/*"
       EventInvokeConfig:
         # The next scheduled run retries; a retry would only burn API rate limit.
         MaximumRetryAttempts: 0

@@ -443,3 +443,149 @@ def test_dry_run_normalizes_the_username(
     assert {m.username for m in dry_run_lines(capsys.readouterr().out)} == {
         "example_user"
     }
+
+
+# ---- raw pages and replay --------------------------------------------------------
+
+RAW = "s3://test-media-bucket/raw/"
+
+
+def queue_depth(aws: Aws) -> int:
+    attrs = aws.sqs.get_queue_attributes(
+        QueueUrl=aws.queue_url, AttributeNames=["ApproximateNumberOfMessages"]
+    )["Attributes"]
+    return int(attrs["ApproximateNumberOfMessages"])
+
+
+def raw_keys(aws: Aws) -> list[str]:
+    listing = aws.s3.list_objects_v2(Bucket=aws.bucket, Prefix="raw/")
+    return [o["Key"] for o in listing.get("Contents", [])]
+
+
+def test_fetch_lands_raw_pages_when_the_bucket_is_set(
+    pipeline_env: Aws, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    install_x_api(monkeypatch, cli, XApiStub())
+
+    assert main(FETCH) == EXIT_OK
+
+    assert len(raw_keys(pipeline_env)) == 2
+
+
+def test_fetch_without_a_bucket_warns_that_pages_are_not_landed(
+    pipeline_env: Aws,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    install_x_api(monkeypatch, cli, XApiStub())
+    monkeypatch.delenv("MEDIA_BUCKET")
+
+    with caplog.at_level(logging.WARNING):
+        assert main(FETCH) == EXIT_OK
+
+    assert raw_keys(pipeline_env) == []
+    assert "raw API pages will not be landed" in caplog.text
+
+
+def test_fetch_dry_run_writes_no_raw_pages(
+    pipeline_env: Aws, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    install_x_api(monkeypatch, cli, XApiStub())
+
+    assert main([*FETCH, "--dry-run"]) == EXIT_OK
+
+    assert raw_keys(pipeline_env) == []
+
+
+def test_replay_dry_run_prints_the_messages_the_fetch_built(
+    pipeline_env: Aws,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    install_x_api(monkeypatch, cli, XApiStub())
+    main(FETCH)
+    capsys.readouterr()
+    sent = [
+        m["Body"]
+        for m in pipeline_env.sqs.receive_message(
+            QueueUrl=pipeline_env.queue_url, MaxNumberOfMessages=10
+        )["Messages"]
+    ]
+    monkeypatch.setattr(cli, "XClient", None)  # replay must not build an API client
+
+    assert main(["replay", "--raw", RAW, "--dry-run"]) == EXIT_OK
+
+    captured = capsys.readouterr()
+    lines = captured.out.splitlines()
+    assert len(lines) == 7
+    messages = dry_run_lines(captured.out)
+    assert all(m.raw_key and m.raw_key.startswith("raw/") for m in messages)
+    assert set(sent) <= set(lines)  # same bodies, fetched_at included
+    assert json.loads(captured.err.splitlines()[-1]) == {
+        "objects": 2,
+        "tweets": 7,
+        "enqueued": 0,
+    }
+
+
+def test_replay_enqueues_and_never_touches_the_cursor(
+    pipeline_env: Aws,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    install_x_api(monkeypatch, cli, XApiStub())
+    main(FETCH)
+    capsys.readouterr()
+    before = CheckpointStore(pipeline_env.state_table).load("example_user")
+    depth = queue_depth(pipeline_env)
+
+    assert main(["replay", "--raw", f"{RAW}{USER_ID}/"]) == EXIT_OK
+
+    assert json.loads(capsys.readouterr().out) == {
+        "objects": 2,
+        "tweets": 7,
+        "enqueued": 7,
+    }
+    assert queue_depth(pipeline_env) == depth + 7
+    assert CheckpointStore(pipeline_env.state_table).load("example_user") == before
+
+
+@pytest.mark.parametrize("uri", ["s3://b/media/", "http://b/raw/", "nonsense"])
+def test_replay_with_a_bad_uri_is_a_usage_error(
+    uri: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert main(["replay", "--raw", uri, "--dry-run"]) == EXIT_USAGE
+
+    assert "expected s3://" in capsys.readouterr().err
+
+
+def test_replay_without_a_queue_is_a_usage_error(
+    pipeline_env: Aws,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.delenv("QUEUE_URL")
+
+    assert main(["replay", "--raw", RAW]) == EXIT_USAGE
+
+    assert "QUEUE_URL" in capsys.readouterr().err
+
+
+def test_replay_of_a_corrupt_object_fails_at_runtime(
+    pipeline_env: Aws, capsys: pytest.CaptureFixture[str]
+) -> None:
+    pipeline_env.s3.put_object(Bucket=pipeline_env.bucket, Key="raw/1/x", Body=b"junk")
+
+    assert main(["replay", "--raw", RAW, "--dry-run"]) == EXIT_FAILURE
+
+    assert "raw/1/x" in capsys.readouterr().err
+
+
+def test_replay_from_a_missing_bucket_fails_at_runtime(
+    pipeline_env: Aws, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert (
+        main(["replay", "--raw", "s3://nope-bucket/raw/", "--dry-run"]) == EXIT_FAILURE
+    )
+
+    assert "NoSuchBucket" in capsys.readouterr().err

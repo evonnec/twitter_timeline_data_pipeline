@@ -582,3 +582,39 @@ def test_media_retry_function_has_an_errors_alarm(template: Template) -> None:
         alarm["AlarmActions"]
         == properties(template, "ProcessFunctionErrorsAlarm")["AlarmActions"]
     )
+
+
+def test_fetch_function_writes_only_under_raw(template: Template) -> None:
+    statements = policy_statements(template, "FetchFunction")
+    (put,) = (s for s in statements if "s3:PutObject" in _as_list(s["Action"]))
+
+    assert put["Effect"] == "Allow"
+    assert put["Action"] == "s3:PutObject"
+    assert put["Resource"] == {"Fn::Sub": "${MediaBucket.Arn}/raw/*"}
+    # nothing else of S3: no reads, no listing, no other prefix
+    other = [
+        s
+        for s in statements
+        if s is not put and any(a.startswith("s3:") for a in _as_list(s["Action"]))
+    ]
+    assert other == []
+
+
+def test_fetch_function_gets_the_bucket_name(template: Template) -> None:
+    assert env_of(template, "FetchFunction")["MEDIA_BUCKET"] == {"Ref": "MediaBucket"}
+
+
+def test_raw_pages_are_archived_and_never_expire(template: Template) -> None:
+    rules = properties(template, "MediaBucket")["LifecycleConfiguration"]["Rules"]
+    (rule,) = (r for r in rules if r["Id"] == "archive-raw-pages")
+
+    assert rule["Status"] == "Enabled"
+    assert rule["Prefix"] == "raw/"
+    assert rule["Transitions"] == [
+        {"StorageClass": "GLACIER_IR", "TransitionInDays": 90}
+    ]
+    expiring = {"ExpirationInDays", "ExpirationDate", "ExpiredObjectDeleteMarker"}
+    assert not expiring & rule.keys()
+    # no rule expires current objects, bucket-wide or otherwise
+    for other in rules:
+        assert not expiring & other.keys(), other["Id"]

@@ -23,6 +23,7 @@ from twitter_timeline_data_pipeline.config import DEFAULT_X_API_BASE_URL
 from twitter_timeline_data_pipeline.models import (
     JSONObject,
     Media,
+    RawPage,
     TimelinePage,
     Tweet,
 )
@@ -84,6 +85,31 @@ class RateLimitError(XApiError):
     def __init__(self, message: str, *, reset_at: float | None = None) -> None:
         super().__init__(message, status_code=429)
         self.reset_at = reset_at
+
+
+def parse_timeline_page(
+    body: Mapping[str, Any], *, raw: RawPage | None = None
+) -> TimelinePage:
+    """Parse one ``/users/:id/tweets`` response body into a ``TimelinePage``.
+
+    Shared by the live walk (``XClient.iter_timeline``) and the replay of landed raw
+    pages, so both read a body the same way. A body without ``data`` gives an empty
+    page that keeps its ``next_token``.
+    """
+    meta: Mapping[str, Any] = body.get("meta") or {}
+    data = body.get("data")
+    next_token = meta.get("next_token")
+    if not data:
+        return TimelinePage(tweets=(), media={}, next_token=next_token, raw=raw)
+    media = (Media.from_dict(m) for m in (body.get("includes") or {}).get("media", ()))
+    return TimelinePage(
+        tweets=tuple(Tweet.from_api(t) for t in data),
+        media={m.media_key: m for m in media},
+        newest_id=meta.get("newest_id"),
+        oldest_id=meta.get("oldest_id"),
+        next_token=next_token,
+        raw=raw,
+    )
 
 
 class XClient:
@@ -198,12 +224,11 @@ class XClient:
             params["since_id"] = since_id
         if until_id:
             params["until_id"] = until_id
+        endpoint = f"/users/{user_id}/tweets"
         for page_number in range(1, max_pages + 1):
-            body = self._request(f"/users/{user_id}/tweets", params)
-            meta: Mapping[str, Any] = body.get("meta") or {}
-            data = body.get("data")
+            body = self._request(endpoint, params)
             if errors := body.get("errors"):
-                if not data:
+                if not body.get("data"):
                     # e.g. a protected account: 200 with only an Authorization Error.
                     # Treating that as "no more Tweets" would drop unfetched ranges.
                     raise XApiError(
@@ -217,29 +242,17 @@ class XClient:
                     len(errors),
                     _first_error_text(body) or "no detail",
                 )
-            next_token = meta.get("next_token")
-            if not data:
-                if not next_token:
-                    return
-                # An empty page that still points onward is not the end: yield it
-                # (it cost a request) and keep following the token.
-                yield TimelinePage(tweets=(), media={}, next_token=next_token)
-                params["pagination_token"] = next_token
-                continue
-            media = (
-                Media.from_dict(m)
-                for m in (body.get("includes") or {}).get("media", ())
+            page = parse_timeline_page(
+                body, raw=RawPage(endpoint=endpoint, params=dict(params), body=body)
             )
-            yield TimelinePage(
-                tweets=tuple(Tweet.from_api(t) for t in data),
-                media={m.media_key: m for m in media},
-                newest_id=meta.get("newest_id"),
-                oldest_id=meta.get("oldest_id"),
-                next_token=next_token,
-            )
-            if not next_token:
+            if not page.tweets and not page.next_token:
+                return  # a clean empty response ends the walk without a page
+            # An empty page that still points onward is not the end: yield it (it
+            # cost a request) and keep following the token.
+            yield page
+            if not page.next_token:
                 return
-            params["pagination_token"] = next_token
+            params["pagination_token"] = page.next_token
         logger.warning(
             "stopped after max_pages=%d with more pages available", max_pages
         )

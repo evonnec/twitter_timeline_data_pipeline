@@ -71,9 +71,16 @@ def drain(aws: Aws) -> list[dict[str, Any]]:
     return records
 
 
-def s3_keys(aws: Aws) -> list[str]:
-    contents = aws.s3.list_objects_v2(Bucket=aws.bucket).get("Contents", [])
-    return sorted(o["Key"] for o in contents if "Key" in o)
+def s3_keys(aws: Aws, prefix: str = "") -> list[str]:
+    """Object keys outside ``raw/`` (or, with ``prefix``, those under it)."""
+    contents = aws.s3.list_objects_v2(Bucket=aws.bucket, Prefix=prefix).get(
+        "Contents", []
+    )
+    return sorted(
+        o["Key"]
+        for o in contents
+        if "Key" in o and (prefix or not o["Key"].startswith("raw/"))
+    )
 
 
 def item(aws: Aws, tweet_id: str) -> dict[str, Any]:
@@ -90,6 +97,10 @@ def test_full_pipeline_stores_tweets_and_media(pipeline: Aws, cdn: CdnStub) -> N
     assert processed == {"batchItemFailures": []}
     assert pipeline.tweets_table.scan()["Count"] == 7
     assert s3_keys(pipeline) == sorted([PHOTO_KEY, VIDEO_KEY, GIF_KEY])
+    raw_keys = s3_keys(pipeline, "raw/")
+    assert len(raw_keys) == fetched["pages"] == 2
+    stored = {i["raw_key"] for i in pipeline.tweets_table.scan()["Items"]}
+    assert stored == set(raw_keys)
 
     photo = pipeline.s3.get_object(Bucket=pipeline.bucket, Key=PHOTO_KEY)
     assert photo["Body"].read() == b"jpeg-bytes"
