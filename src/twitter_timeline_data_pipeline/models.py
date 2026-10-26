@@ -739,8 +739,7 @@ class TimelinePage:
     quarantined: tuple[QuarantinedItem, ...] = ()
     """Items of the page that failed to parse. They are not in ``tweets``/``media``."""
     # Posts from ``includes.tweets`` by ID (``type`` is empty here). ``requested`` is
-    # what the request asked for: only when the expansion was, is a reference with no
-    # entry here known to be unavailable rather than simply not requested.
+    # what the request asked for (recorded on each message).
     included: Mapping[TweetId, ReferencedPost] = field(default_factory=dict)
     requested: Mapping[str, bool] = field(default_factory=dict)
     # Post ID -> ``not_found`` / ``not_authorized`` for each post the response's

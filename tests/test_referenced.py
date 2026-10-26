@@ -1795,6 +1795,28 @@ def test_restore_refills_entities_from_the_raw_page(aws: Aws) -> None:
     assert restore_omitted(aws.s3, aws.bucket, slim) == message
 
 
+@pytest.mark.parametrize(
+    "includes",
+    [[], [{"id": "7", "text": "p"}], [{"id": "7", "text": "p", "note_tweet": {}}]],
+    ids=["no-post", "post-without-note", "empty-note"],
+)
+def test_restore_fails_when_the_raw_page_lacks_the_note(
+    aws: Aws, includes: list[Any]
+) -> None:
+    message = land_page(aws, link_heavy_page(5, 100))
+    envelope = Envelope(
+        username="u",
+        user_id=USER_ID,
+        fetched_at=NEW,
+        request={"endpoint": "/2/users/1/tweets", "params": PARAMS},
+        response={"data": [], "includes": {"tweets": includes}},
+    )
+    aws.s3.put_object(Bucket=aws.bucket, Key=RAW_KEY, Body=envelope.to_bytes())
+
+    with pytest.raises(RawPageError, match="no note for 7"):
+        restore_omitted(aws.s3, aws.bucket, message.without_referenced_notes())
+
+
 def test_restore_fails_when_the_raw_page_lacks_the_entities(aws: Aws) -> None:
     message = land_page(aws, link_heavy_page(5, 100))
     envelope = Envelope(
