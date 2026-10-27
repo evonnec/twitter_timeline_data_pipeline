@@ -652,7 +652,8 @@ MERGE_ATTEMPTS = 3
 _MERGE_PROJECTION = (
     "media, referenced_tweets, entities, entities_s3_key, display_entities, "
     "display_entities_s3_key, entities_omitted, in_reply_to_user_id, "
-    "possibly_sensitive, edit_controls, withheld, fetched_at, revision, deleted_at"
+    "possibly_sensitive, edit_controls, withheld, fetched_at, revision, deleted_at, "
+    "stored_at, first_stored_at"
 )
 # The fields of a stored referenced-post entry, in groups that are merged as a unit (a
 # text is its inline value with its S3 pointer; they must not come from two copies).
@@ -733,6 +734,14 @@ def _has(entry: Mapping[str, Any], group: Sequence[str]) -> bool:
     return any(name in entry for name in group)
 
 
+def _later(a: str, b: str) -> bool:
+    """Whether the ISO 8601 time ``a`` is after ``b`` (string order if unparseable)."""
+    try:
+        return datetime.fromisoformat(a) > datetime.fromisoformat(b)
+    except ValueError:
+        return a > b
+
+
 def _merge_reference(
     fresh: Mapping[str, Any],
     kept: Mapping[str, Any],
@@ -749,6 +758,16 @@ def _merge_reference(
     stay). A fresh ``unavailable`` entry keeps the stored copy whole, with
     ``unavailable_since`` carried from the first fetch that saw it so. A copy that is
     present again carries no status."""
+    if kept.get("scrubbed_at"):
+        # The compliance job scrubbed this copy (its original is gone at the source). A
+        # redelivery or an older message must not put it back: the copy returns only
+        # when a message fetched after the scrub shows the post, available.
+        back = (
+            not _is_bare(fresh)
+            and fresh.get("status") != "unavailable"
+            and _later(fetched_at, str(kept["scrubbed_at"]))
+        )
+        return dict(fresh) if back else dict(kept)
     merged = dict(fresh)
     if _is_bare(fresh):
         for group in (*_TEXT_GROUPS, _ENTITIES_GROUP, *_OTHER_GROUPS):
@@ -1017,6 +1036,12 @@ class TweetStore:
         item = self.to_item(message, media)
         if previous is not None:
             carry_forward(item, previous, message.fetched_at, message.requested)
+        # The first store, carried: ``stored_at`` moves with every rewrite, so retention
+        # counts from here and a re-fetch can't keep an item alive for ever.
+        first = (previous or {}).get("first_stored_at") or (previous or {}).get(
+            "stored_at"
+        )
+        item["first_stored_at"] = str(first or item["stored_at"])
         fields = [f for f in ("text", "display_text") if f in item]
         for field in sorted(fields, key=lambda f: len(item[f]), reverse=True):
             over = (
@@ -1066,7 +1091,7 @@ class TweetStore:
             self._offload_entities(message, holder, name, key_base)
         if self._retention_days > 0:
             # DynamoDB's TTL (attribute expires_at) removes the item after this epoch.
-            stored = datetime.fromisoformat(item["stored_at"]).timestamp()
+            stored = datetime.fromisoformat(item["first_stored_at"]).timestamp()
             item["expires_at"] = int(stored) + self._retention_days * 86_400
         return item
 
@@ -1319,7 +1344,8 @@ class TweetStore:
                 # ADD revision: this write must fail a concurrent put_tweet's guard.
                 UpdateExpression=f"SET {position} = :entry ADD revision :one",
                 ConditionExpression=(
-                    f"attribute_exists(tweet_id) AND {position}.media_key = :key "
+                    f"attribute_exists(tweet_id) AND attribute_not_exists(deleted_at) "
+                    f"AND {position}.media_key = :key "
                     f"AND {position}.#status = :retrying"
                 ),
                 ExpressionAttributeNames={"#status": "status"},

@@ -134,24 +134,38 @@ class Envelope:
             raise RawPageError(f"malformed envelope: {exc!r}") from exc
 
 
-def redact_envelope(body: bytes, tweet_ids: Collection[str]) -> tuple[bytes, set[str]]:
+INCLUDED_POST_KEYS = ("tweets", "posts")
+"""The ``response.includes`` lists that hold posts (X is renaming ``tweets``)."""
+
+
+def redact_envelope(
+    body: bytes, tweet_ids: Collection[str], *, from_data: bool = True
+) -> tuple[bytes, set[str]]:
     """``body`` (a landed object) without the Tweets in ``tweet_ids``.
 
-    Removes them from ``response.data`` and from ``response.includes.tweets`` (the
-    posts another Tweet quotes, replies to or retweets), drops the ``includes.media``
-    only they used, and adds their IDs to ``redactions`` (which replay honors).
-    Returns the new object and the IDs it removed; with none removed the new object
-    is ``body`` unchanged. Raises ``RawPageError`` if ``body`` can't be read.
+    Removes them from ``response.data`` and from ``response.includes.tweets`` and
+    ``.posts`` (the posts another Tweet quotes, replies to or retweets), drops the
+    ``includes.media`` only they used, and adds their IDs to ``redactions`` (which
+    replay honors). With ``from_data=False`` only the includes are touched, and
+    ``redactions`` is left alone: that is the copy of a deleted post held in the page
+    of a Tweet that quotes it, while the post's own page is the post's own purge
+    after its own grace. Returns the new object and the IDs it removed; with none
+    removed the new object is ``body`` unchanged. Raises ``RawPageError`` if ``body``
+    can't be read.
     """
     envelope = Envelope.from_bytes(body)
     response = envelope.response
     includes = response.get("includes")
-    included = includes.get("tweets") if isinstance(includes, dict) else None
-    data = response.get("data")
+    lists: dict[str, list[Any]] = {}
+    if from_data and isinstance(response.get("data"), list):
+        lists["data"] = response["data"]
+    if isinstance(includes, dict):
+        for name in INCLUDED_POST_KEYS:
+            if isinstance(includes.get(name), list):
+                lists[f"includes.{name}"] = includes[name]
     tweets = [
         t
-        for source in (data, included)
-        if isinstance(source, list)
+        for source in lists.values()
         for t in source
         if isinstance(t, dict) and "id" in t
     ]
@@ -175,12 +189,13 @@ def redact_envelope(body: bytes, tweet_ids: Collection[str]) -> tuple[bytes, set
     dropped = media_keys([t for t in tweets if str(t["id"]) in gone])
     still_used = media_keys([t for t in tweets if str(t["id"]) not in gone])
     new_response: JSONObject = dict(response)
-    if isinstance(data, list):
-        new_response["data"] = keep(data)
+    if "data" in lists:
+        new_response["data"] = keep(lists["data"])
     if isinstance(includes, dict):
         new_includes = dict(includes)
-        if isinstance(included, list):
-            new_includes["tweets"] = keep(included)
+        for name in INCLUDED_POST_KEYS:
+            if f"includes.{name}" in lists:
+                new_includes[name] = keep(lists[f"includes.{name}"])
         if isinstance(includes.get("media"), list):
             new_includes["media"] = [
                 m
@@ -194,7 +209,11 @@ def redact_envelope(body: bytes, tweet_ids: Collection[str]) -> tuple[bytes, set
     redacted = replace(
         envelope,
         response=new_response,
-        redactions=tuple(sorted({*envelope.redactions, *gone})),
+        redactions=(
+            tuple(sorted({*envelope.redactions, *gone}))
+            if from_data
+            else envelope.redactions
+        ),
     )
     return redacted.to_bytes(), gone
 

@@ -1934,12 +1934,7 @@ def test_text_offload_boundary_accounts_for_the_media_fields(aws: Aws) -> None:
         )
         return store.build_item(message, stored)
 
-    base = estimate_item_size(
-        TweetStore.to_item(
-            make_message(media=tuple(media), tweet={"media_keys": keys, "text": ""}),
-            stored,
-        )
-    )
+    base = estimate_item_size(build(0))
     fits = ITEM_LIMIT_BYTES - base
 
     assert base > 20_000  # the media fields are part of what the estimate counts

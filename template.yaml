@@ -177,10 +177,13 @@ Resources:
           Projection:
             ProjectionType: KEYS_ONLY
       # Items expire at their epoch `expires_at`. The attribute is only written when
-      # RetentionDays > 0, so by default nothing ever expires.
-      TimeToLiveSpecification:
-        AttributeName: expires_at
-        Enabled: true
+      # RetentionDays > 0, and TTL is only enabled then, so by default nothing ever
+      # expires.
+      TimeToLiveSpecification: !If
+        - HasRetention
+        - AttributeName: expires_at
+          Enabled: true
+        - !Ref AWS::NoValue
       PointInTimeRecoverySpecification:
         PointInTimeRecoveryEnabled: true
       SSESpecification:
@@ -508,6 +511,8 @@ Resources:
         item and every S3 object version after the grace period.
       Handler: twitter_timeline_data_pipeline.handlers.compliance.handler
       Timeout: 300
+      # Two overlapping runs would rewrite the same raw pages and purge the same items.
+      ReservedConcurrentExecutions: 1
       MemorySize: 256
       LoggingConfig:
         LogGroup: !Ref ComplianceFunctionLogGroup
@@ -548,7 +553,9 @@ Resources:
                 StringLike:
                   "s3:prefix": ["media/*", "text/*", "raw/*", "quarantine/*"]
             - Effect: Allow
-              Action: [s3:DeleteObject, s3:DeleteObjectVersion]
+              # Every delete names a VersionId (a bucket-versioning delete of a version),
+              # so only s3:DeleteObjectVersion is needed.
+              Action: s3:DeleteObjectVersion
               Resource:
                 - !Sub "${MediaBucket.Arn}/media/*"
                 - !Sub "${MediaBucket.Arn}/text/*"

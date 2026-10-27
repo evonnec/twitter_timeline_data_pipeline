@@ -71,7 +71,8 @@ def test_resources_have_the_template_settings(sim: Simulation) -> None:
         assert gsi["KeySchema"] == expected_gsi["KeySchema"]
         assert gsi["Projection"] == expected_gsi["Projection"]
     ttl = sim.tweets_table.meta.client.describe_time_to_live(TableName=table.name)
-    assert ttl["TimeToLiveDescription"]["AttributeName"] == "expires_at"
+    # TTL is only enabled with RetentionDays > 0 (the template default is 0)
+    assert ttl["TimeToLiveDescription"]["TimeToLiveStatus"] == "DISABLED"
     assert sim.state_table.key_schema == _props(template, "StateTable")["KeySchema"]
     versioning = sim.s3.get_bucket_versioning(Bucket=sim.bucket)
     assert versioning["Status"] == "Enabled"

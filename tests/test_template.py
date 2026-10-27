@@ -615,10 +615,15 @@ def test_media_retry_function_has_an_errors_alarm(template: Template) -> None:
 # --- deletions and retention (#21) ----------------------------------------------
 
 
-def test_tweets_table_has_ttl_on_expires_at(template: Template) -> None:
+def test_tweets_table_has_ttl_on_expires_at_only_with_retention(
+    template: Template,
+) -> None:
     assert properties(template, "TweetsTable")["TimeToLiveSpecification"] == {
-        "AttributeName": "expires_at",
-        "Enabled": True,
+        "Fn::If": [
+            "HasRetention",
+            {"AttributeName": "expires_at", "Enabled": True},
+            {"Ref": "AWS::NoValue"},
+        ]
     }
 
 
@@ -701,7 +706,7 @@ def test_compliance_function_permissions(template: Template) -> None:
         frozenset({"dynamodb:GetItem", "dynamodb:UpdateItem", "dynamodb:Scan"}),
         frozenset({"dynamodb:GetItem", "dynamodb:PutItem"}),
         frozenset({"s3:ListBucketVersions", "s3:ListBucket"}),
-        frozenset({"s3:DeleteObject", "s3:DeleteObjectVersion"}),
+        frozenset({"s3:DeleteObjectVersion"}),
         frozenset({"s3:GetObject"}),
         frozenset({"s3:PutObject"}),
     }
@@ -711,7 +716,7 @@ def test_compliance_function_permissions(template: Template) -> None:
     assert state["Condition"] == {
         "ForAllValues:StringLike": {"dynamodb:LeadingKeys": ["compliance#*"]}
     }
-    deletes = by_actions[frozenset({"s3:DeleteObject", "s3:DeleteObjectVersion"})]
+    deletes = by_actions[frozenset({"s3:DeleteObjectVersion"})]
     assert [json_key(r) for r in deletes["Resource"]] == [
         json_key({"Fn::Sub": f"${{MediaBucket.Arn}}/{prefix}/*"})
         for prefix in ("media", "text", "raw", "quarantine")
@@ -756,6 +761,12 @@ def test_only_the_compliance_function_can_delete(template: Template) -> None:
                 "SQSSendMessagePolicy",
                 "AWSSecretsManagerGetSecretValuePolicy",
             }
+
+
+def test_compliance_function_never_runs_twice_at_once(template: Template) -> None:
+    assert (
+        properties(template, "ComplianceFunction")["ReservedConcurrentExecutions"] == 1
+    )
 
 
 def test_compliance_function_has_an_errors_alarm(template: Template) -> None:

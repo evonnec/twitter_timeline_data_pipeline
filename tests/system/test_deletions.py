@@ -60,7 +60,8 @@ def test_deleted_post_is_tombstoned_then_removed_with_all_its_objects(
     assert invocation.outcome == "ok"
     assert live(sim) == {keep.id}
     for gone in (doomed.id, long_post.id):  # only a content-free tombstone is left
-        assert set(sim.tweets()[gone]) == {
+        # the sweep marker stays until the next run sweeps the prefixes once more
+        assert set(sim.tweets()[gone]) - {"tombstone", "sweep_owners"} == {
             "tweet_id",
             "deleted_at",
             "deletion_reason",

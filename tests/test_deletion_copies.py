@@ -2,7 +2,9 @@
 
 import json
 import logging
+from datetime import timedelta
 from typing import Any
+from unittest.mock import ANY
 
 import pytest
 from botocore.exceptions import ClientError
@@ -31,7 +33,8 @@ from test_handlers_compliance import (
 )
 
 from twitter_timeline_data_pipeline.handlers.compliance import (
-    REFERENCES_CURSOR,
+    SCAN_CURSOR,
+    Compliance,
     ComplianceError,
     ComplianceStore,
 )
@@ -153,6 +156,7 @@ def test_the_copy_is_scrubbed_once_the_grace_period_has_passed(
         "status": "unavailable",
         "unavailable_reason": "not_found",
         "unavailable_since": "2026-10-26T12:00:00Z",
+        "scrubbed_at": ANY,
     }
     assert versions(aws, key_b) == []  # every version and delete marker
     assert len(ref_keys(aws, quoting)) == 1  # C's object stays
@@ -162,7 +166,7 @@ def test_the_copy_is_scrubbed_once_the_grace_period_has_passed(
     envelope_after = read(aws, raw)
     assert [t["id"] for t in envelope_after.response["includes"]["tweets"]] == [C]
     assert [t["id"] for t in envelope_after.response["data"]] == [quoting]
-    assert envelope_after.redactions == (B,)
+    assert envelope_after.redactions == ()  # B's own page is B's own purge
     assert (done.copies_scrubbed, done.ref_raw_pages) == (1, 1)
     assert "scrubbed 1 copy(ies) of deleted posts" in caplog.text
     assert "compliance references: checked=" in caplog.text
@@ -210,7 +214,7 @@ def test_a_failed_lookup_never_marks_or_scrubs_and_fails_the_run(
     def failing(ids: list[str]) -> TweetLookup:
         raise RuntimeError("503")
 
-    with pytest.raises(ComplianceError, match="references walk"):
+    with pytest.raises(ComplianceError, match="walk: RuntimeError"):
         job(aws, failing, clock).run(HANDLE)
 
     assert item(aws, quoting) == before
@@ -239,41 +243,51 @@ def test_ids_are_deduplicated_and_counted_in_the_budget(aws: Aws, clock: Clock) 
     refs = [i for call in lookup.calls for i in call if i in (B, C)]
     assert sorted(refs) == [B, C]  # B once, though two items hold it
     assert done.ref_checked == 2
-    assert done.checked == 2  # plus the two stored Tweets: 4 lookups in all
+    assert done.checked == 4  # plus the two stored Tweets: 4 lookups in all
     assert sum(len(c) for c in lookup.calls) == 4
 
 
-def test_references_take_at_most_half_of_the_budget(aws: Aws, clock: Clock) -> None:
+def test_own_and_referenced_ids_share_one_budget(aws: Aws, clock: Clock) -> None:
     for n in range(1, 4):
         put_quote(aws, n, str(1800000000000000100 + n))
     lookup = Lookup()
 
     done = run(aws, lookup, clock, max_lookups=6)
 
-    assert done.ref_checked == 3  # half of 6
-    assert done.checked == 3
+    assert (done.checked, done.ref_checked) == (6, 3)  # 3 own + 3 referenced
     assert sum(len(c) for c in lookup.calls) == 6
+    assert done.wrapped
 
 
-def test_the_references_walk_stops_where_an_item_no_longer_fits_and_resumes(
+def test_the_walk_stops_after_the_last_item_that_fits_and_resumes(
     aws: Aws, clock: Clock
 ) -> None:
-    ids = [str(1800000000000000100 + n) for n in range(4)]
-    a = put_quote(aws, 1, ids[0], ids[1])
-    b = put_quote(aws, 2, ids[2], ids[3])
-    first = Lookup(gone=dict.fromkeys(ids, "deleted"))
+    ids = [str(1800000000000000100 + n) for n in range(6)]
+    quoting = [
+        put_quote(aws, 1, ids[0], ids[1]),
+        put_quote(aws, 2, ids[2], ids[3]),
+        put_quote(aws, 3, ids[4], ids[5]),
+    ]
+    lookup = Lookup(gone=dict.fromkeys(ids, "deleted"))
 
-    run(aws, first, clock, max_lookups=6)  # budget 3: item one fits (2), two doesn't
+    first = run(aws, lookup, clock, max_lookups=6)  # 3 ids an item: two items fit
 
-    assert entry(aws, a, ids[0]).get("status") == "unavailable"
-    assert entry(aws, b, ids[2]).get("status") is None
-    store = store_for(aws)
-    assert store.load_cursor(REFERENCES_CURSOR) is not None
+    def marked() -> list[str]:
+        return [t for t in quoting if entry(aws, t, _first_ref(aws, t)).get("status")]
 
-    run(aws, first, clock, max_lookups=6)
+    assert len(marked()) == 2 and first.wrapped is False
+    assert store_for(aws).load_cursor(SCAN_CURSOR) is not None
 
-    assert entry(aws, b, ids[2]).get("status") == "unavailable"
-    assert entry(aws, b, ids[3]).get("status") == "unavailable"
+    second = run(aws, lookup, clock, max_lookups=6)
+
+    assert sorted(marked()) == quoting
+    assert second.wrapped
+
+
+def _first_ref(aws: Aws, tweet_id: str) -> str:
+    stored = item(aws, tweet_id)
+    assert stored is not None
+    return str(stored["referenced_tweets"][0]["id"])
 
 
 def test_the_walk_wraps_and_the_cursor_is_kept(aws: Aws, clock: Clock) -> None:
@@ -281,18 +295,7 @@ def test_the_walk_wraps_and_the_cursor_is_kept(aws: Aws, clock: Clock) -> None:
     run(aws, Lookup(), clock)
     store = store_for(aws)
 
-    assert store.load_cursor(REFERENCES_CURSOR) is None  # wrapped
-
-
-def test_a_budget_below_six_skips_the_walk_with_a_warning(
-    aws: Aws, clock: Clock, caplog: pytest.LogCaptureFixture
-) -> None:
-    put_quote(aws, 1, B)
-
-    done = run(aws, Lookup(gone={B: "deleted"}), clock, max_lookups=5)
-
-    assert done.ref_checked == 0
-    assert "leaves no room for the references walk" in caplog.text
+    assert store.load_cursor(SCAN_CURSOR) is None  # wrapped
 
 
 def test_one_item_that_alone_exceeds_the_budget_is_reported(
@@ -300,10 +303,47 @@ def test_one_item_that_alone_exceeds_the_budget_is_reported(
 ) -> None:
     put_quote(aws, 1, B, C, "1800000000000000003", "1800000000000000004")
 
-    done = run(aws, Lookup(), clock, max_lookups=6)
+    done = run(aws, Lookup(), clock, max_lookups=4)  # the item needs 5
 
-    assert done.ref_checked == 0
-    assert "needs more lookups than left" in caplog.text
+    assert done.checked == 0
+    assert "needs more lookups than the budget" in caplog.text
+
+
+def test_the_scan_is_capped_per_run_whatever_the_items_hold(
+    aws: Aws, clock: Clock
+) -> None:
+    store = TweetStore(aws.tweets_table, aws.s3, aws.bucket)
+    for n in range(1, 21):  # purged tombstones: no ID to look up, but a read each
+        store.put_tweet(make_message(tid(n)), [])
+        aws.tweets_table.update_item(
+            Key={"tweet_id": tid(n)},
+            UpdateExpression="SET purged_at = :p, deleted_at = :p",
+            ExpressionAttributeValues={":p": "2026-10-01T00:00:00Z"},
+        )
+    scans = []
+    original = ComplianceStore.page_items
+
+    def counting(self: ComplianceStore, start: Any, limit: int) -> Any:
+        scans.append(limit)
+        return original(self, start, limit)
+
+    ComplianceStore.page_items = counting  # type: ignore[method-assign]
+    try:
+        done = run(aws, Lookup(), clock, max_lookups=5)
+    finally:
+        ComplianceStore.page_items = original  # type: ignore[method-assign]
+
+    assert sum(scans) == 10  # 2 x max_lookups items, not the whole table
+    assert done.checked == 0 and not done.wrapped
+
+
+def test_the_walk_stops_when_the_time_is_up(aws: Aws, clock: Clock) -> None:
+    put_quote(aws, 1, B)
+    lookup = Lookup()
+
+    done = run(aws, lookup, clock, remaining_ms=lambda: 0)
+
+    assert lookup.calls == [] and done.checked == 0
 
 
 def test_a_stored_tweet_that_is_also_quoted_is_tombstoned_too(
@@ -321,7 +361,7 @@ def test_a_stored_tweet_that_is_also_quoted_is_tombstoned_too(
 def test_the_item_changing_after_the_scan_is_read_again(aws: Aws, clock: Clock) -> None:
     quoting = put_quote(aws, 1, B)
     store = store_for(aws)
-    ((snapshot, _),) = [(store.page_references(None, 10)[0][0], 0)]
+    ((snapshot, _),) = [(store.page_items(None, 10)[0][0], 0)]
     # a fetch lands between the scan and the update: the revision moves
     aws.tweets_table.update_item(
         Key={"tweet_id": quoting},
@@ -344,7 +384,7 @@ def test_the_item_changing_after_the_scan_is_read_again(aws: Aws, clock: Clock) 
 def test_copy_updates_give_up_after_three_lost_races(aws: Aws, clock: Clock) -> None:
     quoting = put_quote(aws, 1, B)
     store = store_for(aws)
-    (snapshot,) = store.page_references(None, 10)[0]
+    (snapshot,) = store.page_items(None, 10)[0]
     real = aws.tweets_table
 
     class Busy:
@@ -372,7 +412,7 @@ def test_a_copy_update_leaves_a_tombstoned_or_vanished_item_alone(
 ) -> None:
     quoting = put_quote(aws, 1, B)
     store = store_for(aws)
-    (snapshot,) = store.page_references(None, 10)[0]
+    (snapshot,) = store.page_items(None, 10)[0]
     store.tombstone(quoting, "deleted", "2026-10-26T12:00:00Z")
 
     assert store.update_copies(snapshot, {B: "deleted"}, now="n", cutoff="z") == (
@@ -560,7 +600,7 @@ def test_the_text_prefix_never_matches_a_longer_id(aws: Aws) -> None:
 
 def test_the_prefix_delete_refuses_a_prefix_outside_text(aws: Aws) -> None:
     with pytest.raises(ComplianceError):
-        store_for(aws).delete_prefix_versions("media/1/")
+        store_for(aws).delete_prefix_versions("raw/1/")
 
 
 def test_the_prefix_listing_is_paginated(versioned: Aws) -> None:
@@ -583,7 +623,7 @@ def test_the_tombstone_and_its_clearing_bump_the_revision(aws: Aws) -> None:
 
     assert store.tombstone(tweet, "deleted", "2026-10-26T12:00:00Z")
     tombstoned = int(item(aws, tweet)["revision"])  # type: ignore[index]
-    assert store.clear_tombstone(tweet, "2026-10-26T00:00:00Z")
+    assert store.clear_tombstone(tweet)
 
     assert tombstoned == first + 1
     assert int(item(aws, tweet)["revision"]) == first + 2  # type: ignore[index]
@@ -600,40 +640,60 @@ def test_a_legacy_item_without_a_revision_gets_one(aws: Aws) -> None:
     assert int(item(aws, tweet)["revision"]) == 1  # type: ignore[index]
 
 
+def purge_now(store: ComplianceStore, tweet_id: str) -> tuple[int, int] | None:
+    stale = store.load_item(tweet_id)
+    assert stale is not None
+    assert store.begin_purge(stale) is not None
+    return store.finish_purge(tweet_id)
+
+
 def test_the_purge_is_retried_when_the_item_changes_under_it(
     versioned: Aws, clock: Clock
 ) -> None:
     aws = versioned
     tweet = put(aws, 1)
-    store = store_for(aws)
-    store.tombstone(tweet, "deleted", "2026-10-24T00:00:00Z")
-    stale = store.load_item(tweet)
-    assert stale is not None
-    # a media retry resolves after the item was read: a new object and a new revision
+    plain = store_for(aws)
+    plain.tombstone(tweet, "deleted", "2026-10-24T00:00:00Z")
+    assert plain.begin_purge(plain.load_item(tweet) or {}) is not None
+    real = aws.tweets_table
     key = f"media/{USER_ID}/{tweet}/late.jpg"
-    aws.s3.put_object(Bucket=aws.bucket, Key=key, Body=b"img")
-    aws.tweets_table.update_item(
-        Key={"tweet_id": tweet},
-        UpdateExpression="SET media = :m ADD revision :one",
-        ExpressionAttributeValues={
-            ":m": [{"media_key": "k", "status": "stored", "s3_key": key}],
-            ":one": 1,
-        },
-    )
 
-    objects, _ = store.purge(stale)
+    class MediaRetryLands:
+        """A write lands (a new object, a new revision) before the purge's write."""
 
-    assert objects == 1  # the late object, found on the second attempt
-    assert versions(aws, key) == []
+        lands = True
+
+        def get_item(self, **kw: Any) -> Any:
+            return real.get_item(**kw)
+
+        def update_item(self, **kw: Any) -> Any:
+            if self.lands:
+                self.lands = False
+                aws.s3.put_object(Bucket=aws.bucket, Key=key, Body=b"img")
+                real.update_item(
+                    Key={"tweet_id": tweet},
+                    UpdateExpression="SET media = :m ADD revision :one",
+                    ExpressionAttributeValues={
+                        ":m": [{"media_key": "k", "status": "stored", "s3_key": key}],
+                        ":one": 1,
+                    },
+                )
+            return real.update_item(**kw)
+
+    racing = ComplianceStore(MediaRetryLands(), aws.state_table, aws.s3, aws.bucket)  # type: ignore[arg-type]
+
+    removed = racing.finish_purge(tweet)
+
+    assert removed is not None
+    assert versions(aws, key) == []  # found and deleted on the second attempt
     assert_purged(aws, tweet)
 
 
 def test_the_purge_gives_up_after_three_lost_races(aws: Aws) -> None:
     tweet = put(aws, 1)
-    store = store_for(aws)
-    store.tombstone(tweet, "deleted", "2026-10-24T00:00:00Z")
-    stale = store.load_item(tweet)
-    assert stale is not None
+    plain = store_for(aws)
+    plain.tombstone(tweet, "deleted", "2026-10-24T00:00:00Z")
+    assert plain.begin_purge(plain.load_item(tweet) or {}) is not None
     real = aws.tweets_table
 
     class Busy:
@@ -651,25 +711,89 @@ def test_the_purge_gives_up_after_three_lost_races(aws: Aws) -> None:
     busy = ComplianceStore(Busy(), aws.state_table, aws.s3, aws.bucket)  # type: ignore[arg-type]
 
     with pytest.raises(ComplianceError, match="purge attempts"):
-        busy.purge(stale)
-
+        busy.finish_purge(tweet)
     assert "purged_at" not in (item(aws, tweet) or {})
 
 
-def test_a_purge_that_finds_the_item_cleared_or_already_purged_stops(
-    aws: Aws,
-) -> None:
+def test_the_purge_start_gives_up_after_three_lost_races(aws: Aws) -> None:
+    tweet = put(aws, 1)
+    plain = store_for(aws)
+    plain.tombstone(tweet, "deleted", "2026-10-24T00:00:00Z")
+    real = aws.tweets_table
+
+    class Busy:
+        def get_item(self, **kw: Any) -> Any:
+            return real.get_item(**kw)
+
+        def update_item(self, **kw: Any) -> Any:
+            real.update_item(
+                Key={"tweet_id": tweet},
+                UpdateExpression="ADD revision :one",
+                ExpressionAttributeValues={":one": 1},
+            )
+            return real.update_item(**kw)
+
+    busy = ComplianceStore(Busy(), aws.state_table, aws.s3, aws.bucket)  # type: ignore[arg-type]
+
+    with pytest.raises(ComplianceError, match="purge starts"):
+        busy.begin_purge(plain.load_item(tweet) or {})
+
+
+def test_a_purge_that_finds_the_item_cleared_or_gone_stops(aws: Aws) -> None:
     tweet = put(aws, 1)
     store = store_for(aws)
     store.tombstone(tweet, "deleted", "2026-10-24T00:00:00Z")
     stale = store.load_item(tweet)
     assert stale is not None
-    store.clear_tombstone(tweet, "2026-10-01T00:00:00Z")  # tombstone cleared meanwhile
+    store.clear_tombstone(tweet)  # the tombstone is cleared meanwhile
 
-    assert store.purge(stale)[0] == 0
+    assert store.begin_purge(stale) is None
+    assert store.finish_purge(tweet) is None
     assert "purged_at" not in (item(aws, tweet) or {})
     aws.tweets_table.delete_item(Key={"tweet_id": tweet})
-    assert store.purge(stale)[0] == 0  # vanished
+    assert store.begin_purge(stale) is None  # vanished
+    assert store.finish_purge(tweet) is None
+
+
+def test_an_operator_untombstoning_during_a_purge_is_not_counted_as_purged(
+    aws: Aws, clock: Clock, caplog: pytest.LogCaptureFixture
+) -> None:
+    tweet = put(aws, 1)
+    store = store_for(aws)
+    original = store.redact_raw
+
+    def operator_removes_the_tombstone(*args: Any, **kwargs: Any) -> Any:
+        aws.tweets_table.update_item(
+            Key={"tweet_id": tweet},
+            UpdateExpression="REMOVE deleted_at, deletion_reason, tombstone",
+        )
+        return original(*args, **kwargs)
+
+    store.redact_raw = operator_removes_the_tombstone  # type: ignore[method-assign]
+    lookup = Lookup({tweet: "deleted"})
+
+    compliance_job = Compliance(
+        store, lookup, max_lookups=10, grace=timedelta(0), now=clock
+    )
+    compliance_job.run(HANDLE)
+
+    stored = item(aws, tweet) or {}
+    assert compliance_job.purged == 0 and "purged_at" not in stored
+    assert "text" in stored  # nothing of the Tweet was removed
+    assert "no longer being purged" in caplog.text
+
+
+def test_a_purge_in_progress_is_resumed_with_its_marker(aws: Aws) -> None:
+    tweet = put(aws, 1)
+    store = store_for(aws)
+    store.tombstone(tweet, "deleted", "2026-10-24T00:00:00Z")
+    first = store.begin_purge(store.load_item(tweet) or {})
+    assert first is not None and "purging" in first
+
+    again = store.begin_purge(first)
+
+    assert again is not None and again["purging"] == first["purging"]
+    assert purge_now(store, tweet) is not None
 
 
 def test_other_purge_errors_propagate(aws: Aws) -> None:
@@ -683,15 +807,21 @@ def test_other_purge_errors_propagate(aws: Aws) -> None:
         def update_item(self, **kw: Any) -> Any:
             raise ClientError({"Error": {"Code": "Throttled"}}, "UpdateItem")
 
+        def get_item(self, **kw: Any) -> Any:
+            return aws.tweets_table.get_item(**kw)
+
     broken = ComplianceStore(Throttled(), aws.state_table, aws.s3, aws.bucket)  # type: ignore[arg-type]
 
     with pytest.raises(ClientError):
-        broken.purge(stale)
+        broken.begin_purge(stale)
+    assert store.begin_purge(stale) is not None
+    with pytest.raises(ClientError):
+        broken.finish_purge(tweet)
 
 
 def test_copy_updates_propagate_other_errors(aws: Aws) -> None:
     put_quote(aws, 1, B)
-    (snapshot,) = store_for(aws).page_references(None, 10)[0]
+    (snapshot,) = store_for(aws).page_items(None, 10)[0]
 
     class Throttled:
         def update_item(self, **kw: Any) -> Any:
@@ -705,7 +835,7 @@ def test_copy_updates_propagate_other_errors(aws: Aws) -> None:
 
 def test_an_entry_without_a_lookup_result_is_left_alone(aws: Aws) -> None:
     put_quote(aws, 1, B, C)
-    (snapshot,) = store_for(aws).page_references(None, 10)[0]
+    (snapshot,) = store_for(aws).page_items(None, 10)[0]
 
     assert store_for(aws).update_copies(snapshot, {}, now="n", cutoff="z") == (0, 0, 0)
     assert json.dumps(snapshot["referenced_tweets"], default=str)
@@ -771,6 +901,7 @@ def test_a_confirmed_unavailable_copy_is_scrubbed_on_the_fetchs_clock(
         "status": "unavailable",
         "unavailable_reason": "not_found",
         "unavailable_since": "2026-10-20T00:00:00Z",
+        "scrubbed_at": ANY,
     }
     assert done.copies_scrubbed == 1
 
@@ -829,6 +960,7 @@ def test_the_scrub_removes_the_copys_entities_objects_and_pointers(
         "status": "unavailable",
         "unavailable_reason": "not_authorized",
         "unavailable_since": "2026-10-26T12:00:00Z",
+        "scrubbed_at": ANY,
     }
     for key in hashed:
         assert versions(aws, key) == []

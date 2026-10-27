@@ -21,6 +21,7 @@ from twitter_timeline_data_pipeline import credentials
 from twitter_timeline_data_pipeline.config import ConfigError
 from twitter_timeline_data_pipeline.handlers import compliance
 from twitter_timeline_data_pipeline.handlers.compliance import (
+    SCAN_CURSOR,
     Compliance,
     ComplianceError,
     ComplianceStore,
@@ -127,16 +128,18 @@ def run(aws: Aws, lookup: Lookup, clock: Clock, **kwargs: Any) -> Compliance:
 
 
 def assert_purged(aws: Aws, tweet_id: str) -> None:
-    """Only the content-free tombstone is left."""
+    """Only the content-free tombstone is left (and, until the next run sweeps it
+    once more, the sweep marker)."""
     stored = item(aws, tweet_id)
     assert stored is not None
-    assert set(stored) == {
+    assert set(stored) - {"tombstone", "sweep_owners"} == {
         "tweet_id",
         "deleted_at",
         "deletion_reason",
         "purged_at",
         "revision",
     }
+    assert stored.get("tombstone", "2") == "2"
 
 
 def versions(aws: Aws, key: str) -> list[str]:
@@ -273,17 +276,21 @@ def test_tombstone_is_not_overwritten_by_a_later_unavailable_result(
     assert result.tombstoned == 0
 
 
-def test_present_tweet_past_its_grace_period_is_purged_not_cleared(
+def test_present_tweet_past_its_grace_period_is_cleared_not_purged(
     aws: Aws, clock: Clock
 ) -> None:
+    # X says the post is there when the grace period is over: it is kept, whatever the
+    # age of the tombstone (an old walk answer must never purge a present post).
     tweet = put(aws, 1)
     run(aws, Lookup({tweet: "deleted"}), clock)
     clock.now += GRACE + timedelta(hours=1)
 
     result = run(aws, Lookup(), clock)
 
-    assert (result.cleared, result.purged) == (0, 1)
-    assert_purged(aws, tweet)
+    assert (result.cleared, result.purged) == (1, 0)
+    stored = item(aws, tweet) or {}
+    assert "deleted_at" not in stored and "text" in stored
+    assert store_for(aws).tombstones() == {}
 
 
 def test_ambiguous_lookup_never_tombstones(
@@ -318,27 +325,18 @@ def test_tombstone_of_a_vanished_item_is_a_no_op(aws: Aws, clock: Clock) -> None
 
 
 def test_cursor_resumes_across_runs_and_wraps(aws: Aws, clock: Clock) -> None:
-    ids = [put(aws, n) for n in range(1, 6)]  # oldest first in the GSI
+    ids = [put(aws, n) for n in range(1, 6)]
     lookup = Lookup()
 
-    first = run(aws, lookup, clock, max_lookups=2)
-    second = run(aws, lookup, clock, max_lookups=2)
-    third = run(aws, lookup, clock, max_lookups=2)
-    fourth = run(aws, lookup, clock, max_lookups=2)
+    runs = [run(aws, lookup, clock, max_lookups=2) for _ in range(4)]
 
-    assert lookup.calls[0] == ids[:2]
-    assert lookup.calls[1] == ids[2:4]
-    assert lookup.calls[2] == ids[4:]
-    assert lookup.calls[3] == ids[:2]  # wrapped
-    assert (first.wrapped, second.wrapped, third.wrapped, fourth.wrapped) == (
-        False,
-        False,
-        True,
-        False,
-    )
-    state = aws.state_table.get_item(Key={"username": f"compliance#{HANDLE}"})["Item"]
-    assert json.loads(str(state["cursor"]))["tweet_id"] == ids[1]
-    assert aws.state_table.get_item(Key={"username": HANDLE}).get("Item") is None
+    first_pass = [i for call in lookup.calls[:3] for i in call]
+    assert sorted(first_pass) == sorted(ids)  # every item once in the first 3 runs
+    assert [len(c) for c in lookup.calls[:3]] == [2, 2, 1]
+    assert lookup.calls[3] == lookup.calls[0]  # wrapped
+    assert [r.wrapped for r in runs] == [False, False, True, False]
+    state = aws.state_table.get_item(Key={"username": "compliance##scan"})["Item"]
+    assert json.loads(str(state["cursor"]))["tweet_id"] in lookup.calls[3]
 
 
 def test_lookup_budget_is_honored_in_batches_of_100(aws: Aws, clock: Clock) -> None:
@@ -363,23 +361,33 @@ def test_empty_account_wraps_without_lookups(aws: Aws, clock: Clock) -> None:
 def test_unreadable_cursor_restarts_the_pass(aws: Aws, clock: Clock) -> None:
     ids = [put(aws, 1), put(aws, 2)]
     for bad in ("not json", "[1]"):
-        aws.state_table.put_item(
-            Item={"username": f"compliance#{HANDLE}", "cursor": bad}
-        )
+        aws.state_table.put_item(Item={"username": "compliance##scan", "cursor": bad})
         lookup = Lookup()
 
         run(aws, lookup, clock, max_lookups=2)
 
-        assert lookup.calls[0] == ids
+        assert sorted(lookup.calls[0]) == sorted(ids)
 
 
-def test_handle_is_normalized(aws: Aws, clock: Clock) -> None:
-    tweet = put(aws, 1)
-    compliance_job = job(aws, Lookup({tweet: "deleted"}), clock)
+def test_items_of_every_handle_and_without_created_at_are_checked(
+    aws: Aws, clock: Clock
+) -> None:
+    # A rename, a fetch run for another account, an item without created_at: the walk
+    # covers the table, not one handle's index.
+    store = TweetStore(aws.tweets_table, aws.s3, aws.bucket)
+    old, other, bare = tid(1), tid(2), tid(3)
+    store.put_tweet(make_message(old, username="old_handle"), [])
+    store.put_tweet(make_message(other, username="other_account"), [])
+    store.put_tweet(make_message(bare), [])
+    aws.tweets_table.update_item(
+        Key={"tweet_id": bare}, UpdateExpression="REMOVE created_at"
+    )
+    lookup = Lookup({old: "deleted", other: "deleted", bare: "deleted"})
 
-    compliance_job.run("@Example_User")
+    result = run(aws, lookup, clock)
 
-    assert (item(aws, tweet) or {})["tombstone"] == "1"
+    assert result.checked == 3
+    assert all("deleted_at" in (item(aws, t) or {}) for t in (old, other, bare))
 
 
 class FailSecond(Lookup):
@@ -402,21 +410,62 @@ def store_many(aws: Aws, count: int) -> list[str]:
     return ids
 
 
-def test_lookup_failure_keeps_progress_still_purges_and_then_raises(
-    aws: Aws, clock: Clock
-) -> None:
-    ids = store_many(aws, 230)
-    old = ids[0]
-    assert store_for(aws).tombstone(old, "deleted", "2026-10-01T00:00:00Z")
+def test_walk_failure_keeps_progress_and_then_raises(aws: Aws, clock: Clock) -> None:
+    store_many(aws, 230)
     failing_job = job(aws, FailSecond(), clock, max_lookups=200)
 
-    with pytest.raises(ComplianceError, match="lookup walk: XApiError"):
+    with pytest.raises(ComplianceError, match="walk: XApiError"):
         failing_job.run(HANDLE)
 
     assert failing_job.checked == 100
-    assert store_for(aws).load_cursor(HANDLE) is not None  # progress kept
-    assert_purged(aws, old)  # purged despite the failing lookup
-    assert failing_job.purged == 1
+    assert store_for(aws).load_cursor(SCAN_CURSOR) is not None  # progress kept
+
+
+class FailsToConfirm(Lookup):
+    """Answers a batch, fails a lookup of a single ID (the purge's confirmation)."""
+
+    def __call__(self, ids: list[str]) -> TweetLookup:
+        if len(ids) == 1:
+            raise XApiError("boom")
+        return super().__call__(ids)
+
+
+def test_a_failed_confirmation_defers_the_purge_and_fails_the_run(
+    aws: Aws, clock: Clock
+) -> None:
+    ids = store_many(aws, 5)
+    old = ids[0]
+    lookup = FailsToConfirm({old: "deleted"})
+    run(aws, lookup, clock)  # tombstoned
+    clock.now += GRACE + timedelta(seconds=1)
+    failing_job = job(aws, lookup, clock)
+
+    with pytest.raises(ComplianceError, match="purge confirmation: XApiError"):
+        failing_job.run(HANDLE)
+
+    stored = item(aws, old) or {}
+    assert "purged_at" not in stored and "text" in stored  # kept, never purged
+    assert failing_job.purged == 0 and failing_job.deferred == 1
+
+
+def test_an_unknown_confirmation_defers_the_purge_and_fails_the_run(
+    aws: Aws, clock: Clock
+) -> None:
+    tweet = put(aws, 1)
+    run(aws, Lookup({tweet: "deleted"}), clock)
+    clock.now += GRACE + timedelta(seconds=1)
+    only_confirm_unknown = job(aws, Lookup(), clock)
+    only_confirm_unknown._lookup = lambda ids: (
+        TweetLookup(unknown=frozenset(ids))
+        if len(ids) == 1
+        else TweetLookup(unavailable=dict.fromkeys(ids, "deleted"))
+    )
+
+    with pytest.raises(ComplianceError, match="purge confirmation unknown"):
+        only_confirm_unknown.run(HANDLE)
+
+    assert "purged_at" not in (item(aws, tweet) or {})
+    assert only_confirm_unknown.deferred == 1
 
 
 def test_auth_failure_is_flagged(aws: Aws, clock: Clock) -> None:
@@ -473,9 +522,11 @@ def test_purge_of_an_item_that_is_already_gone_is_fine(
     stale = {tweet: "2026-10-01T00:00:00Z"}
     caplog.set_level(logging.INFO)
 
-    Compliance(store, Lookup(), max_lookups=1, grace=GRACE, now=clock)._purge_due(stale)
+    Compliance(
+        store, Lookup({tweet: "deleted"}), max_lookups=1, grace=GRACE, now=clock
+    )._purge_due(stale)
 
-    assert "already removed" in caplog.text
+    assert "no longer due" in caplog.text
 
 
 def test_keys_outside_the_allowed_prefixes_are_never_deleted(
@@ -608,6 +659,7 @@ def test_handler_runs_the_job_end_to_end(
         "raw_pages_redacted": 0,
         "references_checked": 0,
         "copies_scrubbed": 0,
+        "purge_deferred": 0,
     }
     assert_purged(aws, gone)
     assert item(aws, kept) is not None
@@ -646,12 +698,12 @@ def test_handler_clears_the_token_cache_after_an_auth_error(
     assert credentials._cache == {}
 
 
-def test_handler_requires_its_settings_and_a_username(
+def test_handler_requires_its_settings_but_no_username(
     monkeypatch: pytest.MonkeyPatch, handler_env: Aws
 ) -> None:
     monkeypatch.delenv("TWITTER_USERNAME")
-    with pytest.raises(RuntimeError, match="no username"):
-        compliance.handler({}, Context())
+    install_x_api(monkeypatch, compliance, api_handler(set()))
+    assert compliance.handler({}, Context())["checked"] == 0
     monkeypatch.delenv("MEDIA_BUCKET")
     with pytest.raises(ConfigError, match="MEDIA_BUCKET"):
         compliance.handler({}, Context())
@@ -690,13 +742,13 @@ def test_other_dynamodb_errors_propagate_from_tombstone_and_clear(aws: Aws) -> N
     with pytest.raises(ClientError):
         store.tombstone(tid(1), "deleted", "2026-10-26T12:00:00Z")
     with pytest.raises(ClientError):
-        store.clear_tombstone(tid(1), "2026-10-26T12:00:00Z")
+        store.clear_tombstone(tid(1))
 
 
 def test_clear_tombstone_ignores_an_item_that_is_not_tombstoned(aws: Aws) -> None:
     tweet = put(aws, 1)
 
-    assert store_for(aws).clear_tombstone(tweet, "2026-10-26T12:00:00Z") is False
+    assert store_for(aws).clear_tombstone(tweet) is False
 
 
 def test_tombstones_are_listed_across_pages(aws: Aws) -> None:
