@@ -554,7 +554,7 @@ class ComplianceStore:
             "ids": sorted({str(i) for i in ids})[:BATCH_CAP],
             "holders": sorted({str(h) for h in holders})[:BATCH_CAP],
             "explicit": sorted({str(k) for k in explicit})[:BATCH_CAP],
-            "media_keys": sorted({str(k) for k in media_keys})[: 4 * BATCH_CAP],
+            "media_keys": sorted({str(k) for k in media_keys}),
             "first_day": first_day,
             "pending_versions": [],
             "complete": False,
@@ -576,7 +576,6 @@ class ComplianceStore:
         *,
         first_day: str,
         author: str | None,
-        media_keys: Collection[str] = (),
         stop: Callable[[], bool] = lambda: False,
     ) -> RedactResult:
         """The batch of a purge (``own`` mode): remove the Tweets ``ids`` from the raw
@@ -601,14 +600,21 @@ class ComplianceStore:
                 for i in items
                 if isinstance(k := i.get("raw_key"), str) and k.startswith("raw/")
             }
+            taken = set(sorted(wanted)[:BATCH_CAP])
             self.start_batch(
                 unit,
                 mode="own",
                 author=author,
-                ids=wanted,
+                ids=taken,
                 first_day=first_day,
                 explicit=explicit,
-                media_keys=media_keys,
+                # the keys of the Tweets in the batch, so none is lost to the cap
+                media_keys={
+                    str(k)
+                    for i in items
+                    if str(i["tweet_id"]) in taken
+                    for k in i.get("media_keys") or ()
+                },
             )
         result = self.advance(unit, stop=stop)
         assert result is not None  # the batch was just saved
@@ -683,17 +689,45 @@ class ComplianceStore:
                 track(key, False)
 
         def held_elsewhere() -> set[str]:
+            """The media keys another item still lists. The scan keeps its place in
+            the batch state, so a very large table is covered over several runs; a
+            run that cannot read even one page is a failure (the alarm), not a wait."""
             nonlocal held
             if held is None:
-                held = self.media_keys_held_by_others(media_keys, work, stop)
+                scan = state.get("held_scan") or {}
+                cursor = json.loads(scan["cursor"]) if scan.get("cursor") else None
+                found, cursor, finished, read = self.scan_held(
+                    media_keys, work, cursor, scan.get("held", ()), stop
+                )
+                if not finished:
+                    save(
+                        held_scan={
+                            "held": sorted(found),
+                            "cursor": json.dumps(cursor) if cursor else "",
+                        }
+                    )
+                    if read == 0:
+                        raise ComplianceError(
+                            "the scan for media held by other Tweets made no progress"
+                        )
+                    raise _OutOfTime
+                held = found
             return held
 
         def unfinished() -> RedactResult:
             return self._result(state, done=False, pages=pages, quarantined=quarantined)
 
         flush()
-        for key in state.get("explicit", ()):
-            pages += self._redact_page(key, work, own, track)
+        explicit = list(state.get("explicit", ()))
+        for number in range(int(state.get("explicit_done", 0)), len(explicit)):
+            if stop():
+                save(explicit_done=number)
+                return unfinished()
+            pages += self._redact_page(explicit[number], work, own, track)
+            if (number + 1) % PROGRESS_EVERY == 0:
+                save(explicit_done=number + 1)
+        if explicit:
+            save(explicit_done=len(explicit))
         if author is not None and not state.get("raw_done"):
             start = state.get("raw_after") or (
                 f"raw/{author}/dt={first}/" if first else None
@@ -733,33 +767,54 @@ class ComplianceStore:
         save(complete=True)
         return self._result(state, done=True, pages=pages, quarantined=quarantined)
 
+    def scan_held(
+        self,
+        keys: Collection[str],
+        exclude: Collection[str],
+        cursor: Mapping[str, Any] | None,
+        held: Collection[str],
+        stop: Callable[[], bool],
+    ) -> tuple[set[str], dict[str, Any] | None, bool, int]:
+        """Go on with the projected scan for the ``media_keys`` among ``keys`` that
+        another stored item (not in ``exclude``, not purged) still lists, from
+        ``cursor`` with ``held`` found so far. Returns ``(held, cursor, finished,
+        pages)``; it stops between two pages when ``stop()`` says time is up."""
+        wanted = set(keys)
+        found = set(held)
+        kwargs: dict[str, Any] = {
+            "ProjectionExpression": "tweet_id, media_keys, purged_at"
+        }
+        if cursor is not None:
+            kwargs["ExclusiveStartKey"] = dict(cursor)
+        pages = 0
+        position = dict(cursor) if cursor is not None else None
+        while wanted:
+            if stop():
+                return found, position, False, pages
+            page = self._tweets.scan(**kwargs)
+            pages += 1
+            for item in cast("list[dict[str, Any]]", page["Items"]):
+                if str(item["tweet_id"]) in exclude or "purged_at" in item:
+                    continue
+                found |= wanted & {str(k) for k in item.get("media_keys") or ()}
+            position = cast("dict[str, Any] | None", page.get("LastEvaluatedKey"))
+            if position is None:
+                break
+            kwargs["ExclusiveStartKey"] = position
+        return found, None, True, pages
+
     def media_keys_held_by_others(
         self,
         keys: Collection[str],
         exclude: Collection[str],
         stop: Callable[[], bool] = lambda: False,
     ) -> set[str]:
-        """The ``media_keys`` among ``keys`` that another stored item (not in
-        ``exclude``, not purged) still lists. One projected scan of the table; if
-        ``stop()`` says time is up between two pages it raises ``_OutOfTime`` (the
-        caller goes on next run)."""
-        wanted = set(keys)
-        held: set[str] = set()
-        kwargs: dict[str, Any] = {
-            "ProjectionExpression": "tweet_id, media_keys, purged_at"
-        }
-        while wanted:
-            if stop():
-                raise _OutOfTime
-            page = self._tweets.scan(**kwargs)
-            for item in cast("list[dict[str, Any]]", page["Items"]):
-                if str(item["tweet_id"]) in exclude or "purged_at" in item:
-                    continue
-                held |= wanted & {str(k) for k in item.get("media_keys") or ()}
-            if "LastEvaluatedKey" not in page:
-                break
-            kwargs["ExclusiveStartKey"] = page["LastEvaluatedKey"]
-        return held
+        """The whole scan of ``scan_held`` in one go; raises ``_OutOfTime`` if
+        ``stop()`` says time is up before it is finished."""
+        found, _, finished, _ = self.scan_held(keys, exclude, None, (), stop)
+        if not finished:
+            raise _OutOfTime
+        return found
 
     def _put_rewritten(
         self,
@@ -1158,6 +1213,7 @@ class ComplianceStore:
         *,
         now: str,
         cutoff: str,
+        mark_only: bool = False,
     ) -> tuple[int, int, int]:
         """Apply what the X API said about the posts ``item`` holds copies of.
 
@@ -1214,7 +1270,7 @@ class ComplianceStore:
                         names[f"#{name}"] = name
                         removes.append(f"{position}.#{name}")
                     unmarked += bool(cleared)
-                elif str(since or now) <= cutoff:
+                elif not mark_only and str(since or now) <= cutoff:
                     for prefix in self.text_prefixes(
                         current, tweet_id, f"ref.{ref_id}."
                     ):
@@ -1238,7 +1294,7 @@ class ComplianceStore:
                         "scrubbed_at": now,
                     }
                     scrubbed += 1
-                elif since is None:
+                elif since is None:  # the first sighting starts the grace clock
                     names["#status"] = "status"
                     sets.append(
                         f"{position}.#status = :unavailable, "
@@ -1305,6 +1361,7 @@ class Compliance:
         self._grace = grace
         self._remaining_ms = remaining_ms
         self._now = now
+        self._reserve_ms = SAFETY_MARGIN_MS  # time kept back from the phase running
         self.checked = 0
         self.ref_checked = 0
         self.purge_checked = 0
@@ -1336,8 +1393,15 @@ class Compliance:
             self.auth_failed = isinstance(exc, AuthError)
             logger.exception("compliance walk failed")
             self.failures.append(f"walk: {type(exc).__name__}")
-        self._advance_copy_batches()
+        # The purges come first (a confirmed purge must not wait behind a long copy
+        # batch); while copy batches are waiting they keep half of the time that is
+        # left, so a purge's listing cannot starve them either.
+        if self._remaining_ms is not None and self._store.active_units():
+            left = self._remaining_ms() - SAFETY_MARGIN_MS
+            self._reserve_ms = SAFETY_MARGIN_MS + max(0, left) // 2
         self._purge_due(tombstones)
+        self._reserve_ms = SAFETY_MARGIN_MS
+        self._advance_copy_batches()
         self._sweep(sweeping)
         logger.info(
             "compliance run for %s: checked=%d tombstoned=%d cleared=%d purged=%d "
@@ -1368,7 +1432,7 @@ class Compliance:
 
     def _time_low(self) -> bool:
         return (
-            self._remaining_ms is not None and self._remaining_ms() < SAFETY_MARGIN_MS
+            self._remaining_ms is not None and self._remaining_ms() < self._reserve_ms
         )
 
     def _out_of_time(self) -> bool:
@@ -1491,12 +1555,29 @@ class Compliance:
         for author, group in by_author.items():
             unit = f"copy#{author or '-'}"
             if unit in active:
+                # One batch per author at a time. The waiting items still get their
+                # first sighting recorded (the grace clock must start), and the walk
+                # registers them when it next reaches them.
                 logger.info(
                     "a redaction of deleted copies is in progress for %s: %d tweet(s) "
                     "wait for the walk to reach them again",
                     author,
                     len(group),
                 )
+                for item in group:
+                    try:
+                        marked, _, _ = self._store.update_copies(
+                            item, outcome, now=now, cutoff=cutoff, mark_only=True
+                        )
+                    except Exception as exc:
+                        logger.exception(
+                            "marking copies in %s failed", item["tweet_id"]
+                        )
+                        self.failures.append(
+                            f"copies {item['tweet_id']}: {type(exc).__name__}"
+                        )
+                        continue
+                    self.copies_marked += marked
                 continue
             due = {
                 i
@@ -1701,9 +1782,6 @@ class Compliance:
                     ids,
                     first_day=min(_day(i) for i in group),
                     author=author,
-                    media_keys={
-                        str(k) for i in group for k in i.get("media_keys") or ()
-                    },
                     stop=self._time_low,
                 )
             except Exception as exc:
