@@ -4,7 +4,9 @@ Description: >-
   Serverless pipeline: a scheduled Lambda pulls an X (Twitter) user's timeline and
   queues one SQS message per Tweet; a second Lambda stores Tweet metadata in DynamoDB
   and media in S3. Media that still can't be stored on a message's last receive is
-  recorded as retrying and handled by a third Lambda through its own retry queue.
+  recorded as retrying and handled by a third Lambda through its own retry queue. A
+  fourth, scheduled Lambda tombstones Tweets that were deleted or made unavailable at
+  the source and removes their content and S3 objects after a grace period.
 
 Parameters:
   TwitterUsername:
@@ -76,6 +78,35 @@ Parameters:
       Receives of a media-retry message before it moves to the media-retry dead-letter
       queue (which has an alarm). Receives are at least the retry queue's visibility
       timeout apart.
+  RetentionDays:
+    Type: Number
+    Default: 0
+    MinValue: 0
+    Description: >-
+      Days a Tweet and its media are kept (DynamoDB TTL on expires_at plus S3 lifecycle
+      expiration on media/ and text/). 0 keeps everything forever; deletions at the
+      source are still propagated.
+  ComplianceSchedule:
+    Type: String
+    Default: rate(6 hours)
+    Description: EventBridge schedule expression for the deletion-compliance run.
+  ComplianceMaxLookups:
+    Type: Number
+    Default: 1000
+    MinValue: 4
+    Description: >-
+      Most Tweet IDs one compliance run checks against the X API (100 per request):
+      the stored Tweets' own IDs and the posts they quote, reply to or retweet, one
+      budget. The walk stops after the last item whose IDs fit (a Tweet needs its own
+      ID plus up to three), so at least 4 is needed. It resumes where the last run
+      stopped and wraps around.
+  DeletionGraceHours:
+    Type: Number
+    Default: 24
+    MinValue: 0
+    Description: >-
+      Hours between tombstoning a Tweet that is unavailable at the source and removing
+      its item and all its S3 objects (every version).
   LogLevel:
     Type: String
     Default: INFO
@@ -86,6 +117,7 @@ Parameters:
     Description: Optional SNS topic ARN notified by the alarms. Leave empty for none.
 
 Conditions:
+  HasRetention: !Not [!Equals [!Ref RetentionDays, "0"]]
   HasAlarmTopic: !Not [!Equals [!Ref AlarmTopicArn, ""]]
   # SAM treats any non-empty `Enabled` string as true, so map the parameter to State.
   ScheduleIsEnabled: !Equals [!Ref ScheduleEnabled, "true"]
@@ -120,6 +152,8 @@ Resources:
         - {AttributeName: tweet_id, AttributeType: S}
         - {AttributeName: username, AttributeType: S}
         - {AttributeName: created_at, AttributeType: S}
+        - {AttributeName: tombstone, AttributeType: S}
+        - {AttributeName: deleted_at, AttributeType: S}
       KeySchema:
         - {AttributeName: tweet_id, KeyType: HASH}
       GlobalSecondaryIndexes:
@@ -134,6 +168,20 @@ Resources:
             ProjectionType: INCLUDE
             NonKeyAttributes:
               [text, text_truncated, text_s3_key, media_count, public_metrics]
+        # Sparse: only tombstoned items carry `tombstone`, so the compliance job finds
+        # what to purge with a Query that reads just those, never a table scan.
+        - IndexName: tombstone-deleted_at-index
+          KeySchema:
+            - {AttributeName: tombstone, KeyType: HASH}
+            - {AttributeName: deleted_at, KeyType: RANGE}
+          Projection:
+            ProjectionType: KEYS_ONLY
+      # Items expire at their epoch `expires_at`. The attribute is only written when
+      # RetentionDays > 0, and TTL is only enabled then, so by default nothing ever
+      # expires.
+      TimeToLiveSpecification:
+        AttributeName: expires_at
+        Enabled: !If [HasRetention, true, false]
       PointInTimeRecoverySpecification:
         PointInTimeRecoveryEnabled: true
       SSESpecification:
@@ -193,6 +241,22 @@ Resources:
             Transitions:
               - StorageClass: INTELLIGENT_TIERING
                 TransitionInDays: 0
+          # With RetentionDays > 0 objects expire as the items do (the delete marker's
+          # noncurrent version is removed by expire-noncurrent-versions).
+          - !If
+            - HasRetention
+            - Id: retention-media
+              Status: Enabled
+              Prefix: media/
+              ExpirationInDays: !Ref RetentionDays
+            - !Ref AWS::NoValue
+          - !If
+            - HasRetention
+            - Id: retention-text
+              Status: Enabled
+              Prefix: text/
+              ExpirationInDays: !Ref RetentionDays
+            - !Ref AWS::NoValue
           # No rule for raw/ on purpose: those pages are the only copy of fields the
           # processor doesn't keep, so they are never expired or tiered (gzipped pages
           # are far below the 128 KB S3 minimum for lifecycle transitions anyway).
@@ -285,6 +349,11 @@ Resources:
     Properties:
       RetentionInDays: 30
 
+  ComplianceFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 30
+
   # --- Functions -------------------------------------------------------------
   FetchFunction:
     Type: AWS::Serverless::Function
@@ -356,6 +425,7 @@ Resources:
           MAX_MEDIA_BYTES: !Ref MaxMediaBytes
           MAX_RECEIVE_COUNT: !Ref MaxReceiveCount
           MEDIA_RETRY_QUEUE_URL: !Ref MediaRetryQueue
+          RETENTION_DAYS: !Ref RetentionDays
       Policies:
         - SQSSendMessagePolicy:
             QueueName: !GetAtt MediaRetryQueue.QueueName
@@ -430,6 +500,90 @@ Resources:
             ScalingConfig:
               MaximumConcurrency: 2  # bounds concurrent big downloads
 
+  # The only function allowed to delete: no other function has any delete permission.
+  ComplianceFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: >-
+        Tombstones Tweets deleted or made unavailable at the source, then removes their
+        item and every S3 object version after the grace period.
+      Handler: twitter_timeline_data_pipeline.handlers.compliance.handler
+      Timeout: 300
+      # Two overlapping runs would rewrite the same raw pages and purge the same items.
+      ReservedConcurrentExecutions: 1
+      MemorySize: 256
+      LoggingConfig:
+        LogGroup: !Ref ComplianceFunctionLogGroup
+      Environment:
+        Variables:
+          TWITTER_USERNAME: !Ref TwitterUsername
+          BEARER_TOKEN_SECRET_ARN: !Ref BearerTokenSecret
+          TWEETS_TABLE: !Ref TweetsTable
+          STATE_TABLE: !Ref StateTable
+          MEDIA_BUCKET: !Ref MediaBucket
+          RETENTION_DAYS: !Ref RetentionDays
+          COMPLIANCE_MAX_LOOKUPS: !Ref ComplianceMaxLookups
+          DELETION_GRACE_HOURS: !Ref DeletionGraceHours
+      Policies:
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: !Ref BearerTokenSecret
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action: dynamodb:Query
+              Resource: !Sub "${TweetsTable.Arn}/index/*"
+            - Effect: Allow
+              # Scan: the references walk reads the items' referenced_tweets in bounded
+              # pages. UpdateItem does every write (tombstone, copy scrub, purge), so
+              # the function can neither put nor delete an item.
+              Action: [dynamodb:GetItem, dynamodb:UpdateItem, dynamodb:Scan]
+              Resource: !GetAtt TweetsTable.Arn
+            # Its own cursor items only (`compliance#<handle>`), not the fetch checkpoints.
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:PutItem]
+              Resource: !GetAtt StateTable.Arn
+              Condition:
+                ForAllValues:StringLike:
+                  "dynamodb:LeadingKeys": ["compliance#*"]
+            - Effect: Allow
+              Action: [s3:ListBucketVersions, s3:ListBucket]
+              Resource: !GetAtt MediaBucket.Arn
+              Condition:
+                StringLike:
+                  "s3:prefix": ["media/*", "text/*", "raw/*", "quarantine/*"]
+            - Effect: Allow
+              # Every delete names a VersionId (a bucket-versioning delete of a version),
+              # so only s3:DeleteObjectVersion is needed.
+              Action: s3:DeleteObjectVersion
+              Resource:
+                - !Sub "${MediaBucket.Arn}/media/*"
+                - !Sub "${MediaBucket.Arn}/text/*"
+                - !Sub "${MediaBucket.Arn}/raw/*"
+                - !Sub "${MediaBucket.Arn}/quarantine/*"
+            # Raw pages are rewritten without a deleted Tweet; quarantined objects are
+            # only read (to find a Tweet) and deleted.
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource:
+                - !Sub "${MediaBucket.Arn}/raw/*"
+                - !Sub "${MediaBucket.Arn}/quarantine/*"
+            # Raw pages and quarantined messages are rewritten without a deleted post's
+            # copy (If-Match, new version; the older versions are deleted).
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource:
+                - !Sub "${MediaBucket.Arn}/raw/*"
+                - !Sub "${MediaBucket.Arn}/quarantine/*"
+      EventInvokeConfig:
+        # The next scheduled run retries; the cursor and tombstones persist.
+        MaximumRetryAttempts: 0
+      Events:
+        Schedule:
+          Type: Schedule
+          Properties:
+            Schedule: !Ref ComplianceSchedule
+            State: !If [ScheduleIsEnabled, ENABLED, DISABLED]
+
   # --- Alarms ----------------------------------------------------------------
   DeadLetterQueueNotEmptyAlarm:
     Type: AWS::CloudWatch::Alarm
@@ -475,6 +629,24 @@ Resources:
         - {Name: FunctionName, Value: !Ref MediaRetryFunction}
       Statistic: Sum
       Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref AWS::NoValue]
+
+  ComplianceFunctionErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: >-
+        The compliance function failed: deletions at the source may not be propagated
+        within the documented window.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - {Name: FunctionName, Value: !Ref ComplianceFunction}
+      Statistic: Sum
+      Period: 3600
       EvaluationPeriods: 1
       Threshold: 1
       ComparisonOperator: GreaterThanOrEqualToThreshold
@@ -536,3 +708,5 @@ Outputs:
     Value: !Ref ProcessFunction
   MediaRetryFunctionName:
     Value: !Ref MediaRetryFunction
+  ComplianceFunctionName:
+    Value: !Ref ComplianceFunction

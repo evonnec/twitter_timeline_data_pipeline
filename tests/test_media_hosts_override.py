@@ -122,7 +122,7 @@ def test_the_handlers_warn_loudly_once_and_pass_the_hosts_to_the_store(
     # the override would otherwise send them to a custom URL.
     process._s3_client()
     process._sqs_client()
-    process._tweet_store(TWEETS_TABLE, BUCKET)
+    process._tweet_store(TWEETS_TABLE, BUCKET, 0)
     monkeypatch.setenv("AWS_ENDPOINT_URL", EMULATED["AWS_ENDPOINT_URL"])
     monkeypatch.setenv(MEDIA_HOSTS_OVERRIDE_ENV, "cdn-stub")
     message = make_message(media=(photo(url=STUB_URL),))

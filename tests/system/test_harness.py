@@ -64,11 +64,15 @@ def test_resources_have_the_template_settings(sim: Simulation) -> None:
     table = sim.tweets_table
     expected = _props(template, "TweetsTable")
     assert table.key_schema == expected["KeySchema"]
-    (gsi,) = table.global_secondary_indexes or []
-    (expected_gsi,) = expected["GlobalSecondaryIndexes"]
-    assert gsi["IndexName"] == expected_gsi["IndexName"]
-    assert gsi["KeySchema"] == expected_gsi["KeySchema"]
-    assert gsi["Projection"] == expected_gsi["Projection"]
+    gsis = {g["IndexName"]: g for g in table.global_secondary_indexes or []}
+    assert set(gsis) == {g["IndexName"] for g in expected["GlobalSecondaryIndexes"]}
+    for expected_gsi in expected["GlobalSecondaryIndexes"]:
+        gsi = gsis[expected_gsi["IndexName"]]
+        assert gsi["KeySchema"] == expected_gsi["KeySchema"]
+        assert gsi["Projection"] == expected_gsi["Projection"]
+    ttl = sim.tweets_table.meta.client.describe_time_to_live(TableName=table.name)
+    # TTL is only enabled with RetentionDays > 0 (the template default is 0)
+    assert ttl["TimeToLiveDescription"]["TimeToLiveStatus"] == "DISABLED"
     assert sim.state_table.key_schema == _props(template, "StateTable")["KeySchema"]
     versioning = sim.s3.get_bucket_versioning(Bucket=sim.bucket)
     assert versioning["Status"] == "Enabled"

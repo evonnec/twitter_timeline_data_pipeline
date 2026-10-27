@@ -48,6 +48,15 @@ def _retry_one(
     """Handle one record; raises for anything that must be retried."""
     retry = MediaRetry.from_json(record["body"])
     key = retry.media.media_key
+    # Before any download: a Tweet removed at the source gets no media back.
+    if tweet_store.is_tombstoned(retry.tweet_id):
+        logger.info(
+            "tweet %s is tombstoned (deleted at the source): media %s dropped, "
+            "nothing downloaded",
+            retry.tweet_id,
+            key,
+        )
+        return
     entries = tweet_store.get_media(retry.tweet_id)
     if entries is None:
         # The Tweet write may not have landed (or was lost): try again later.

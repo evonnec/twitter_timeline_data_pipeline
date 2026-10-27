@@ -1,5 +1,6 @@
 import json
 import logging
+import time
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
@@ -1059,6 +1060,22 @@ def test_handler_processes_the_sample_event(process_env: Aws) -> None:
     assert s3_keys(process_env) == [
         "media/1000000000000000000/1000000000000000001/3_1000000000000000002.jpg"
     ]
+
+
+def test_handler_writes_expires_at_only_when_retention_is_configured(
+    process_env: Aws, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    handler(sample_event(), None)
+    assert "expires_at" not in ddb_get(
+        process_env.tweets_table, tweet_id="1000000000000000001"
+    )
+
+    monkeypatch.setenv("RETENTION_DAYS", "7")
+    process._tweet_store.cache_clear()
+    handler(sample_event(), None)
+
+    item = ddb_get(process_env.tweets_table, tweet_id="1000000000000000001")
+    assert 6 * 86_400 < int(item["expires_at"]) - time.time() <= 7 * 86_400
 
 
 def test_handler_returns_batch_item_failures_shape(process_env: Aws) -> None:

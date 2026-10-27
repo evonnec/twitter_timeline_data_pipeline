@@ -29,6 +29,7 @@ import re
 import time
 from collections.abc import Buffer, Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
+from datetime import datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Literal, cast, override
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -604,6 +605,9 @@ class PutResult:
     written: bool
     stored_fetched_at: str | None = None
     stored_schema_version: int | None = None
+    tombstoned: bool = False
+    """The Tweet was deleted or made unavailable at the source (the compliance job
+    tombstoned it), so nothing is written; the other fields are not set."""
 
 
 # DynamoDB items are limited to 400 KB (names and values together). A text is moved to
@@ -648,7 +652,8 @@ MERGE_ATTEMPTS = 3
 _MERGE_PROJECTION = (
     "media, referenced_tweets, entities, entities_s3_key, display_entities, "
     "display_entities_s3_key, entities_omitted, in_reply_to_user_id, "
-    "possibly_sensitive, edit_controls, withheld, fetched_at, revision"
+    "possibly_sensitive, edit_controls, withheld, fetched_at, revision, deleted_at, "
+    "stored_at, first_stored_at"
 )
 # The fields of a stored referenced-post entry, in groups that are merged as a unit (a
 # text is its inline value with its S3 pointer; they must not come from two copies).
@@ -729,6 +734,14 @@ def _has(entry: Mapping[str, Any], group: Sequence[str]) -> bool:
     return any(name in entry for name in group)
 
 
+def _later(a: str, b: str) -> bool:
+    """Whether the ISO 8601 time ``a`` is after ``b`` (string order if unparseable)."""
+    try:
+        return datetime.fromisoformat(a) > datetime.fromisoformat(b)
+    except ValueError:
+        return a > b
+
+
 def _merge_reference(
     fresh: Mapping[str, Any],
     kept: Mapping[str, Any],
@@ -745,6 +758,16 @@ def _merge_reference(
     stay). A fresh ``unavailable`` entry keeps the stored copy whole, with
     ``unavailable_since`` carried from the first fetch that saw it so. A copy that is
     present again carries no status."""
+    if kept.get("scrubbed_at"):
+        # The compliance job scrubbed this copy (its original is gone at the source). A
+        # redelivery or an older message must not put it back: the copy returns only
+        # when a message fetched after the scrub shows the post, available.
+        back = (
+            not _is_bare(fresh)
+            and fresh.get("status") != "unavailable"
+            and _later(fetched_at, str(kept["scrubbed_at"]))
+        )
+        return dict(fresh) if back else dict(kept)
     merged = dict(fresh)
     if _is_bare(fresh):
         for group in (*_TEXT_GROUPS, _ENTITIES_GROUP, *_OTHER_GROUPS):
@@ -899,10 +922,18 @@ def carry_forward(
 class TweetStore:
     """Writes Tweet metadata to the tweets table (partition key ``tweet_id``)."""
 
-    def __init__(self, table: Table, s3_client: S3Client, bucket: str) -> None:
+    def __init__(
+        self,
+        table: Table,
+        s3_client: S3Client,
+        bucket: str,
+        *,
+        retention_days: int = 0,
+    ) -> None:
         self._table = table
         self._s3 = s3_client
         self._bucket = bucket
+        self._retention_days = retention_days
 
     @staticmethod
     def text_key(message: TweetMessage, field: str = "text") -> str:
@@ -1005,6 +1036,12 @@ class TweetStore:
         item = self.to_item(message, media)
         if previous is not None:
             carry_forward(item, previous, message.fetched_at, message.requested)
+        # The first store, carried: ``stored_at`` moves with every rewrite, so retention
+        # counts from here and a re-fetch can't keep an item alive for ever.
+        first = (previous or {}).get("first_stored_at") or (previous or {}).get(
+            "stored_at"
+        )
+        item["first_stored_at"] = str(first or item["stored_at"])
         fields = [f for f in ("text", "display_text") if f in item]
         for field in sorted(fields, key=lambda f: len(item[f]), reverse=True):
             over = (
@@ -1052,6 +1089,10 @@ class TweetStore:
             if estimate_item_size(item) <= ITEM_LIMIT_BYTES:
                 break
             self._offload_entities(message, holder, name, key_base)
+        if self._retention_days > 0:
+            # DynamoDB's TTL (attribute expires_at) removes the item after this epoch.
+            stored = datetime.fromisoformat(item["first_stored_at"]).timestamp()
+            item["expires_at"] = int(stored) + self._retention_days * 86_400
         return item
 
     @staticmethod
@@ -1161,6 +1202,11 @@ class TweetStore:
         other in-place updater of the item must ``ADD revision 1`` too, as
         ``resolve_media`` does). ``WriteContentionError`` if it keeps changing; any
         other DynamoDB error propagates.
+
+        A tombstoned Tweet (``deleted_at`` set, by the compliance job, also after its
+        content was purged) is never written, whatever the message says: that is what
+        keeps a replay or redrive from bringing a removed Tweet back. The result has
+        ``tombstoned=True``.
         """
         is_long = bool(message.tweet.note_text)
         keep_long_post = (
@@ -1170,6 +1216,7 @@ class TweetStore:
         )
         base = (
             "attribute_not_exists(tweet_id) OR ("
+            "attribute_not_exists(deleted_at) AND "
             "(attribute_not_exists(fetched_at) "
             "OR fetched_at <= :fetched_at) AND "
             "(attribute_not_exists(schema_version) "
@@ -1194,6 +1241,8 @@ class TweetStore:
                     ProjectionExpression=_MERGE_PROJECTION,
                 ).get("Item"),
             )
+            if previous is not None and "deleted_at" in previous:
+                return PutResult(written=False, tombstoned=True)
             read_revision = None if previous is None else previous.get("revision")
             if previous is None:
                 guard = "attribute_not_exists(tweet_id)"
@@ -1217,6 +1266,8 @@ class TweetStore:
                 ):
                     raise
                 old = cast("dict[str, Any]", exc.response.get("Item") or {})
+                if "deleted_at" in old:
+                    return PutResult(written=False, tombstoned=True)
                 now = old.get("revision", {}).get("N")
                 # A failure is either a write since the read (the revision moved, or
                 # the item appeared) or the base condition on the state that was
@@ -1252,6 +1303,15 @@ class TweetStore:
             stored_schema_version=None if version is None else int(version),
         )
 
+    def is_tombstoned(self, tweet_id: TweetId) -> bool:
+        """Whether the item is tombstoned (strongly consistent read)."""
+        item = self._table.get_item(
+            Key={"tweet_id": tweet_id},
+            ConsistentRead=True,
+            ProjectionExpression="deleted_at",
+        ).get("Item")
+        return item is not None and "deleted_at" in item
+
     def get_media(self, tweet_id: TweetId) -> list[dict[str, Any]] | None:
         """The item's ``media`` entries (strongly consistent), None if no such item."""
         item = self._table.get_item(
@@ -1284,7 +1344,8 @@ class TweetStore:
                 # ADD revision: this write must fail a concurrent put_tweet's guard.
                 UpdateExpression=f"SET {position} = :entry ADD revision :one",
                 ConditionExpression=(
-                    f"attribute_exists(tweet_id) AND {position}.media_key = :key "
+                    f"attribute_exists(tweet_id) AND attribute_not_exists(deleted_at) "
+                    f"AND {position}.media_key = :key "
                     f"AND {position}.#status = :retrying"
                 ),
                 ExpressionAttributeNames={"#status": "status"},

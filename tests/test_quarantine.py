@@ -137,6 +137,7 @@ def test_one_bad_tweet_is_quarantined_and_the_rest_enqueued(
         "raw_key": raw_key,
         "error": stored["error"],
         "item": bad_tweet(),
+        "tweet_id": bad_tweet()["id"],
     }
     assert "TypeError" in stored["error"]
     assert raw_key in [

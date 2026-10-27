@@ -13,7 +13,7 @@ def comparable(items: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
     replay where the first run said ``stored``."""
     return {
         k: {
-            **{f: v for f, v in i.items() if f != "stored_at"},
+            **{f: v for f, v in i.items() if f not in ("stored_at", "first_stored_at")},
             "media": [
                 {**m, "status": "stored" if m["status"] == "exists" else m["status"]}
                 for m in i.get("media", [])

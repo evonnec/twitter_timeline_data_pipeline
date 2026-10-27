@@ -9,7 +9,11 @@ Key layout::
 
 Each object is plain JSON::
 
-    {"kind", "raw_key", "error", "item": <the JSON>}
+    {"kind", "raw_key", "error", "item": <the JSON>, "tweet_id"?}
+
+``tweet_id`` (additive) is the ID of the Tweet the object holds, when the kind has one:
+``item.id`` of a ``tweet`` or ``included_tweet``, ``item.tweet.id`` of a ``message``.
+Objects written before it existed are matched by those same paths.
 
 ``kind`` is ``tweet``, ``media``, ``included_tweet`` or ``included_user`` (an entry of
 the page's ``includes``) or ``message``.
@@ -50,6 +54,18 @@ def quarantine_key(
     )
 
 
+def item_tweet_id(kind: str, item: Any) -> str | None:
+    """The ID of the Tweet a quarantined ``item`` holds (None for the other kinds, or
+    when it has no usable ID)."""
+    holder = item
+    if kind == "message" and isinstance(item, dict):
+        holder = item.get("tweet")
+    elif kind not in ("tweet", "included_tweet"):
+        return None
+    tweet_id = holder.get("id") if isinstance(holder, dict) else None
+    return tweet_id if isinstance(tweet_id, str) and tweet_id.isdecimal() else None
+
+
 class QuarantineStore:
     """Writes the quarantine objects of one run (or replay)."""
 
@@ -74,10 +90,15 @@ class QuarantineStore:
         caller must then fail the page rather than drop the item."""
         index = self._counts.get(page_no, 0)
         key = quarantine_key(user_id, fetched_at, self.run_id, page_no, index)
-        body = json.dumps(
-            {"kind": kind, "raw_key": raw_key, "error": error, "item": item},
-            separators=(",", ":"),
-        )
+        document: dict[str, Any] = {
+            "kind": kind,
+            "raw_key": raw_key,
+            "error": error,
+            "item": item,
+        }
+        if (tweet_id := item_tweet_id(kind, item)) is not None:
+            document["tweet_id"] = tweet_id
+        body = json.dumps(document, separators=(",", ":"))
         self.s3.put_object(
             Bucket=self.bucket,
             Key=key,

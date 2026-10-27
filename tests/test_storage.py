@@ -2,6 +2,7 @@ import io
 import json
 import logging
 from collections.abc import Callable, Iterator
+from datetime import datetime
 from typing import Any, cast
 from urllib.parse import urlsplit
 
@@ -29,6 +30,7 @@ from hypothesis import strategies as st
 from moto import mock_aws
 from mypy_boto3_s3 import S3Client
 
+from twitter_timeline_data_pipeline.handlers.compliance import ComplianceStore
 from twitter_timeline_data_pipeline.models import (
     MAX_STORED_INT,
     Media,
@@ -1725,6 +1727,32 @@ def test_the_runbook_scan_finds_items_with_any_retrying_media(aws: Aws) -> None:
     ]
 
 
+def test_expires_at_is_written_only_when_retention_is_configured(aws: Aws) -> None:
+    message = make_message("1700000000000000001")
+    keep = TweetStore(aws.tweets_table, aws.s3, aws.bucket)
+    expire = TweetStore(aws.tweets_table, aws.s3, aws.bucket, retention_days=30)
+
+    assert "expires_at" not in keep.build_item(message, [])
+    item = expire.build_item(message, [])
+
+    stored = datetime.fromisoformat(item["stored_at"]).timestamp()
+    assert item["expires_at"] == int(stored) + 30 * 86_400
+
+
+def test_default_retention_never_writes_expires_at_to_dynamodb(aws: Aws) -> None:
+    TweetStore(aws.tweets_table, aws.s3, aws.bucket).put_tweet(
+        make_message("1700000000000000001"), []
+    )
+    TweetStore(aws.tweets_table, aws.s3, aws.bucket, retention_days=1).put_tweet(
+        make_message("1700000000000000002"), []
+    )
+
+    items = {i["tweet_id"]: i for i in aws.tweets_table.scan()["Items"]}
+
+    assert "expires_at" not in items["1700000000000000001"]
+    assert "expires_at" in items["1700000000000000002"]
+
+
 # ---- missing keys, media fields, previews (#17, #36) -----------------------------
 
 PREVIEW_URL = "https://pbs.twimg.com/ext_tw_video_thumb/1/pu/img/p.jpg"
@@ -1906,12 +1934,7 @@ def test_text_offload_boundary_accounts_for_the_media_fields(aws: Aws) -> None:
         )
         return store.build_item(message, stored)
 
-    base = estimate_item_size(
-        TweetStore.to_item(
-            make_message(media=tuple(media), tweet={"media_keys": keys, "text": ""}),
-            stored,
-        )
-    )
+    base = estimate_item_size(build(0))
     fits = ITEM_LIMIT_BYTES - base
 
     assert base > 20_000  # the media fields are part of what the estimate counts
@@ -2507,3 +2530,99 @@ def test_a_legacy_item_without_stamps_is_merged_too(aws: Aws) -> None:
     (entry,) = ddb_get(aws.tweets_table, tweet_id=TWEET_ID)["media"]
     assert (entry["status"], entry["s3_key"]) == ("stored", "k")
     assert entry["last_seen_fetched_at"] == NEW_FETCH
+
+
+# ---- compliance writes join the revision lock (#21) ---------------------------------
+
+
+def _tombstone(aws: Aws, when: str = "2026-10-26T12:00:00Z") -> Callable[[], object]:
+    store = ComplianceStore(aws.tweets_table, aws.state_table, aws.s3, aws.bucket)
+    return lambda: store.tombstone(TWEET_ID, "deleted", when)
+
+
+def test_a_tombstone_between_the_read_and_the_put_makes_the_put_refuse(
+    aws: Aws,
+) -> None:
+    plain = TweetStore(aws.tweets_table, aws.s3, aws.bucket)
+    plain.put_tweet(*photo_entry_message(OLD_FETCH, present=True))
+    racing = TweetStore(
+        racing_table(aws.tweets_table, _tombstone(aws), 1), aws.s3, aws.bucket
+    )
+
+    result = racing.put_tweet(*photo_entry_message(NEW_FETCH, present=False))
+
+    assert result.tombstoned and not result.written
+    stored = ddb_get(aws.tweets_table, tweet_id=TWEET_ID)
+    assert stored["deleted_at"] == "2026-10-26T12:00:00Z"
+    assert stored["fetched_at"] == OLD_FETCH  # nothing of the new message landed
+    assert stored["revision"] == 2
+
+
+def test_a_tombstone_on_a_legacy_item_between_read_and_put_makes_it_refuse(
+    aws: Aws,
+) -> None:
+    plain = TweetStore(aws.tweets_table, aws.s3, aws.bucket)
+    plain.put_tweet(*photo_entry_message(OLD_FETCH, present=True))
+    aws.tweets_table.update_item(
+        Key={"tweet_id": TWEET_ID}, UpdateExpression="REMOVE revision"
+    )
+    racing = TweetStore(
+        racing_table(aws.tweets_table, _tombstone(aws), 1), aws.s3, aws.bucket
+    )
+
+    result = racing.put_tweet(*photo_entry_message(NEW_FETCH, present=False))
+
+    assert result.tombstoned and not result.written
+    assert ddb_get(aws.tweets_table, tweet_id=TWEET_ID)["fetched_at"] == OLD_FETCH
+
+
+def test_a_deleted_at_that_leaves_the_revision_alone_still_fails_the_put(
+    aws: Aws,
+) -> None:
+    # The base condition carries attribute_not_exists(deleted_at) on its own, not only
+    # through the revision guard: a writer that forgets to bump the revision is caught.
+    plain = TweetStore(aws.tweets_table, aws.s3, aws.bucket)
+    plain.put_tweet(*photo_entry_message(OLD_FETCH, present=True))
+
+    def silent_tombstone() -> None:
+        aws.tweets_table.update_item(
+            Key={"tweet_id": TWEET_ID},
+            UpdateExpression="SET deleted_at = :d",
+            ExpressionAttributeValues={":d": "2026-10-26T12:00:00Z"},
+        )
+
+    racing = TweetStore(
+        racing_table(aws.tweets_table, silent_tombstone, 1), aws.s3, aws.bucket
+    )
+
+    result = racing.put_tweet(*photo_entry_message(NEW_FETCH, present=False))
+
+    assert result.tombstoned and not result.written
+    assert ddb_get(aws.tweets_table, tweet_id=TWEET_ID)["fetched_at"] == OLD_FETCH
+
+
+def test_a_put_that_reads_a_tombstone_refuses_without_writing(aws: Aws) -> None:
+    plain = TweetStore(aws.tweets_table, aws.s3, aws.bucket)
+    plain.put_tweet(*photo_entry_message(OLD_FETCH, present=True))
+    _tombstone(aws)()
+    puts: list[object] = []
+    racing = TweetStore(
+        racing_table(aws.tweets_table, lambda: puts.append(1), 99), aws.s3, aws.bucket
+    )
+
+    result = racing.put_tweet(*photo_entry_message(NEW_FETCH, present=False))
+
+    assert result.tombstoned
+    assert puts == []  # refused on the read, before any put
+
+
+def test_a_put_that_lands_before_the_tombstone_is_kept_under_it(aws: Aws) -> None:
+    plain = TweetStore(aws.tweets_table, aws.s3, aws.bucket)
+    plain.put_tweet(*photo_entry_message(OLD_FETCH, present=True))
+    plain.put_tweet(*photo_entry_message(NEW_FETCH, present=True))
+
+    assert _tombstone(aws)() is True
+
+    stored = ddb_get(aws.tweets_table, tweet_id=TWEET_ID)
+    assert stored["fetched_at"] == NEW_FETCH  # the merge is intact, deleted_at added
+    assert stored["deleted_at"] and stored["revision"] == 3

@@ -130,6 +130,17 @@ def process_records(
             continue
         try:
             message = TweetMessage.from_json(record["body"])
+            # Before any download: a Tweet removed at the source must not get its media
+            # back from a replay or a redrive (put_tweet refuses it too, but that is
+            # after the files are already in S3).
+            if tweet_store.is_tombstoned(message.tweet.id):
+                logger.info(
+                    "tweet %s is tombstoned (deleted at the source): message %s "
+                    "dropped, nothing downloaded",
+                    message.tweet.id,
+                    message_id,
+                )
+                continue
             if message.has_omitted:
                 # Left out of the body to fit SQS's limit; read back from the raw page.
                 # An error here retries the record, until its last receive: then the
@@ -199,6 +210,13 @@ def process_records(
             logger.exception("message %s failed", message_id)
             failed.append(message_id)
         else:
+            if result.tombstoned:
+                logger.info(
+                    "write refused for tombstoned tweet %s (message %s)",
+                    message.tweet.id,
+                    message_id,
+                )
+                continue
             if not result.written:
                 # Not a failure: a newer version is already stored, so a retry or the
                 # DLQ would only repeat this.
@@ -307,9 +325,14 @@ def _test_media_hosts() -> frozenset[str]:
 
 
 @functools.cache
-def _tweet_store(table_name: str, bucket: str) -> TweetStore:
+def _tweet_store(table_name: str, bucket: str, retention_days: int = 0) -> TweetStore:
     dynamodb = boto3.resource("dynamodb", config=_short_timeouts())
-    return TweetStore(dynamodb.Table(table_name), _s3_client(), bucket)
+    return TweetStore(
+        dynamodb.Table(table_name),
+        _s3_client(),
+        bucket,
+        retention_days=retention_days,
+    )
 
 
 def handler(event: Any, context: Any) -> dict[str, list[dict[str, str]]]:
@@ -328,7 +351,9 @@ def handler(event: Any, context: Any) -> dict[str, list[dict[str, str]]]:
             max_bytes=settings.max_media_bytes,
             test_hosts=_test_media_hosts(),
         ),
-        tweet_store=_tweet_store(settings.tweets_table, settings.media_bucket),
+        tweet_store=_tweet_store(
+            settings.tweets_table, settings.media_bucket, settings.retention_days
+        ),
         remaining_ms=getattr(context, "get_remaining_time_in_millis", None),
         max_receive_count=settings.max_receive_count,
         retry_queue=MediaRetryQueue(_sqs_client(), settings.media_retry_queue_url),

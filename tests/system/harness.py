@@ -18,7 +18,9 @@ What moto doesn't model faithfully is patched here, in the open:
 
 import copy
 import datetime as dt
+import importlib
 import json
+import pkgutil
 import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -87,6 +89,12 @@ def _routed_httpx(handler: Callable[[httpx.Request], httpx.Response]) -> ModuleT
     return shim
 
 
+def import_package() -> None:
+    package = importlib.import_module(PACKAGE)
+    for info in pkgutil.walk_packages(package.__path__, f"{PACKAGE}."):
+        importlib.import_module(info.name)
+
+
 class Simulation:
     def __init__(
         self,
@@ -99,8 +107,12 @@ class Simulation:
         self.clock = SimClock(start)
         self._mp = monkeypatch
         self._patch_moto()
+        # Every module must exist before time is patched: one imported later (by the
+        # runtime, for a handler no earlier test loaded) would keep the real clock.
+        import_package()
+        modules = all_package_modules()
         virtualize_time(monkeypatch, self.clock, PACKAGE)
-        reset_module_state(all_package_modules())
+        reset_module_state(modules)
         monkeypatch.setattr(boto3, "DEFAULT_SESSION", None)
         boto3.setup_default_session(region_name=REGION)
         assert boto3.DEFAULT_SESSION is not None
@@ -166,7 +178,8 @@ class Simulation:
             for schedule in runtime.spec.schedules
             if schedule.enabled
         ]
-        (self.fetch,) = (f for f in self.functions.values() if f.spec.schedules)
+        (self.fetch,) = self._functions_running("fetch")
+        (self.compliance,) = self._functions_running("compliance")
         (self.process,) = self._functions_running("process")
         (self.media_retry,) = self._functions_running("media_retry")
         (self.esm,) = self._sources_of(self.process)
@@ -267,8 +280,13 @@ class Simulation:
 
     @property
     def schedule(self) -> Schedule:
-        (schedule,) = self.schedules
+        """The fetch function's schedule (what ``run`` fires)."""
+        (schedule,) = (s for s in self.schedules if s.runtime is self.fetch)
         return schedule
+
+    def run_compliance(self, event: Mapping[str, Any] | None = None) -> Invocation:
+        """One compliance run, as its schedule would start it (synchronously)."""
+        return self.compliance.invoke(dict(event or {}))
 
     def process_until(self, when: float) -> list[Invocation]:
         """Let the event source work (through visibility timeouts) until ``when``."""

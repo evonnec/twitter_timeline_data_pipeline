@@ -21,7 +21,7 @@ import json
 import logging
 import uuid
 import zlib
-from collections.abc import Iterator, Mapping
+from collections.abc import Collection, Iterator, Mapping
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
@@ -132,6 +132,106 @@ class Envelope:
             )
         except (KeyError, TypeError) as exc:
             raise RawPageError(f"malformed envelope: {exc!r}") from exc
+
+
+INCLUDED_POST_KEYS = ("tweets", "posts")
+"""The ``response.includes`` lists that hold posts (X is renaming ``tweets``)."""
+
+
+def redact_envelope(
+    body: bytes, tweet_ids: Collection[str], *, from_data: bool = True
+) -> tuple[bytes, set[str]]:
+    """``body`` (a landed object) without the Tweets in ``tweet_ids``.
+
+    Removes them from ``response.data`` and from ``response.includes.tweets`` and
+    ``.posts`` (the posts another Tweet quotes, replies to or retweets), drops the
+    ``includes.media`` only they used, and adds their IDs to ``redactions`` (which
+    replay honors). With ``from_data=False`` only the includes are touched, and
+    ``redactions`` is left alone: that is the copy of a deleted post held in the page
+    of a Tweet that quotes it, while the post's own page is the post's own purge
+    after its own grace. Returns the new object and the IDs it removed; with none
+    removed the new object is ``body`` unchanged. Raises ``RawPageError`` if ``body``
+    can't be read.
+    """
+    envelope = Envelope.from_bytes(body)
+    response = envelope.response
+    includes = response.get("includes")
+    lists: dict[str, list[Any]] = {}
+    if from_data and isinstance(response.get("data"), list):
+        lists["data"] = response["data"]
+    if isinstance(includes, dict):
+        for name in INCLUDED_POST_KEYS:
+            if isinstance(includes.get(name), list):
+                lists[f"includes.{name}"] = includes[name]
+    tweets = [
+        t
+        for source in lists.values()
+        for t in source
+        if isinstance(t, dict) and "id" in t
+    ]
+    # Every post of the page, for the media that something else still uses (a retweet
+    # in ``data`` lists the media of the original in ``includes``).
+    everything = [
+        t
+        for source in (
+            response.get("data"),
+            *(
+                includes.get(n)
+                for n in INCLUDED_POST_KEYS
+                if isinstance(includes, dict)
+            ),
+        )
+        if isinstance(source, list)
+        for t in source
+        if isinstance(t, dict) and "id" in t
+    ]
+    gone = {str(t["id"]) for t in tweets} & {str(i) for i in tweet_ids}
+    if not gone:
+        return body, set()
+
+    def media_keys(tweets: list[Any]) -> set[str]:
+        return {
+            str(k)
+            for t in tweets
+            if isinstance(t, dict)
+            for k in (t.get("attachments") or {}).get("media_keys", ())
+        }
+
+    def keep(source: list[Any]) -> list[Any]:
+        return [
+            t for t in source if not (isinstance(t, dict) and str(t.get("id")) in gone)
+        ]
+
+    dropped = media_keys([t for t in tweets if str(t["id"]) in gone])
+    still_used = media_keys([t for t in everything if str(t["id"]) not in gone])
+    new_response: JSONObject = dict(response)
+    if "data" in lists:
+        new_response["data"] = keep(lists["data"])
+    if isinstance(includes, dict):
+        new_includes = dict(includes)
+        for name in INCLUDED_POST_KEYS:
+            if f"includes.{name}" in lists:
+                new_includes[name] = keep(lists[f"includes.{name}"])
+        if isinstance(includes.get("media"), list):
+            new_includes["media"] = [
+                m
+                for m in includes["media"]
+                if not (
+                    isinstance(m, dict)
+                    and str(m.get("media_key")) in dropped - still_used
+                )
+            ]
+        new_response["includes"] = new_includes
+    redacted = replace(
+        envelope,
+        response=new_response,
+        redactions=(
+            tuple(sorted({*envelope.redactions, *gone}))
+            if from_data
+            else envelope.redactions
+        ),
+    )
+    return redacted.to_bytes(), gone
 
 
 class RawPageStore:
