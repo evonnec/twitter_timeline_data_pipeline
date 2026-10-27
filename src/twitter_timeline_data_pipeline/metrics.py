@@ -78,6 +78,7 @@ UNITS: Final[Mapping[str, str]] = {
     "CompliancePurged": "Count",
     "ComplianceCopiesScrubbed": "Count",
     "CompliancePurgeDeferred": "Count",
+    "CompliancePurgeBacklog": "Count",
     "ComplianceUnknownAnswers": "Count",
 }
 

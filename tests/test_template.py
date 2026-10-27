@@ -1302,7 +1302,8 @@ def test_media_retry_record_failures_alarm_adds_only_the_reasons_that_do_not_hea
     props = alarm_props(template, "MediaRetryRecordFailuresAlarm")
 
     by_id = {m["Id"]: m for m in props["Metrics"]}
-    assert by_id["bad"]["Expression"] == "FILL(malformed, 0) + FILL(error, 0)"
+    # plain arithmetic: FILL with one evaluation period can miss a late datapoint
+    assert by_id["bad"]["Expression"] == "malformed + error"
     for reason in ("malformed", "error"):
         stat = by_id[reason]["MetricStat"]
         assert stat["Metric"]["Namespace"] == NAMESPACE
@@ -1361,6 +1362,8 @@ def test_the_default_namespace_is_per_stack_and_never_aws(template: Template) ->
     assert pattern.fullmatch("")
     assert pattern.fullmatch("Team/Twitter Pipeline-1.0_x#y:z")
     assert not pattern.fullmatch("AWS/Lambda")
+    assert not pattern.fullmatch("   ")  # only spaces is not a name
+    assert pattern.fullmatch("a b")
     assert not pattern.fullmatch("bad*char")
     assert not pattern.fullmatch("x" * 256)
     assert pattern.fullmatch("AWSome")  # only the AWS/ prefix is reserved
@@ -1378,3 +1381,26 @@ def test_every_alarm_in_the_metrics_namespace_uses_the_total(
     assert len(custom) >= 9
     for name, props in custom:
         assert "Dimensions" not in props, name  # the dimensionless set only
+
+
+def test_the_freshness_alarms_are_stack_outputs_for_the_deploy_script(
+    template: Template,
+) -> None:
+    outputs = template["Outputs"]
+
+    assert outputs["FetchFreshnessAlarmName"] == {
+        "Condition": "ScheduleIsEnabled",
+        "Value": {"Ref": "FetchFreshnessAlarm"},
+    }
+    assert outputs["ComplianceFreshnessAlarmName"] == {
+        "Condition": "ScheduleIsEnabled",
+        "Value": {"Ref": "ComplianceFreshnessAlarm"},
+    }
+    assert alarms(template)["FetchFreshnessAlarm"]["Condition"] == "ScheduleIsEnabled"
+
+
+def test_the_purge_backlog_is_a_metric_without_an_alarm(template: Template) -> None:
+    watched = {a["Properties"].get("MetricName") for a in alarms(template).values()}
+
+    assert "CompliancePurgeBacklog" not in watched
+    assert "CompliancePurgeBacklog" in emitted_metric_names()

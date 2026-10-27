@@ -126,7 +126,7 @@ Parameters:
     Type: String
     Default: ""
     # CloudWatch's character set, and never the reserved AWS/ prefix.
-    AllowedPattern: '^$|^(?!AWS/)[A-Za-z0-9._/#: -]{1,255}$'
+    AllowedPattern: '^$|^(?!AWS/)(?! +$)[A-Za-z0-9._/#: -]{1,255}$'
     ConstraintDescription: Up to 255 of letters, digits and . _ / # : - or space, not starting with AWS/.
     Description: >-
       CloudWatch namespace of the metrics the functions emit (Embedded Metric Format on
@@ -994,7 +994,7 @@ Resources:
         an unexpected error). It is redelivered and ends in the media-retry DLQ.
       Metrics:
         - Id: bad
-          Expression: FILL(malformed, 0) + FILL(error, 0)
+          Expression: malformed + error
           Label: malformed + error
           ReturnData: true
         - Id: malformed
@@ -1088,6 +1088,12 @@ Resources:
       AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref AWS::NoValue]
 
 Outputs:
+  FetchFreshnessAlarmName:
+    Condition: ScheduleIsEnabled
+    Value: !Ref FetchFreshnessAlarm
+  ComplianceFreshnessAlarmName:
+    Condition: ScheduleIsEnabled
+    Value: !Ref ComplianceFreshnessAlarm
   QueueUrl:
     Value: !Ref TweetsQueue
   DeadLetterQueueUrl:

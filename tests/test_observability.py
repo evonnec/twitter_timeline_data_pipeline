@@ -281,6 +281,7 @@ def test_units_are_the_declared_ones_on_every_line(
         [sqs_record("m", body(photo_message(GOOD)))],
         media_store=MediaStore(aws.s3, aws.bucket, cdn.client()),
         tweet_store=TweetStore(aws.tweets_table, aws.s3, aws.bucket),
+        now=lambda: LATER,
     )
 
     emf.read()
@@ -937,5 +938,169 @@ def test_apply_log_level_maps_the_template_values(value: str, level: int) -> Non
         handlers.apply_log_level({"LOG_LEVEL": "nonsense"})  # ignored
         handlers.apply_log_level({})
         assert package.level == level
+    finally:
+        package.setLevel(before)
+
+
+def test_a_redelivered_message_adds_no_lag_datapoint(
+    aws: Aws, cdn: CdnStub, emf: Emf
+) -> None:
+    process_records(
+        [
+            receives(sqs_record("first", body(make_message(GOOD))), "1"),
+            receives(sqs_record("again", body(make_message(NO_MEDIA))), "2"),
+        ],
+        media_store=MediaStore(aws.s3, aws.bucket, cdn.client()),
+        tweet_store=TweetStore(aws.tweets_table, aws.s3, aws.bucket),
+        now=lambda: LATER,
+    )
+
+    assert emf.one("TweetsStored") == 2
+    assert emf.one("ProcessingLagSeconds") == [30.0]  # only the first receive
+
+
+def test_a_message_fetched_over_a_day_ago_adds_no_lag_datapoint(
+    aws: Aws, cdn: CdnStub, emf: Emf
+) -> None:
+    process_records(
+        [sqs_record("replayed", body(make_message(GOOD)))],  # fetched_at 2026-10-25
+        media_store=MediaStore(aws.s3, aws.bucket, cdn.client()),
+        tweet_store=TweetStore(aws.tweets_table, aws.s3, aws.bucket),
+        now=lambda: LATER + timedelta(days=3),
+    )
+
+    assert emf.one("TweetsStored") == 1
+    assert emf.find("ProcessingLagSeconds") == []
+
+
+def test_purges_waiting_for_capacity_are_a_backlog_not_a_deferral(
+    aws: Aws, emf: Emf, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = Clock()
+    gone = put(aws, 1)
+    lookup = Lookup({gone: "deleted"})
+    compliance_run(aws, lookup, clock)
+    emf.reset()
+    clock.now += timedelta(hours=25)
+    monkeypatch.setattr(
+        "twitter_timeline_data_pipeline.handlers.compliance.MAX_CONFIRM_REQUESTS", 0
+    )
+
+    compliance_run(aws, lookup, clock)  # the cap leaves it for the next run
+
+    assert emf.one("CompliancePurgeBacklog") == 1
+    assert emf.one("CompliancePurgeDeferred") == 0  # nothing the alarm should see
+    assert emf.one("ComplianceRunSucceeded") == 1
+
+
+def test_an_unknown_confirmation_is_a_deferral_and_not_a_backlog(
+    aws: Aws, emf: Emf
+) -> None:
+    clock = Clock()
+    tweet_id = put(aws, 1)
+    compliance_run(aws, Lookup({tweet_id: "deleted"}), clock)
+    emf.reset()
+    clock.now += timedelta(hours=25)
+    failing = job(aws, Lookup(), clock)
+    failing._lookup = lambda chunk: (
+        TweetLookup(unknown=frozenset(chunk))
+        if len(chunk) == 1
+        else TweetLookup(unavailable=dict.fromkeys(chunk, "deleted"))
+    )
+
+    with pytest.raises(ComplianceError):
+        failing.run(HANDLE)
+
+    assert emf.one("CompliancePurgeDeferred") == 1
+    assert emf.one("CompliancePurgeBacklog") == 0
+
+
+def test_a_scan_that_makes_no_progress_is_a_failed_run_without_a_heartbeat(
+    aws: Aws, emf: Emf
+) -> None:
+    clock = Clock()
+    gone = put(aws, 1)
+    run_job = job(aws, Lookup({gone: "deleted"}), clock, grace=timedelta(0))
+
+    def stuck(*_a: Any, **_k: Any) -> Any:
+        raise ComplianceError(
+            "the scan for media held by other Tweets made no progress"
+        )
+
+    run_job._store.redact_raw = stuck  # type: ignore[method-assign]
+
+    with pytest.raises(ComplianceError, match="raw pages: ComplianceError"):
+        run_job.run(HANDLE)
+
+    assert emf.one("ComplianceRunSucceeded") == 0
+    assert emf.one("ComplianceFailures") >= 1
+
+
+def package_level(code: str, **env: str) -> str:
+    import os
+    import subprocess
+    import sys
+
+    base = {
+        k: v
+        for k, v in os.environ.items()
+        if not k.startswith(("LOG_LEVEL", "AWS_LAMBDA"))
+    }
+    out = subprocess.run(
+        [sys.executable, "-I", "-c", code],
+        env={**base, **env},
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return out.stdout.strip()
+
+
+PRINT_LEVEL = (
+    "import logging;import twitter_timeline_data_pipeline.handlers;"
+    "print(logging.getLogger('twitter_timeline_data_pipeline').level)"
+)
+
+
+def test_log_level_is_applied_when_the_handlers_are_imported_in_lambda() -> None:
+    assert (
+        package_level(PRINT_LEVEL, LOG_LEVEL="WARN", AWS_LAMBDA_FUNCTION_NAME="fn")
+        == "30"
+    )
+
+
+def test_log_level_is_not_applied_outside_lambda() -> None:
+    assert package_level(PRINT_LEVEL, LOG_LEVEL="WARN") == "0"
+
+
+def test_the_cli_log_level_wins_over_a_shell_log_level() -> None:
+    code = (
+        "import logging;from twitter_timeline_data_pipeline.cli import main;"
+        "main(['fetch','--username','x','--log-level','DEBUG']);"
+        "print(logging.getLogger().level, "
+        "logging.getLogger('twitter_timeline_data_pipeline').level)"
+    )
+
+    assert package_level(code, LOG_LEVEL="WARN") == "10 0"
+
+
+def test_importing_the_handlers_in_lambda_applies_the_log_level(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import importlib
+
+    from twitter_timeline_data_pipeline import handlers
+
+    package = logging.getLogger("twitter_timeline_data_pipeline")
+    before = package.level
+    monkeypatch.setenv("AWS_LAMBDA_FUNCTION_NAME", "fn")
+    monkeypatch.setenv("LOG_LEVEL", "ERROR")
+    try:
+        importlib.reload(handlers)
+        assert package.level == logging.ERROR
+        monkeypatch.delenv("AWS_LAMBDA_FUNCTION_NAME")
+        package.setLevel(logging.NOTSET)
+        importlib.reload(handlers)
+        assert package.level == logging.NOTSET  # outside Lambda: untouched
     finally:
         package.setLevel(before)

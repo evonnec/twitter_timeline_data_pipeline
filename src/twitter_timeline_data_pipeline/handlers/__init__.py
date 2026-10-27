@@ -37,4 +37,7 @@ def quiet_library_loggers() -> None:
 
 
 quiet_library_loggers()  # imported before either handler runs
-apply_log_level()
+if os.environ.get("AWS_LAMBDA_FUNCTION_NAME"):
+    # Only in Lambda: the CLI imports this package too, and its --log-level must win
+    # over a LOG_LEVEL that happens to be set in the shell.
+    apply_log_level()

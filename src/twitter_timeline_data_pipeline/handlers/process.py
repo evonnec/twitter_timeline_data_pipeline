@@ -163,10 +163,15 @@ class _Tally:
                 metrics.emit({name: count}, {"Reason": reason})
 
 
+MAX_LAG_SECONDS = 86_400
+"""A message fetched longer ago than this is a replay or a redrive, not a delay."""
+
+
 def _lag_seconds(fetched_at: str | None, now: datetime) -> float | None:
     """Seconds from the fetch that produced a message to ``now`` (None when it has no
-    usable time). Not from the Tweet's creation: a backfill or a DLQ redrive would
-    swamp that with the age of old Tweets."""
+    usable time, or when it is over a day old: a replay keeps the original
+    ``fetched_at`` and so does a redrive). Not from the Tweet's creation: a backfill
+    would swamp that with the age of old Tweets."""
     if not fetched_at:
         return None
     try:
@@ -175,7 +180,8 @@ def _lag_seconds(fetched_at: str | None, now: datetime) -> float | None:
         return None
     if fetched.tzinfo is None:
         return None
-    return max(0.0, (now - fetched).total_seconds())
+    lag = max(0.0, (now - fetched).total_seconds())
+    return lag if lag <= MAX_LAG_SECONDS else None
 
 
 def process_records(
@@ -382,7 +388,7 @@ def _process_pending(
             tally.add_media(stored)
             tally.missing += len(message.missing_media_keys)
             lag = _lag_seconds(message.fetched_at, now())
-            if lag is not None:
+            if lag is not None and _receive_count(record) <= 1:  # not a redelivery
                 tally.lags.append(lag)
             if retrying:
                 assert retry_queue is not None  # only the last receive collects any

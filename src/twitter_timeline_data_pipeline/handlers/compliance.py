@@ -1371,6 +1371,10 @@ class Compliance:
         self.cleared = 0
         self.purged = 0
         self.deferred = 0
+        self.backlog = 0
+        """Of ``deferred``, the purges that only wait for capacity (the per-run
+        confirmation cap, low time, raw pages still being redacted): a normal backlog,
+        not alarmed. The rest (an unknown answer, a failed lookup) is a failure."""
         self.swept = 0
         self.raw_pages_redacted = 0
         self.ref_raw_pages = 0
@@ -1444,7 +1448,8 @@ class Compliance:
                 "ComplianceCleared": self.cleared,
                 "CompliancePurged": self.purged,
                 "ComplianceCopiesScrubbed": self.copies_scrubbed,
-                "CompliancePurgeDeferred": self.deferred,
+                "CompliancePurgeDeferred": self.deferred - self.backlog,
+                "CompliancePurgeBacklog": self.backlog,
                 "ComplianceUnknownAnswers": self.unknown,
             }
         )
@@ -1721,6 +1726,7 @@ class Compliance:
             if number >= MAX_CONFIRM_REQUESTS or self._time_low():
                 # Not a failure: the rest is confirmed (and purged) in the next run.
                 self.deferred += len(due) - start
+                self.backlog += len(due) - start
                 logger.info(
                     "%d due tombstone(s) wait for the next run", len(due) - start
                 )
@@ -1819,6 +1825,7 @@ class Compliance:
                 tweet_id = str(item["tweet_id"])
                 if not result.covers({tweet_id}, _day(item)):
                     self.deferred += 1
+                    self.backlog += 1
                     logger.info(
                         "purge of tweet %s waits: raw pages are not yet redacted",
                         tweet_id,
