@@ -305,6 +305,7 @@ def test_a_media_retry_for_a_tombstoned_tweet_downloads_nothing(
         media_store=NoDownload(aws.s3, aws.bucket, None),  # type: ignore[arg-type]
         tweet_store=store,
         remaining_ms=None,
+        log={},
     )
 
     assert "is tombstoned" in caplog.text

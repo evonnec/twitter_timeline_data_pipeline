@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Self
 
 DEFAULT_X_API_BASE_URL = "https://api.x.com/2"
+DEFAULT_METRICS_NAMESPACE = "TwitterTimelinePipeline"
 DEFAULT_MAX_MEDIA_BYTES = 512 * 1024 * 1024
 DEFAULT_USER_ID_TTL_HOURS = 24.0
 MAX_USER_ID_TTL_HOURS = 8760.0  # one year
@@ -32,6 +33,9 @@ ENV_VARS: Mapping[str, str] = {
     "deletion_grace_hours": "DELETION_GRACE_HOURS",
     "expand_referenced_tweets": "EXPAND_REFERENCED_TWEETS",
     "request_entities": "REQUEST_ENTITIES",
+    "metrics_namespace": "METRICS_NAMESPACE",
+    "metrics_per_account": "METRICS_PER_ACCOUNT",
+    "log_level": "LOG_LEVEL",
 }
 
 _TRUE = frozenset({"1", "true", "yes", "on"})
@@ -86,6 +90,14 @@ class Settings:
     request_entities: bool = True
     """Ask the API for ``entities`` (expanded URLs, mentions, hashtags) and the other
     per-Tweet metadata fields."""
+    metrics_namespace: str = DEFAULT_METRICS_NAMESPACE
+    """CloudWatch namespace of the EMF metrics (``metrics.emit`` reads the same
+    variable itself, so a handler never needs the setting to emit)."""
+
+    metrics_per_account: bool = False
+    """Also emit the fetch metrics per ``Username`` (more CloudWatch series)."""
+    log_level: str = "INFO"
+    """Level of the package's Python loggers (see ``handlers.apply_log_level``)."""
 
     def __post_init__(self) -> None:
         if not 5 <= self.max_results <= 100:
@@ -190,6 +202,9 @@ class Settings:
             deletion_grace_hours=get_number("deletion_grace_hours", float, 24.0),
             expand_referenced_tweets=get_flag("expand_referenced_tweets", True),
             request_entities=get_flag("request_entities", True),
+            metrics_namespace=get("metrics_namespace") or DEFAULT_METRICS_NAMESPACE,
+            metrics_per_account=get_flag("metrics_per_account", False),
+            log_level=(get("log_level") or "INFO").upper(),
         )
 
     def require(self, *attrs: str) -> None:

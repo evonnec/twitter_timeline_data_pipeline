@@ -13,7 +13,7 @@ import random
 import re
 import time
 from collections.abc import Callable, Collection, Iterator, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from types import TracebackType
 from typing import Any, Self
 
@@ -494,6 +494,8 @@ class XClient:
             raw = RawPage(endpoint=endpoint, params=dict(params), body=body)
             try:
                 page = parse_timeline_page(body, raw=raw)
+                if errors:
+                    page = replace(page, partial_errors=len(errors))
             except Exception as exc:
                 # Page-level shape errors (a non-list ``data``): the caller lands the
                 # raw page before failing the run.

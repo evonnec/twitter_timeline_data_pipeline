@@ -63,9 +63,10 @@ Parameters:
     Type: Number
     Default: 5
     MinValue: 1
-    MaxValue: 1000
+    MaxValue: 800  # 800 x the 730 s visibility timeout is 6.8 days, well inside the 14-day retention
     Description: >-
-      Receives before a message moves to the dead-letter queue. On the last one the
+      Receives before a message moves to the dead-letter queue (at most 800, so it
+      reaches the queue long before the 14-day retention expires it). On the last one the
       Tweet is written even if its media keeps failing: that media is recorded as
       retrying and queued for the media-retry function. A record that fails some other
       way on its last receive still moves to the dead-letter queue.
@@ -73,10 +74,11 @@ Parameters:
     Type: Number
     Default: 10
     MinValue: 1
-    MaxValue: 1000
+    MaxValue: 100  # 100 x the 5,400 s visibility timeout is 6.3 days
     Description: >-
       Receives of a media-retry message before it moves to the media-retry dead-letter
-      queue (which has an alarm). Receives are at least the retry queue's visibility
+      queue (which has an alarm; at most 100, so it gets there before the 14-day
+      retention expires it). Receives are at least the retry queue's visibility
       timeout apart.
   RetentionDays:
     Type: Number
@@ -111,14 +113,74 @@ Parameters:
     Type: String
     Default: INFO
     AllowedValues: [DEBUG, INFO, WARN, ERROR]
+    Description: >-
+      Level of the functions' own log lines (applied in code as LOG_LEVEL). Lambda's
+      application log level stays at INFO (DEBUG for DEBUG) whatever this says: the
+      JSON log format files the EMF metric lines under INFO and would drop them at
+      WARN or ERROR.
   AlarmTopicArn:
     Type: String
     Default: ""
     Description: Optional SNS topic ARN notified by the alarms. Leave empty for none.
+  MetricsNamespace:
+    Type: String
+    Default: ""
+    # CloudWatch's character set, and never the reserved AWS/ prefix.
+    AllowedPattern: '^$|^(?!AWS/)(?! +$)[A-Za-z0-9._/#: -]{1,255}$'
+    ConstraintDescription: Up to 255 of letters, digits and . _ / # : - or space, not starting with AWS/.
+    Description: >-
+      CloudWatch namespace of the metrics the functions emit (Embedded Metric Format on
+      stdout). Empty (the default) uses TwitterTimelinePipeline/<stack name>, so stacks
+      in one account never share series.
+  MetricsPerAccount:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >-
+      Also emit the fetch metrics with a Username dimension. Each extra series costs
+      about $0.30 a month; the alarms use the totals either way.
+  QueueAgeAlarmSeconds:
+    Type: Number
+    Default: 3600
+    MinValue: 60
+    MaxValue: 604800  # 7 days: well before the 14-day retention
+    Description: >-
+      The alarm on the main queue fires when its oldest message is older than this
+      (seconds). Messages expire after 14 days, so this is the early warning.
+  FetchFreshnessHours:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 24
+    Description: >-
+      Hours without a successful fetch run before the freshness alarm fires. Set it to
+      twice the period of ScheduleExpression (at least 1; the default fits the default
+      rate(1 hour); this is not derived from the expression, so change both together).
+      The alarm only exists while ScheduleEnabled is true.
+  ComplianceFreshnessHours:
+    Type: Number
+    Default: 12
+    MinValue: 1
+    MaxValue: 24
+    Description: >-
+      Hours without a successful compliance run before its freshness alarm fires. Set
+      it to twice the period of ComplianceSchedule (the default fits rate(6 hours)).
+  RateLimitedRunsToAlarm:
+    Type: Number
+    Default: 3
+    MinValue: 1
+    MaxValue: 24
+    Description: >-
+      Consecutive hours that each had a fetch run stopped by a rate limit before the
+      sustained-rate-limit alarm fires (3 runs in a row with the default hourly schedule).
 
 Conditions:
   HasRetention: !Not [!Equals [!Ref RetentionDays, "0"]]
   HasAlarmTopic: !Not [!Equals [!Ref AlarmTopicArn, ""]]
+  HasMetricsNamespace: !Not [!Equals [!Ref MetricsNamespace, ""]]
+  # Lambda's JSON log format files unlevelled stdout lines (EMF metrics) under INFO and
+  # drops them when ApplicationLogLevel is above INFO, so it never goes above INFO.
+  LogLevelIsDebug: !Equals [!Ref LogLevel, DEBUG]
   # SAM treats any non-empty `Enabled` string as true, so map the parameter to State.
   ScheduleIsEnabled: !Equals [!Ref ScheduleEnabled, "true"]
 
@@ -130,7 +192,7 @@ Globals:
     CodeUri: build/lambda/  # pre-built by scripts/build_lambda.sh; no `sam build` step
     LoggingConfig:
       LogFormat: JSON
-      ApplicationLogLevel: !Ref LogLevel
+      ApplicationLogLevel: !If [LogLevelIsDebug, DEBUG, INFO]
       SystemLogLevel: WARN
 
 Resources:
@@ -298,6 +360,9 @@ Resources:
     Properties:
       QueueName: !Sub "${AWS::StackName}-tweets"  # fixed so the DLQ can name it
       SqsManagedSseEnabled: true
+      # The SQS maximum (default is 4 days): a long stall must not expire messages
+      # before processing or the dead-letter queue ever sees them.
+      MessageRetentionPeriod: 1209600  # 14 days
       # 6 x ProcessFunction timeout (120 s) + its 10 s batching window, per AWS guidance
       # for SQS event sources.
       VisibilityTimeout: 730
@@ -371,6 +436,9 @@ Resources:
         LogGroup: !Ref FetchFunctionLogGroup
       Environment:
         Variables:
+          METRICS_NAMESPACE: !If [HasMetricsNamespace, !Ref MetricsNamespace, !Sub "TwitterTimelinePipeline/${AWS::StackName}"]
+          LOG_LEVEL: !Ref LogLevel
+          METRICS_PER_ACCOUNT: !Ref MetricsPerAccount
           TWITTER_USERNAME: !Ref TwitterUsername
           BEARER_TOKEN_SECRET_ARN: !Ref BearerTokenSecret
           QUEUE_URL: !Ref TweetsQueue
@@ -420,6 +488,8 @@ Resources:
         LogGroup: !Ref ProcessFunctionLogGroup
       Environment:
         Variables:
+          METRICS_NAMESPACE: !If [HasMetricsNamespace, !Ref MetricsNamespace, !Sub "TwitterTimelinePipeline/${AWS::StackName}"]
+          LOG_LEVEL: !Ref LogLevel
           TWEETS_TABLE: !Ref TweetsTable
           MEDIA_BUCKET: !Ref MediaBucket
           MAX_MEDIA_BYTES: !Ref MaxMediaBytes
@@ -474,6 +544,8 @@ Resources:
         LogGroup: !Ref MediaRetryFunctionLogGroup
       Environment:
         Variables:
+          METRICS_NAMESPACE: !If [HasMetricsNamespace, !Ref MetricsNamespace, !Sub "TwitterTimelinePipeline/${AWS::StackName}"]
+          LOG_LEVEL: !Ref LogLevel
           TWEETS_TABLE: !Ref TweetsTable
           MEDIA_BUCKET: !Ref MediaBucket
           MAX_MEDIA_BYTES: !Ref MaxMediaBytes
@@ -516,6 +588,8 @@ Resources:
         LogGroup: !Ref ComplianceFunctionLogGroup
       Environment:
         Variables:
+          METRICS_NAMESPACE: !If [HasMetricsNamespace, !Ref MetricsNamespace, !Sub "TwitterTimelinePipeline/${AWS::StackName}"]
+          LOG_LEVEL: !Ref LogLevel
           TWITTER_USERNAME: !Ref TwitterUsername
           BEARER_TOKEN_SECRET_ARN: !Ref BearerTokenSecret
           TWEETS_TABLE: !Ref TweetsTable
@@ -685,7 +759,341 @@ Resources:
       TreatMissingData: notBreaching
       AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref AWS::NoValue]
 
+  # --- Alarms on the metrics the functions emit (see README, Observability) --------
+  RecordFailuresAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: >-
+        A record failed in a way that ends in the dead-letter queue (malformed, an unexpected
+        error, or a media-retry message that could not be queued). Not a Lambda error: the
+        batch response reports it. Self-healing retries are the separate RecordRetries metric.
+      Namespace: !If [HasMetricsNamespace, !Ref MetricsNamespace, !Sub "TwitterTimelinePipeline/${AWS::StackName}"]
+      MetricName: RecordFailures
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref AWS::NoValue]
+
+  IdentityChangedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: >-
+        The handle resolved to a different user ID than the one stored: the account was
+        renamed or the handle taken over. Nothing was ingested; the fetch run failed.
+      Namespace: !If [HasMetricsNamespace, !Ref MetricsNamespace, !Sub "TwitterTimelinePipeline/${AWS::StackName}"]
+      MetricName: IdentityChanged
+      Statistic: Sum
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref AWS::NoValue]
+
+  QuarantinedItemsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: >-
+        Items that could not be parsed, or messages SQS rejected, were quarantined. Nothing
+        is lost (raw/ and quarantine/ hold them) but the parser or the data needs a look.
+      Namespace: !If [HasMetricsNamespace, !Ref MetricsNamespace, !Sub "TwitterTimelinePipeline/${AWS::StackName}"]
+      MetricName: QuarantinedItems
+      Statistic: Sum
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref AWS::NoValue]
+
+  WriteContentionAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: >-
+        A Tweet write lost its optimistic-lock race three times; the record is retried.
+        Repeated contention means two writers keep changing the same item.
+      Namespace: !If [HasMetricsNamespace, !Ref MetricsNamespace, !Sub "TwitterTimelinePipeline/${AWS::StackName}"]
+      MetricName: WriteContentionErrors
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref AWS::NoValue]
+
+  GapsDroppedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: >-
+        WARNING: a gap in the timeline was dropped as out of the API's reach (empty three
+        times over 24 hours). Tweets in that range, if any, were never fetched.
+      Namespace: !If [HasMetricsNamespace, !Ref MetricsNamespace, !Sub "TwitterTimelinePipeline/${AWS::StackName}"]
+      MetricName: GapsDropped
+      Statistic: Sum
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref AWS::NoValue]
+
+  RateLimitedRunsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: >-
+        Fetch runs were stopped by an X API rate limit in several hours in a row
+        (RateLimitedRunsToAlarm). Progress is saved, but the backlog is not shrinking.
+      Namespace: !If [HasMetricsNamespace, !Ref MetricsNamespace, !Sub "TwitterTimelinePipeline/${AWS::StackName}"]
+      MetricName: RateLimitedRuns
+      Statistic: Sum
+      Period: 3600
+      EvaluationPeriods: !Ref RateLimitedRunsToAlarm
+      DatapointsToAlarm: !Ref RateLimitedRunsToAlarm
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref AWS::NoValue]
+
+  FetchFreshnessAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: ScheduleIsEnabled
+    Properties:
+      AlarmDescription: >-
+        No fetch run completed successfully for FetchFreshnessHours: the schedule is stopped,
+        the function keeps failing, or every run hit a rate limit. Missing data breaches.
+      Namespace: !If [HasMetricsNamespace, !Ref MetricsNamespace, !Sub "TwitterTimelinePipeline/${AWS::StackName}"]
+      MetricName: FetchRunSucceeded
+      Statistic: Sum
+      Period: 3600
+      EvaluationPeriods: !Ref FetchFreshnessHours
+      DatapointsToAlarm: !Ref FetchFreshnessHours
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref AWS::NoValue]
+
+  ComplianceFreshnessAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: ScheduleIsEnabled
+    Properties:
+      AlarmDescription: >-
+        No compliance run completed successfully for ComplianceFreshnessHours: deletions at
+        the source are not being propagated. Missing data breaches.
+      Namespace: !If [HasMetricsNamespace, !Ref MetricsNamespace, !Sub "TwitterTimelinePipeline/${AWS::StackName}"]
+      MetricName: ComplianceRunSucceeded
+      Statistic: Sum
+      Period: 3600
+      EvaluationPeriods: !Ref ComplianceFreshnessHours
+      DatapointsToAlarm: !Ref ComplianceFreshnessHours
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref AWS::NoValue]
+
+  CompliancePurgeDeferredAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: >-
+        (Sized for a compliance schedule of 6 hours or faster.) A purge was deferred in two consecutive 6-hour periods: the API gave no certain answer,
+        a confirmation lookup failed, or raw pages could not be redacted. Nothing was purged.
+      Namespace: !If [HasMetricsNamespace, !Ref MetricsNamespace, !Sub "TwitterTimelinePipeline/${AWS::StackName}"]
+      MetricName: CompliancePurgeDeferred
+      Statistic: Sum
+      Period: 21600
+      EvaluationPeriods: 2
+      DatapointsToAlarm: 2
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref AWS::NoValue]
+
+  TweetsQueueAgeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: >-
+        The oldest message in the main queue is older than QueueAgeAlarmSeconds: processing is
+        stalled. Messages expire after 14 days.
+      Namespace: AWS/SQS
+      MetricName: ApproximateAgeOfOldestMessage
+      Dimensions:
+        - {Name: QueueName, Value: !GetAtt TweetsQueue.QueueName}
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: !Ref QueueAgeAlarmSeconds
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref AWS::NoValue]
+
+  DeadLetterQueueAgeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: >-
+        The oldest message in the dead-letter queue is over 7 days old; it expires after 14
+        (its age counts from the move, the expiry from the first send). Redrive or archive it now.
+      Namespace: AWS/SQS
+      MetricName: ApproximateAgeOfOldestMessage
+      Dimensions:
+        - {Name: QueueName, Value: !GetAtt TweetsDeadLetterQueue.QueueName}
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 604800
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref AWS::NoValue]
+
+  MediaRetryDeadLetterQueueAgeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: >-
+        The oldest message in the media-retry dead-letter queue is over 7 days old; it expires
+        after 14 (its age counts from the move). Redrive it or store the media by hand now.
+      Namespace: AWS/SQS
+      MetricName: ApproximateAgeOfOldestMessage
+      Dimensions:
+        - {Name: QueueName, Value: !GetAtt MediaRetryDeadLetterQueue.QueueName}
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 604800
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref AWS::NoValue]
+
+  MediaRetryQueueAgeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: >-
+        The oldest message in the media-retry queue is over a day old: the media-retry
+        function is stalled (a message reaches the DLQ after MediaRetryMaxReceiveCount
+        receives, 5,400 s apart at least).
+      Namespace: AWS/SQS
+      MetricName: ApproximateAgeOfOldestMessage
+      Dimensions:
+        - {Name: QueueName, Value: !GetAtt MediaRetryQueue.QueueName}
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 86400
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref AWS::NoValue]
+
+  # malformed and error never heal by themselves; transient failures do, so the alarm
+  # adds up just those two reasons.
+  MediaRetryRecordFailuresAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: >-
+        A media-retry record failed in a way that will not heal by itself (malformed or
+        an unexpected error). It is redelivered and ends in the media-retry DLQ.
+      Metrics:
+        - Id: bad
+          Expression: malformed + error
+          Label: malformed + error
+          ReturnData: true
+        - Id: malformed
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: !If [HasMetricsNamespace, !Ref MetricsNamespace, !Sub "TwitterTimelinePipeline/${AWS::StackName}"]
+              MetricName: MediaRetryFailures
+              Dimensions:
+                - {Name: Reason, Value: malformed}
+            Period: 300
+            Stat: Sum
+        - Id: error
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: !If [HasMetricsNamespace, !Ref MetricsNamespace, !Sub "TwitterTimelinePipeline/${AWS::StackName}"]
+              MetricName: MediaRetryFailures
+              Dimensions:
+                - {Name: Reason, Value: error}
+            Period: 300
+            Stat: Sum
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref AWS::NoValue]
+
+  FetchFunctionThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Invocations of FetchFunction were throttled (concurrency limit reached).
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions:
+        - {Name: FunctionName, Value: !Ref FetchFunction}
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref AWS::NoValue]
+
+  ProcessFunctionThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Invocations of ProcessFunction were throttled (concurrency limit reached).
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions:
+        - {Name: FunctionName, Value: !Ref ProcessFunction}
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref AWS::NoValue]
+
+  MediaRetryFunctionThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Invocations of MediaRetryFunction were throttled (concurrency limit reached).
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions:
+        - {Name: FunctionName, Value: !Ref MediaRetryFunction}
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref AWS::NoValue]
+
+  ComplianceFunctionThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Invocations of ComplianceFunction were throttled (concurrency limit reached).
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions:
+        - {Name: FunctionName, Value: !Ref ComplianceFunction}
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref AWS::NoValue]
+
 Outputs:
+  FetchFreshnessAlarmName:
+    Condition: ScheduleIsEnabled
+    Value: !Ref FetchFreshnessAlarm
+  ComplianceFreshnessAlarmName:
+    Condition: ScheduleIsEnabled
+    Value: !Ref ComplianceFreshnessAlarm
   QueueUrl:
     Value: !Ref TweetsQueue
   DeadLetterQueueUrl:

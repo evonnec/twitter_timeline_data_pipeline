@@ -17,6 +17,7 @@ Run as a script, it writes ``resources.json`` and one ``<function>.env`` per fun
 
 import argparse
 import json
+import re
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -34,6 +35,7 @@ if TYPE_CHECKING:
 
 TEMPLATE = Path(__file__).resolve().parents[2] / "template.yaml"
 ACCOUNT_ID = "000000000000"  # LocalStack's default account
+STACK_NAME = "it"  # what ${AWS::StackName} stands for in the functions' variables
 FUNCTIONS = ("FetchFunction", "ProcessFunction", "MediaRetryFunction")
 MEDIA_HOST_OVERRIDE = "host.docker.internal"
 VISIBILITY_TIMEOUT_SECONDS = 2
@@ -206,12 +208,13 @@ def function_env(
     internal_endpoint: str,
     stub_url_internal: str,
 ) -> dict[str, str]:
-    """The function's environment: its template variables with every ``!Ref`` resolved
-    against ``resources``, plus the test wiring (endpoint, fake credentials, stub X API,
-    media host override).
+    """The function's environment: its template variables with every ``!Ref``,
+    ``!If`` and ``!Sub`` resolved against ``resources`` and the parameter defaults,
+    plus the test wiring (endpoint, fake credentials, stub X API, media host override).
 
-    Raises ``KeyError`` for a ``!Ref`` this module can't resolve, so a new variable in
-    the template can't silently go missing from the integration run.
+    Raises ``KeyError`` for a reference or intrinsic function this module can't
+    resolve, so a new variable in the template can't silently go missing from the
+    integration run.
     """
 
     def queue_url(queue: Queue) -> str:
@@ -233,15 +236,47 @@ def function_env(
             # Parameters that a test sets to another value than the default.
             "TwitterUsername": USERNAME,
             "MaxReceiveCount": str(resources.max_receive_count),
+            "AWS::AccountId": ACCOUNT_ID,
+            "AWS::Region": resources.region,
+            "AWS::StackName": STACK_NAME,
         }
     )
+    conditions: Mapping[str, Any] = template.get("Conditions", {})
+
+    def resolve(value: Any) -> str:
+        if not isinstance(value, Mapping):
+            return str(value)
+        ((intrinsic, argument),) = value.items()
+        match intrinsic:
+            case "Ref":
+                return refs[argument]
+            case "Fn::If":
+                condition, if_true, if_false = argument
+                return resolve(if_true if holds(conditions[condition]) else if_false)
+            case "Fn::Sub" if isinstance(argument, str):
+                return re.sub(r"\$\{([^!}][^}]*)\}", lambda m: refs[m[1]], argument)
+        raise KeyError(intrinsic)
+
+    def holds(condition: Mapping[str, Any]) -> bool:
+        ((intrinsic, argument),) = condition.items()
+        match intrinsic:
+            case "Fn::Equals":
+                left, right = argument
+                return resolve(left) == resolve(right)
+            case "Fn::Not":
+                return not holds(argument[0])
+            case "Fn::And":
+                return all(holds(c) for c in argument)
+            case "Fn::Or":
+                return any(holds(c) for c in argument)
+            case "Condition":
+                return holds(conditions[argument])
+        raise KeyError(intrinsic)
+
     variables = template["Resources"][function]["Properties"]["Environment"][
         "Variables"
     ]
-    env = {
-        key: refs[value["Ref"]] if isinstance(value, Mapping) else str(value)
-        for key, value in variables.items()
-    }
+    env = {key: resolve(value) for key, value in variables.items()}
     env.update(
         {
             "AWS_ENDPOINT_URL": internal_endpoint,

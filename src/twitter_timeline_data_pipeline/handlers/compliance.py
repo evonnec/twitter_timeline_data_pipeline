@@ -66,6 +66,7 @@ import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
 
+from twitter_timeline_data_pipeline import metrics
 from twitter_timeline_data_pipeline.config import Settings
 from twitter_timeline_data_pipeline.credentials import clear_cache, get_bearer_token
 from twitter_timeline_data_pipeline.models import utc_now_iso
@@ -1370,6 +1371,10 @@ class Compliance:
         self.cleared = 0
         self.purged = 0
         self.deferred = 0
+        self.backlog = 0
+        """Of ``deferred``, the purges that only wait for capacity (the per-run
+        confirmation cap, low time, raw pages still being redacted): a normal backlog,
+        not alarmed. The rest (an unknown answer, a failed lookup) is a failure."""
         self.swept = 0
         self.raw_pages_redacted = 0
         self.ref_raw_pages = 0
@@ -1427,8 +1432,27 @@ class Compliance:
             self.deferred,
             self.swept,
         )
+        self._emit_metrics()
         if self.failures:
             raise ComplianceError("; ".join(self.failures))
+
+    def _emit_metrics(self) -> None:
+        """One EMF line per run. ``ComplianceRunSucceeded`` (the heartbeat the freshness
+        alarm watches) is 1 only when no step failed; the run then raises, or not."""
+        metrics.emit(
+            {
+                "ComplianceRunSucceeded": int(not self.failures),
+                "ComplianceFailures": len(self.failures),
+                "ComplianceChecked": self.checked,
+                "ComplianceTombstoned": self.tombstoned,
+                "ComplianceCleared": self.cleared,
+                "CompliancePurged": self.purged,
+                "ComplianceCopiesScrubbed": self.copies_scrubbed,
+                "CompliancePurgeDeferred": self.deferred - self.backlog,
+                "CompliancePurgeBacklog": self.backlog,
+                "ComplianceUnknownAnswers": self.unknown,
+            }
+        )
 
     def _time_low(self) -> bool:
         return (
@@ -1675,12 +1699,17 @@ class Compliance:
                     tweet_id,
                     reason,
                     now,
+                    extra={"tweet_id": tweet_id},
                 )
         for tweet_id in result.present:
             if tweet_id in tombstones and self._store.clear_tombstone(tweet_id):
                 del tombstones[tweet_id]
                 self.cleared += 1
-                logger.info("tweet %s is available again: tombstone cleared", tweet_id)
+                logger.info(
+                    "tweet %s is available again: tombstone cleared",
+                    tweet_id,
+                    extra={"tweet_id": tweet_id},
+                )
         if result.unknown:
             self.unknown += len(result.unknown)
             logger.info(
@@ -1697,6 +1726,7 @@ class Compliance:
             if number >= MAX_CONFIRM_REQUESTS or self._time_low():
                 # Not a failure: the rest is confirmed (and purged) in the next run.
                 self.deferred += len(due) - start
+                self.backlog += len(due) - start
                 logger.info(
                     "%d due tombstone(s) wait for the next run", len(due) - start
                 )
@@ -1719,6 +1749,7 @@ class Compliance:
                         "tweet %s is available again: tombstone cleared before its "
                         "purge",
                         tweet_id,
+                        extra={"tweet_id": tweet_id},
                     )
             confirmed += [i for i in chunk if i in result.unavailable]
             unsure = [i for i in chunk if i in result.unknown]
@@ -1794,6 +1825,7 @@ class Compliance:
                 tweet_id = str(item["tweet_id"])
                 if not result.covers({tweet_id}, _day(item)):
                     self.deferred += 1
+                    self.backlog += 1
                     logger.info(
                         "purge of tweet %s waits: raw pages are not yet redacted",
                         tweet_id,
@@ -1829,6 +1861,7 @@ class Compliance:
             result.pages,
             result.quarantined,
             item["deleted_at"],
+            extra={"tweet_id": tweet_id},
         )
 
     def _sweep(self, sweeping: Mapping[str, str]) -> None:
