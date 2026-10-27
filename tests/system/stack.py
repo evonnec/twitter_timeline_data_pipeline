@@ -383,7 +383,7 @@ class _Deployer:
         if props:
             raise TemplateError(f"{logical_id}: unsupported properties {sorted(props)}")
         self.dynamodb.create_table(**request)
-        if ttl:
+        if ttl and ttl.get("Enabled"):
             self.dynamodb.update_time_to_live(
                 TableName=name, TimeToLiveSpecification=ttl
             )

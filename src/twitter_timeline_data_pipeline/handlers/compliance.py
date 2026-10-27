@@ -94,10 +94,16 @@ CURSOR_PREFIX = "compliance#"
 # State-table keys: the walk's cursor, and the progress of a raw-page redaction.
 SCAN_CURSOR = "#scan"
 REDACT_PREFIX = "compliance#redact#"
+ACTIVE_UNITS = REDACT_PREFIX + "active"
+# Most IDs (and holder items) one redaction batch takes: its state stays far below
+# DynamoDB's 400 KB item limit; the rest wait for the next batch.
+BATCH_CAP = 1000
 # The function's IAM policy only allows these prefixes.
 ALLOWED_KEY_PREFIXES = ("media/", "text/")
 # Items read per scan request.
 SCAN_PAGE = 100
+# Requests of purge confirmation (100 IDs each) one run makes; the rest waits.
+MAX_CONFIRM_REQUESTS = 5
 # A Tweet lists at most one referenced post per type, plus its own ID.
 MAX_IDS_PER_ITEM = 4
 # Pages between two saves of a redaction's progress.
@@ -169,6 +175,38 @@ def _mentions(body: bytes, ids: Collection[str]) -> bool:
     return any(i.encode() in c for c in candidates for i in ids)
 
 
+class _OutOfTime(Exception):
+    """A long read stopped for lack of time: the batch goes on in the next run."""
+
+
+def _strip_message_copies(document: dict[str, Any], ids: Collection[str]) -> Any:
+    """The quarantined ``message`` without the copies of the posts ``ids`` in its
+    ``referenced`` (only the ID, type and unavailable status stay); None if it holds
+    none, or is not a message."""
+    item = document.get("item")
+    if document.get("kind") != "message" or not isinstance(item, dict):
+        return None
+    refs = item.get("referenced")
+    if not isinstance(refs, list):
+        return None
+    changed = False
+    stripped: list[Any] = []
+    content = ("text", "note_text", "author_id", "author_username", "created_at")
+    for ref in refs:
+        if (
+            isinstance(ref, dict)
+            and str(ref.get("id")) in ids
+            and any(ref.get(k) for k in (*content, "entities"))
+        ):
+            keep = ("id", "type", "unavailable_reason", "unavailable_since")
+            ref = {k: ref[k] for k in keep if ref.get(k)} | {"status": "unavailable"}
+            changed = True
+        stripped.append(ref)
+    if not changed:
+        return None
+    return {**document, "item": {**item, "referenced": stripped}}
+
+
 @dataclass(frozen=True, slots=True)
 class RedactResult:
     """Where a raw-page redaction stands: ``done`` when every page of ``ids`` from
@@ -179,6 +217,7 @@ class RedactResult:
     first_day: str
     pages: int = 0
     quarantined: int = 0
+    holders: tuple[str, ...] = ()
 
     def covers(self, ids: Collection[str], first_day: str) -> bool:
         return self.done and set(ids) <= self.ids and first_day >= self.first_day
@@ -188,8 +227,14 @@ class ComplianceStore:
     """The DynamoDB and S3 operations of the compliance job."""
 
     def __init__(
-        self, tweets: Table, state: Table, s3_client: S3Client, bucket: str
+        self,
+        tweets: Table,
+        state: Table,
+        s3_client: S3Client,
+        bucket: str,
+        retention_days: int = 0,
     ) -> None:
+        self._retention_days = retention_days
         self._tweets = tweets
         self._state = state
         self._s3 = s3_client
@@ -310,19 +355,34 @@ class ComplianceStore:
         return True
 
     def clear_tombstone(self, tweet_id: str) -> bool:
-        """Remove the tombstone (and a ``purging`` marker) of a Tweet that is not yet
-        purged, whatever its age; True if one was removed."""
+        """Remove the tombstone of a Tweet that is not yet purging or purged, whatever
+        its age; True if one was removed. Once a purge has begun it is not undone (the
+        post was confirmed gone right before it began). With retention on, the item
+        gets its ``expires_at`` back, from ``first_stored_at``."""
+        update = "REMOVE deleted_at, deletion_reason, tombstone ADD revision :one"
+        condition = (
+            "attribute_exists(deleted_at) AND attribute_not_exists(purged_at) "
+            "AND attribute_not_exists(purging)"
+        )
+        values: dict[str, Any] = {":one": 1}
+        if self._retention_days > 0:
+            item = self.load_item(tweet_id)
+            if item is None:
+                return False
+            lock, lock_values = self._lock(item)
+            condition += f" AND {lock}"
+            values |= lock_values
+            first = item.get("first_stored_at") or item.get("stored_at")
+            if first:
+                stored = datetime.fromisoformat(str(first)).timestamp()
+                values[":expires"] = int(stored) + self._retention_days * 86_400
+                update = "SET expires_at = :expires " + update
         try:
             self._tweets.update_item(
                 Key={"tweet_id": tweet_id},
-                UpdateExpression=(
-                    "REMOVE deleted_at, deletion_reason, tombstone, purging "
-                    "ADD revision :one"
-                ),
-                ConditionExpression=(
-                    "attribute_exists(deleted_at) AND attribute_not_exists(purged_at)"
-                ),
-                ExpressionAttributeValues={":one": 1},
+                UpdateExpression=update,
+                ConditionExpression=condition,
+                ExpressionAttributeValues=values,
             )
         except ClientError as exc:
             if _is_conditional_failure(exc):
@@ -447,6 +507,68 @@ class ComplianceStore:
                 return None
             raise
 
+    # --- redaction batches ---------------------------------------------------------
+    #
+    # A batch is the unit of a resumable redaction: the IDs to remove, where in the raw
+    # and quarantine listings it stands, the holder items to scrub once it is done (a
+    # copy batch) and the page keys whose older versions are still to be deleted. It
+    # lives in the state table under ``compliance#redact#<unit>`` (at most BATCH_CAP IDs
+    # and holders, so it stays far below DynamoDB's 400 KB); the units of copy batches
+    # are listed in ``compliance#redact#active`` so every run goes on with them.
+
+    def _put_state(self, state: Mapping[str, Any], **changes: Any) -> dict[str, Any]:
+        saved = {**state, **changes, "updated_at": utc_now_iso()}
+        self._state.put_item(Item=saved)
+        return saved
+
+    def active_units(self) -> list[str]:
+        record = self._load_state(ACTIVE_UNITS)
+        return [] if record is None else [str(u) for u in record.get("units", ())]
+
+    def _set_active(self, unit: str, active: bool) -> None:
+        units = [u for u in self.active_units() if u != unit]
+        self._put_state(
+            {"username": ACTIVE_UNITS}, units=[*units, unit] if active else units
+        )
+
+    def load_batch(self, unit: str) -> dict[str, Any] | None:
+        return self._load_state(REDACT_PREFIX + unit)
+
+    def start_batch(
+        self,
+        unit: str,
+        *,
+        mode: str,
+        author: str | None,
+        ids: Collection[str],
+        first_day: str,
+        holders: Collection[str] = (),
+        explicit: Collection[str] = (),
+        media_keys: Collection[str] = (),
+    ) -> dict[str, Any]:
+        """Create the batch of ``unit`` (``mode`` ``own``: a purge, ``copy``: a scrub of
+        copies; at most BATCH_CAP IDs and holders, the rest wait for the next batch)."""
+        state = {
+            "username": REDACT_PREFIX + unit,
+            "mode": mode,
+            "author": author,
+            "ids": sorted({str(i) for i in ids})[:BATCH_CAP],
+            "holders": sorted({str(h) for h in holders})[:BATCH_CAP],
+            "explicit": sorted({str(k) for k in explicit})[:BATCH_CAP],
+            "media_keys": sorted({str(k) for k in media_keys})[: 4 * BATCH_CAP],
+            "first_day": first_day,
+            "pending_versions": [],
+            "complete": False,
+        }
+        saved = self._put_state(state)
+        if mode == "copy":
+            self._set_active(unit, True)
+        return saved
+
+    def finish_batch(self, unit: str) -> None:
+        """A copy batch is done and its holders are scrubbed: it is no longer active."""
+        self._set_active(unit, False)
+
     def redact_raw(
         self,
         unit: str,
@@ -455,83 +577,124 @@ class ComplianceStore:
         *,
         first_day: str,
         author: str | None,
-        from_data: bool = True,
-        kinds: Collection[str] | None = None,
         media_keys: Collection[str] = (),
         stop: Callable[[], bool] = lambda: False,
     ) -> RedactResult:
-        """Remove the Tweets ``ids`` from the raw pages (and quarantine) that hold them.
-
-        The pages of each item's ``raw_key`` are always done. The rest are found by
-        listing ``raw/<author>/`` from ``first_day`` (a re-fetch lands the same Tweet
-        in more than one page, and a Tweet that is quoted by a later one is held in
-        ``includes`` of that one's pages: there is no upper day) and the same under
-        ``quarantine/``. A page is rewritten without the Tweets and, with
-        ``from_data``, with their IDs in ``redactions`` (so a replay skips them),
-        put back with ``If-Match`` on the ETag that was read, and the versions older
-        than the new one are deleted. Quarantine objects are matched by their real
-        shape (``item.id`` of a ``tweet`` or ``included_tweet``, ``item.tweet.id`` of
-        a ``message``, the top-level ``tweet_id`` newer writers add, and ``media`` by
-        the ``media_keys`` of the doomed Tweets unless another stored Tweet lists the
-        key); ``kinds`` restricts which kinds are deleted.
-
-        Resumable: the listing's position is kept in the state table under ``unit``
-        and saved every ``PROGRESS_EVERY`` pages and when ``stop()`` says time is up
-        (then the result is not ``done``). A batch in progress is finished first
-        (whatever ``ids`` the caller now asks for, see ``RedactResult.covers``); a
-        finished one that covers the request is not repeated.
-
-        A page that can't be parsed but contains one of the IDs raises
-        ``ComplianceError``: the Tweet is never marked purged with its content left.
-        """
+        """The batch of a purge (``own`` mode): remove the Tweets ``ids`` from the raw
+        pages and quarantine that hold them, going on with the batch already in
+        progress for ``unit`` first (whatever ``ids`` the caller now asks for: see
+        ``RedactResult.covers``), reusing a finished one that covers the request, and
+        starting a new one otherwise. See ``advance`` for what a batch does."""
         wanted = {str(i) for i in ids}
-        pages = quarantined = 0
-        for key in sorted(
-            {
+        state = self.load_batch(unit)
+        if state is not None and not state.get("complete"):
+            pass  # finish the batch in progress
+        elif (
+            state is not None
+            and state.get("mode") == "own"
+            and wanted <= {str(i) for i in state["ids"]}
+            and first_day >= str(state["first_day"])
+        ):
+            return self._result(state, done=True)
+        else:
+            explicit = {
                 k
                 for i in items
                 if isinstance(k := i.get("raw_key"), str) and k.startswith("raw/")
             }
-        ):
-            pages += self._redact_page(key, wanted, from_data)
-        loaded = self._load_state(REDACT_PREFIX + unit)
-        state: dict[str, Any]
-        if loaded is not None and not loaded.get("complete"):
-            state = loaded
-            work = {str(i) for i in state["ids"]}  # finish the batch in progress
-            first = str(state["first_day"])
-        elif (
-            loaded is not None
-            and wanted <= {str(i) for i in loaded["ids"]}
-            and first_day >= str(loaded["first_day"])
-        ):
-            return RedactResult(
-                True, frozenset(str(i) for i in loaded["ids"]), str(loaded["first_day"])
+            self.start_batch(
+                unit,
+                mode="own",
+                author=author,
+                ids=wanted,
+                first_day=first_day,
+                explicit=explicit,
+                media_keys=media_keys,
             )
-        else:
-            work, first = wanted, first_day
-            state = {
-                "username": REDACT_PREFIX + unit,
-                "ids": sorted(work),
-                "first_day": first,
-                "complete": False,
-            }
+        result = self.advance(unit, stop=stop)
+        assert result is not None  # the batch was just saved
+        return result
+
+    @staticmethod
+    def _result(
+        state: Mapping[str, Any], *, done: bool, pages: int = 0, quarantined: int = 0
+    ) -> RedactResult:
+        return RedactResult(
+            done,
+            frozenset(str(i) for i in state["ids"]),
+            str(state["first_day"]),
+            pages,
+            quarantined,
+            tuple(str(h) for h in state.get("holders", ())),
+        )
+
+    def advance(
+        self, unit: str, *, stop: Callable[[], bool] = lambda: False
+    ) -> RedactResult | None:
+        """Go on with the batch of ``unit`` (None if there is none).
+
+        First the older versions of the pages it rewrote before are deleted
+        (``pending_versions``: a failure after a redacted put must not keep the
+        unredacted version). Then the pages named by the holders' ``raw_key``; then
+        the listing of ``raw/<author>/`` from ``first_day`` (a re-fetch lands the same
+        Tweet in more than one page, and a Tweet that is quoted by a later one is held
+        in ``includes`` of that one's pages: there is no upper day), and the same
+        under ``quarantine/``. A page is rewritten without the Tweets (an ``own``
+        batch also from ``data``, with the IDs added to ``redactions`` so a replay
+        skips them), put back with ``If-Match`` on the ETag that was read, and the
+        versions older than the new one are deleted. Quarantine objects are matched by
+        their real shape (``item.id`` of a ``tweet`` or ``included_tweet``,
+        ``item.tweet.id`` of a ``message``, the top-level ``tweet_id`` newer writers
+        add, and ``media`` by the doomed Tweets' ``media_keys`` unless another stored
+        Tweet lists the key) and deleted; a ``message`` that merely holds a doomed
+        post's copy in ``referenced`` is rewritten without that copy. A ``copy`` batch
+        deletes only ``included_tweet`` objects.
+
+        Resumable: the position is saved every ``PROGRESS_EVERY`` pages and when
+        ``stop()`` says time is up (then the result is not ``done``).
+
+        A page that can't be parsed but contains one of the IDs raises
+        ``ComplianceError``: the Tweet is never marked purged with its content left.
+        """
+        loaded = self.load_batch(unit)
+        if loaded is None:
+            return None
+        state: dict[str, Any] = loaded
+        if state.get("complete"):
+            return self._result(state, done=True)
+        work = {str(i) for i in state["ids"]}
+        own = state.get("mode") == "own"
+        author = state.get("author")
+        first = str(state["first_day"])
+        media_keys = {str(k) for k in state.get("media_keys", ())}
+        pages = quarantined = 0
         held: set[str] | None = None
+
+        def save(**changes: Any) -> None:
+            nonlocal state
+            state = self._put_state(state, **changes)
+
+        def track(key: str, pending: bool) -> None:
+            keys = [k for k in state.get("pending_versions", ()) if k != key]
+            save(pending_versions=[*keys, key] if pending else keys)
+
+        def flush() -> None:
+            for key in list(state.get("pending_versions", ())):
+                self._delete_noncurrent_versions(key)
+                track(key, False)
 
         def held_elsewhere() -> set[str]:
             nonlocal held
             if held is None:
-                held = self.media_keys_held_by_others(media_keys, work)
+                held = self.media_keys_held_by_others(media_keys, work, stop)
             return held
 
-        def save(**progress: Any) -> None:
-            self._state.put_item(
-                Item={**state, **progress, "updated_at": utc_now_iso()}
-            )
-
         def unfinished() -> RedactResult:
-            return RedactResult(False, frozenset(work), first, pages, quarantined)
+            return self._result(state, done=False, pages=pages, quarantined=quarantined)
 
+        flush()
+        for key in state.get("explicit", ()):
+            pages += self._redact_page(key, work, own, track)
         if author is not None and not state.get("raw_done"):
             start = state.get("raw_after") or (
                 f"raw/{author}/dt={first}/" if first else None
@@ -541,12 +704,11 @@ class ComplianceStore:
                 if stop():
                     save(raw_after=last or start or "")
                     return unfinished()
-                pages += self._redact_page(key, work, from_data)
+                pages += self._redact_page(key, work, own, track)
                 last = key
                 if handled % PROGRESS_EVERY == 0:
                     save(raw_after=key)
             save(raw_after=last or start or "", raw_done=True)
-            state = {**state, "raw_done": True}
         if author is not None:
             start = state.get("quar_after") or (
                 f"quarantine/{author}/dt={first}/" if first else None
@@ -558,26 +720,38 @@ class ComplianceStore:
                 if stop():
                     save(quar_after=last or start or "")
                     return unfinished()
-                quarantined += self._drop_quarantined(
-                    key, work, kinds, set(media_keys), held_elsewhere
-                )
+                try:
+                    quarantined += self._quarantined(
+                        key, work, own, media_keys, held_elsewhere, track
+                    )
+                except _OutOfTime:
+                    save(quar_after=last or start or "")
+                    return unfinished()
                 last = key
                 if handled % PROGRESS_EVERY == 0:
                     save(quar_after=key)
+        flush()
         save(complete=True)
-        return RedactResult(True, frozenset(work), first, pages, quarantined)
+        return self._result(state, done=True, pages=pages, quarantined=quarantined)
 
     def media_keys_held_by_others(
-        self, keys: Collection[str], exclude: Collection[str]
+        self,
+        keys: Collection[str],
+        exclude: Collection[str],
+        stop: Callable[[], bool] = lambda: False,
     ) -> set[str]:
         """The ``media_keys`` among ``keys`` that another stored item (not in
-        ``exclude``, not purged) still lists. One projected scan of the table."""
+        ``exclude``, not purged) still lists. One projected scan of the table; if
+        ``stop()`` says time is up between two pages it raises ``_OutOfTime`` (the
+        caller goes on next run)."""
         wanted = set(keys)
         held: set[str] = set()
         kwargs: dict[str, Any] = {
             "ProjectionExpression": "tweet_id, media_keys, purged_at"
         }
         while wanted:
+            if stop():
+                raise _OutOfTime
             page = self._tweets.scan(**kwargs)
             for item in cast("list[dict[str, Any]]", page["Items"]):
                 if str(item["tweet_id"]) in exclude or "purged_at" in item:
@@ -588,7 +762,59 @@ class ComplianceStore:
             kwargs["ExclusiveStartKey"] = page["LastEvaluatedKey"]
         return held
 
-    def _redact_page(self, key: str, ids: set[str], from_data: bool) -> int:
+    def _put_rewritten(
+        self,
+        key: str,
+        body: bytes,
+        etag: str,
+        content_type: str,
+        track: Callable[[str, bool], None],
+        gzipped: bool = False,
+    ) -> bool:
+        """Put the rewritten object back with ``If-Match`` and delete the versions older
+        than the new one. The key is recorded as pending before the put and removed
+        after the delete, so a failure in between is finished by the next run. False if
+        the object changed since it was read (read it again)."""
+        track(key, True)
+        try:
+            put = (
+                self._s3.put_object(
+                    Bucket=self._bucket,
+                    Key=key,
+                    Body=body,
+                    ContentType=content_type,
+                    ContentEncoding="gzip",
+                    IfMatch=etag,
+                )
+                if gzipped
+                else self._s3.put_object(
+                    Bucket=self._bucket,
+                    Key=key,
+                    Body=body,
+                    ContentType=content_type,
+                    IfMatch=etag,
+                )
+            )
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") in (
+                "PreconditionFailed",
+                "412",
+            ):
+                track(key, False)
+                return False
+            raise
+        if version := put.get("VersionId"):
+            self._delete_older_versions(key, version)
+        track(key, False)
+        return True
+
+    def _redact_page(
+        self,
+        key: str,
+        ids: set[str],
+        from_data: bool,
+        track: Callable[[str, bool], None] = lambda key, pending: None,
+    ) -> int:
         for _ in range(WRITE_ATTEMPTS):
             read = self._read(key)
             if read is None:
@@ -606,26 +832,13 @@ class ComplianceStore:
                 return 0
             if not gone:
                 return 0
-            try:
-                put = self._s3.put_object(
-                    Bucket=self._bucket,
-                    Key=key,
-                    Body=redacted,
-                    ContentType="application/json",
-                    ContentEncoding="gzip",
-                    IfMatch=etag,
+            if self._put_rewritten(
+                key, redacted, etag, "application/json", track, gzipped=True
+            ):
+                logger.warning(
+                    "redacted raw page %s: removed tweets %s", key, sorted(gone)
                 )
-            except ClientError as exc:
-                if exc.response.get("Error", {}).get("Code") in (
-                    "PreconditionFailed",
-                    "412",
-                ):
-                    continue  # another writer changed the page: read it again
-                raise
-            if version := put.get("VersionId"):
-                self._delete_older_versions(key, version)
-            logger.warning("redacted raw page %s: removed tweets %s", key, sorted(gone))
-            return 1
+                return 1
         raise ComplianceError(f"raw page {key} changed under {WRITE_ATTEMPTS} attempts")
 
     def _delete_older_versions(self, key: str, version: str) -> None:
@@ -638,48 +851,101 @@ class ComplianceStore:
             for older in listed[listed.index(version) + 1 :]:
                 self._s3.delete_object(Bucket=self._bucket, Key=key, VersionId=older)
 
-    def _drop_quarantined(
+    def _delete_noncurrent_versions(self, key: str) -> None:
+        """Delete every version of ``key`` but the current one. Raw pages and
+        quarantine objects are only rewritten by this job, so a version older than the
+        current one is a copy from before a redaction. If the current entry is a delete
+        marker nothing is deleted (someone removed the object: leave what is left)."""
+        entries: list[dict[str, Any]] = []
+        kwargs: dict[str, Any] = {"Bucket": self._bucket, "Prefix": key}
+        while True:
+            page = self._s3.list_object_versions(**kwargs)
+            entries += [
+                {**e, "marker": marker}
+                for marker, group in (
+                    (False, page.get("Versions", ())),
+                    (True, page.get("DeleteMarkers", ())),
+                )
+                for e in group
+                if e["Key"] == key
+            ]
+            if not page.get("IsTruncated"):
+                break
+            kwargs["KeyMarker"] = page["NextKeyMarker"]
+            kwargs["VersionIdMarker"] = page["NextVersionIdMarker"]
+        current = next((e for e in entries if e["IsLatest"]), None)
+        if current is None or current["marker"]:
+            return
+        for entry in entries:
+            if not entry["IsLatest"]:
+                self._s3.delete_object(
+                    Bucket=self._bucket, Key=key, VersionId=entry["VersionId"]
+                )
+
+    def _quarantined(
         self,
         key: str,
         ids: Collection[str],
-        kinds: Collection[str] | None,
+        own: bool,
         media_keys: Collection[str],
         held: Callable[[], set[str]],
+        track: Callable[[str, bool], None],
     ) -> int:
-        read = self._read(key)
-        if read is None:
-            return 0
-        body = read[0]
-        try:
-            raw = gzip.decompress(body) if body[:2] == b"\x1f\x8b" else body
-            document = json.loads(raw)
-        except OSError, EOFError, zlib.error, ValueError:
-            if _mentions(body, ids):
-                raise ComplianceError(
-                    f"quarantine object {key} can't be parsed but names a deleted post"
-                ) from None
-            return 0
-        if not isinstance(document, dict):
-            return 0
-        kind = document.get("kind")
-        if kinds is not None and kind not in kinds:
-            return 0
-        item = document.get("item")
-        tweet_id = document.get("tweet_id") or item_tweet_id(str(kind), item)
-        doomed = tweet_id is not None and str(tweet_id) in ids
-        if (
-            not doomed
-            and kind == "media"
-            and isinstance(item, dict)
-            and str(item.get("media_key")) in media_keys
-        ):
-            doomed = str(item["media_key"]) not in held()
-        if not doomed:
-            return 0
-        for _, version_id in self._list_versions(key):
-            self._s3.delete_object(Bucket=self._bucket, Key=key, VersionId=version_id)
-        logger.warning("deleted quarantined object %s", key)
-        return 1
+        """Delete (or, for a message that only holds a copy, rewrite) one quarantine
+        object; 1 if it was changed."""
+        for _ in range(WRITE_ATTEMPTS):
+            read = self._read(key)
+            if read is None:
+                return 0
+            body, etag = read
+            try:
+                raw = gzip.decompress(body) if body[:2] == b"\x1f\x8b" else body
+                document = json.loads(raw)
+            except OSError, EOFError, zlib.error, ValueError:
+                if _mentions(body, ids):
+                    raise ComplianceError(
+                        f"quarantine object {key} can't be parsed but names a "
+                        "deleted post"
+                    ) from None
+                return 0
+            if not isinstance(document, dict):
+                return 0
+            kind = document.get("kind")
+            item = document.get("item")
+            tweet_id = document.get("tweet_id") or item_tweet_id(str(kind), item)
+            doomed = tweet_id is not None and str(tweet_id) in ids
+            if not own and kind != "included_tweet":
+                doomed = False  # a copy scrub never deletes a post's own objects
+            if (
+                not doomed
+                and own
+                and kind == "media"
+                and isinstance(item, dict)
+                and str(item.get("media_key")) in media_keys
+            ):
+                doomed = str(item["media_key"]) not in held()
+            if doomed:
+                for _, version_id in self._list_versions(key):
+                    self._s3.delete_object(
+                        Bucket=self._bucket, Key=key, VersionId=version_id
+                    )
+                logger.warning("deleted quarantined object %s", key)
+                return 1
+            stripped = _strip_message_copies(document, ids)
+            if stripped is None:
+                return 0
+            if self._put_rewritten(
+                key,
+                json.dumps(stripped, separators=(",", ":")).encode(),
+                etag,
+                "application/json",
+                track,
+            ):
+                logger.warning("stripped copies of deleted posts from %s", key)
+                return 1
+        raise ComplianceError(
+            f"quarantine object {key} changed under {WRITE_ATTEMPTS} attempts"
+        )
 
     # --- purge ------------------------------------------------------------------
 
@@ -1043,6 +1309,7 @@ class Compliance:
         self.checked = 0
         self.ref_checked = 0
         self.purge_checked = 0
+        self.scrub_checked = 0
         self.tombstoned = 0
         self.cleared = 0
         self.purged = 0
@@ -1070,6 +1337,7 @@ class Compliance:
             self.auth_failed = isinstance(exc, AuthError)
             logger.exception("compliance walk failed")
             self.failures.append(f"walk: {type(exc).__name__}")
+        self._advance_copy_batches()
         self._purge_due(tombstones)
         self._sweep(sweeping)
         logger.info(
@@ -1227,61 +1495,112 @@ class Compliance:
         now: str,
         cutoff: str,
     ) -> None:
-        """Scrub the copies past the grace period: the raw pages' includes first
-        (nothing is scrubbed from an item if that fails or isn't finished, so the item
-        still names what is left; the walk comes back to it)."""
+        """Register the copies that are past the grace period as a redaction batch per
+        holder author: the raw pages' includes and the quarantine are cleaned first,
+        and the holders are scrubbed when the batch is done, in whatever run that is
+        (``_advance_copy_batches``). A batch already in progress is finished first; the
+        walk registers the rest when it next reaches them."""
         gone = {i for i, reason in outcome.items() if reason is not None}
         by_author: dict[str | None, list[dict[str, Any]]] = {}
         for item in pending:
             by_author.setdefault(item.get("author_id"), []).append(item)
+        if not by_author:
+            return
+        active = set(self._store.active_units())
         for author, group in by_author.items():
+            unit = f"copy#{author or '-'}"
+            if unit in active:
+                logger.info(
+                    "a redaction of deleted copies is in progress for %s: %d tweet(s) "
+                    "wait for the walk to reach them again",
+                    author,
+                    len(group),
+                )
+                continue
             due = {
                 i
                 for item in group
                 for i in self._store.scrub_due(item, gone, now, cutoff)
             }
-            first = min(_day(item) for item in group)
             try:
-                result = self._store.redact_raw(
-                    f"copy#{author or '-'}",
-                    group,
-                    due,
-                    first_day=first,
+                self._store.start_batch(
+                    unit,
+                    mode="copy",
                     author=author,
-                    from_data=False,
-                    kinds=("included_tweet",),
-                    stop=self._time_low,
+                    ids=due,
+                    first_day=min(_day(item) for item in group),
+                    holders=[str(item["tweet_id"]) for item in group],
+                    explicit=[
+                        k
+                        for item in group
+                        if isinstance(k := item.get("raw_key"), str)
+                        and k.startswith("raw/")
+                    ],
                 )
+            except Exception as exc:
+                logger.exception("registering a redaction of deleted copies failed")
+                self.failures.append(f"raw pages of copies: {type(exc).__name__}")
+
+    def _advance_copy_batches(self) -> None:
+        """Go on with every copy batch in progress (whichever run registered it): clean
+        its pages while time allows, and when one is done scrub its holders."""
+        for unit in self._store.active_units():
+            if self._out_of_time():
+                return
+            try:
+                result = self._store.advance(unit, stop=self._time_low)
             except Exception as exc:
                 logger.exception("redacting raw pages of deleted posts failed")
                 self.failures.append(f"raw pages of copies: {type(exc).__name__}")
                 continue
+            if result is None:
+                self._store.finish_batch(unit)  # the batch is gone
+                continue
             self.ref_raw_pages += result.pages
             self.raw_pages_redacted += result.pages
-            for item in group:
-                mine = self._store.scrub_due(item, gone, now, cutoff)
-                if not result.covers(mine, _day(item)):
-                    logger.info(
-                        "tweet %s: raw pages of its deleted copies are not yet "
-                        "redacted; scrubbed when the walk next reaches it",
-                        item["tweet_id"],
-                    )
+            if result.done:
+                self._finish_copy_batch(unit, result)
+
+    def _finish_copy_batch(self, unit: str, result: RedactResult) -> None:
+        """The pages of a copy batch are clean: confirm with a fresh lookup that its
+        posts are still unavailable (one that is present or unknown is not scrubbed),
+        then scrub the copies in the holders, read again. Idempotent: a failure leaves
+        the batch active and the next run does it again."""
+        outcome: dict[str, str | None] = {}
+        ids = sorted(result.ids)
+        for start in range(0, len(ids), MAX_LOOKUP_IDS):
+            chunk = ids[start : start + MAX_LOOKUP_IDS]
+            try:
+                answer = self._lookup(chunk)
+            except Exception as exc:
+                self.auth_failed = self.auth_failed or isinstance(exc, AuthError)
+                logger.exception("confirming deleted copies failed")
+                self.failures.append(f"copy confirmation: {type(exc).__name__}")
+                return
+            self.scrub_checked += len(chunk)
+            outcome.update(dict.fromkeys(answer.present))
+            outcome.update(answer.unavailable)
+        now = _iso(self._now())
+        cutoff = _iso(self._now() - self._grace)
+        complete = True
+        for holder in result.holders:
+            try:
+                item = self._store.load_item(holder)
+                if item is None:
                     continue
-                try:
-                    marked, unmarked, scrubbed = self._store.update_copies(
-                        item, outcome, now=now, cutoff=cutoff
-                    )
-                except Exception as exc:
-                    logger.exception(
-                        "scrubbing copies in tweet %s failed", item["tweet_id"]
-                    )
-                    self.failures.append(
-                        f"copies {item['tweet_id']}: {type(exc).__name__}"
-                    )
-                    continue
-                self.copies_marked += marked
-                self.copies_unmarked += unmarked
-                self.copies_scrubbed += scrubbed
+                marked, unmarked, scrubbed = self._store.update_copies(
+                    item, outcome, now=now, cutoff=cutoff
+                )
+            except Exception as exc:
+                logger.exception("scrubbing copies in tweet %s failed", holder)
+                self.failures.append(f"copies {holder}: {type(exc).__name__}")
+                complete = False
+                continue
+            self.copies_marked += marked
+            self.copies_unmarked += unmarked
+            self.copies_scrubbed += scrubbed
+        if complete:
+            self._store.finish_batch(unit)
 
     def _apply(self, result: TweetLookup, tombstones: dict[str, str]) -> None:
         now = _iso(self._now())
@@ -1317,7 +1636,14 @@ class Compliance:
         reported present is cleared; an unknown answer or a failed lookup defers the
         purge and fails the run (the alarm), it never purges."""
         confirmed: list[str] = []
-        for start in range(0, len(due), MAX_LOOKUP_IDS):
+        for number, start in enumerate(range(0, len(due), MAX_LOOKUP_IDS)):
+            if number >= MAX_CONFIRM_REQUESTS or self._time_low():
+                # Not a failure: the rest is confirmed (and purged) in the next run.
+                self.deferred += len(due) - start
+                logger.info(
+                    "%d due tombstone(s) wait for the next run", len(due) - start
+                )
+                break
             chunk = due[start : start + MAX_LOOKUP_IDS]
             try:
                 result = self._lookup(chunk)
@@ -1353,19 +1679,35 @@ class Compliance:
         ]
         if not due or self._out_of_time():
             return
-        confirmed = self._confirm_due(due, cast("dict[str, str]", tombstones))
-        begun: list[dict[str, Any]] = []
-        for tweet_id in confirmed:
+        # Once a purge has begun (``purging``) it always completes: it was confirmed
+        # unavailable after the grace period right before it began, and it is not
+        # asked about again. The others are confirmed now.
+        loaded: dict[str, dict[str, Any]] = {}
+        fresh: list[str] = []
+        going: list[str] = []
+        for tweet_id in due:
             if self._out_of_time():
                 break
             try:
-                loaded = self._store.load_item(tweet_id)
-                if loaded is None or str(loaded.get("deleted_at", "9")) > cutoff:
-                    logger.info("tweet %s is no longer due: skipped", tweet_id)
-                    continue
-                item = self._store.begin_purge(loaded)
+                item = self._store.load_item(tweet_id)
             except Exception as exc:
                 logger.exception("reading tweet %s failed", tweet_id)
+                self.failures.append(f"purge {tweet_id}: {type(exc).__name__}")
+                continue
+            if item is None or str(item.get("deleted_at", "9")) > cutoff:
+                logger.info("tweet %s is no longer due: skipped", tweet_id)
+                continue
+            loaded[tweet_id] = item
+            (going if "purging" in item else fresh).append(tweet_id)
+        confirmed = self._confirm_due(fresh, cast("dict[str, str]", tombstones))
+        begun: list[dict[str, Any]] = []
+        for tweet_id in [*going, *confirmed]:
+            if self._out_of_time():
+                break
+            try:
+                item = self._store.begin_purge(loaded[tweet_id])
+            except Exception as exc:
+                logger.exception("starting the purge of tweet %s failed", tweet_id)
                 self.failures.append(f"purge {tweet_id}: {type(exc).__name__}")
                 continue
             if item is None:
@@ -1454,13 +1796,16 @@ def _short_timeouts() -> Config:
 
 
 @functools.cache
-def _store(tweets_table: str, state_table: str, bucket: str) -> ComplianceStore:
+def _store(
+    tweets_table: str, state_table: str, bucket: str, retention_days: int = 0
+) -> ComplianceStore:
     dynamodb = boto3.resource("dynamodb", config=_short_timeouts())
     return ComplianceStore(
         dynamodb.Table(tweets_table),
         dynamodb.Table(state_table),
         boto3.client("s3", config=_short_timeouts()),
         bucket,
+        retention_days,
     )
 
 
@@ -1483,7 +1828,12 @@ def handler(event: Any, context: Any) -> dict[str, Any]:
         max_rate_limit_wait=max_rate_limit_wait,
     ) as x_client:
         job = Compliance(
-            _store(settings.tweets_table, settings.state_table, settings.media_bucket),
+            _store(
+                settings.tweets_table,
+                settings.state_table,
+                settings.media_bucket,
+                settings.retention_days,
+            ),
             x_client.lookup_tweets,
             max_lookups=settings.compliance_max_lookups,
             grace=timedelta(hours=settings.deletion_grace_hours),

@@ -471,7 +471,7 @@ def test_a_raw_page_failure_blocks_the_scrub(
     def failing(self: ComplianceStore, *args: Any, **kwargs: Any) -> Any:
         raise ClientError({"Error": {"Code": "SlowDown"}}, "ListObjectsV2")
 
-    monkeypatch.setattr(ComplianceStore, "redact_raw", failing)
+    monkeypatch.setattr(ComplianceStore, "advance", failing)
 
     with pytest.raises(ComplianceError, match="raw pages of copies"):
         job(aws, Lookup(gone={B: "deleted"}), clock, grace=clock.step * 0).run(HANDLE)

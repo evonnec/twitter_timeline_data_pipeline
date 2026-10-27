@@ -169,6 +169,22 @@ def redact_envelope(
         for t in source
         if isinstance(t, dict) and "id" in t
     ]
+    # Every post of the page, for the media that something else still uses (a retweet
+    # in ``data`` lists the media of the original in ``includes``).
+    everything = [
+        t
+        for source in (
+            response.get("data"),
+            *(
+                includes.get(n)
+                for n in INCLUDED_POST_KEYS
+                if isinstance(includes, dict)
+            ),
+        )
+        if isinstance(source, list)
+        for t in source
+        if isinstance(t, dict) and "id" in t
+    ]
     gone = {str(t["id"]) for t in tweets} & {str(i) for i in tweet_ids}
     if not gone:
         return body, set()
@@ -187,7 +203,7 @@ def redact_envelope(
         ]
 
     dropped = media_keys([t for t in tweets if str(t["id"]) in gone])
-    still_used = media_keys([t for t in tweets if str(t["id"]) not in gone])
+    still_used = media_keys([t for t in everything if str(t["id"]) not in gone])
     new_response: JSONObject = dict(response)
     if "data" in lists:
         new_response["data"] = keep(lists["data"])

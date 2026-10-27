@@ -93,13 +93,13 @@ Parameters:
   ComplianceMaxLookups:
     Type: Number
     Default: 1000
-    MinValue: 1
+    MinValue: 4
     Description: >-
       Most Tweet IDs one compliance run checks against the X API (100 per request):
-      the account's stored Tweets and the posts they quote, reply to or retweet.
-      Up to half goes to the posts the stored items hold copies of (at least 6 is
-      needed for that); the rest to the stored Tweets. Both walks resume where the
-      last run stopped and wrap around.
+      the stored Tweets' own IDs and the posts they quote, reply to or retweet, one
+      budget. The walk stops after the last item whose IDs fit (a Tweet needs its own
+      ID plus up to three), so at least 4 is needed. It resumes where the last run
+      stopped and wraps around.
   DeletionGraceHours:
     Type: Number
     Default: 24
@@ -218,11 +218,9 @@ Resources:
       # Items expire at their epoch `expires_at`. The attribute is only written when
       # RetentionDays > 0, and TTL is only enabled then, so by default nothing ever
       # expires.
-      TimeToLiveSpecification: !If
-        - HasRetention
-        - AttributeName: expires_at
-          Enabled: true
-        - !Ref AWS::NoValue
+      TimeToLiveSpecification:
+        AttributeName: expires_at
+        Enabled: !If [HasRetention, true, false]
       PointInTimeRecoverySpecification:
         PointInTimeRecoveryEnabled: true
       SSESpecification:
@@ -569,6 +567,7 @@ Resources:
           TWEETS_TABLE: !Ref TweetsTable
           STATE_TABLE: !Ref StateTable
           MEDIA_BUCKET: !Ref MediaBucket
+          RETENTION_DAYS: !Ref RetentionDays
           COMPLIANCE_MAX_LOOKUPS: !Ref ComplianceMaxLookups
           DELETION_GRACE_HOURS: !Ref DeletionGraceHours
       Policies:
@@ -614,9 +613,13 @@ Resources:
               Resource:
                 - !Sub "${MediaBucket.Arn}/raw/*"
                 - !Sub "${MediaBucket.Arn}/quarantine/*"
+            # Raw pages and quarantined messages are rewritten without a deleted post's
+            # copy (If-Match, new version; the older versions are deleted).
             - Effect: Allow
               Action: s3:PutObject
-              Resource: !Sub "${MediaBucket.Arn}/raw/*"
+              Resource:
+                - !Sub "${MediaBucket.Arn}/raw/*"
+                - !Sub "${MediaBucket.Arn}/quarantine/*"
       EventInvokeConfig:
         # The next scheduled run retries; the cursor and tombstones persist.
         MaximumRetryAttempts: 0
