@@ -34,6 +34,8 @@ ENV_VARS: Mapping[str, str] = {
     "expand_referenced_tweets": "EXPAND_REFERENCED_TWEETS",
     "request_entities": "REQUEST_ENTITIES",
     "metrics_namespace": "METRICS_NAMESPACE",
+    "metrics_per_account": "METRICS_PER_ACCOUNT",
+    "log_level": "LOG_LEVEL",
 }
 
 _TRUE = frozenset({"1", "true", "yes", "on"})
@@ -91,6 +93,11 @@ class Settings:
     metrics_namespace: str = DEFAULT_METRICS_NAMESPACE
     """CloudWatch namespace of the EMF metrics (``metrics.emit`` reads the same
     variable itself, so a handler never needs the setting to emit)."""
+
+    metrics_per_account: bool = False
+    """Also emit the fetch metrics per ``Username`` (more CloudWatch series)."""
+    log_level: str = "INFO"
+    """Level of the package's Python loggers (see ``handlers.apply_log_level``)."""
 
     def __post_init__(self) -> None:
         if not 5 <= self.max_results <= 100:
@@ -196,6 +203,8 @@ class Settings:
             expand_referenced_tweets=get_flag("expand_referenced_tweets", True),
             request_entities=get_flag("request_entities", True),
             metrics_namespace=get("metrics_namespace") or DEFAULT_METRICS_NAMESPACE,
+            metrics_per_account=get_flag("metrics_per_account", False),
+            log_level=(get("log_level") or "INFO").upper(),
         )
 
     def require(self, *attrs: str) -> None:

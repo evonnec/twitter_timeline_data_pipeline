@@ -128,6 +128,7 @@ def retry_records(
     """Process media-retry records; return the ``messageId`` of each one that failed."""
     failed: list[str] = []
     outcomes: Counter[str] = Counter()
+    reasons: Counter[str] = Counter()
     settled: list[StoredMedia] = []
     try:
         for record in records:
@@ -144,30 +145,38 @@ def retry_records(
             except MessageError:
                 logger.exception("retry message %s is malformed", message_id, extra=log)
                 failed.append(message_id)
+                reasons["malformed"] += 1
             except TransientMediaError as exc:
                 logger.warning(
                     "retry message %s will be retried: %s", message_id, exc, extra=log
                 )
                 failed.append(message_id)
+                reasons["transient"] += 1
             except Exception:
                 logger.exception("retry message %s failed", message_id, extra=log)
                 failed.append(message_id)
+                reasons["error"] += 1
             else:
                 outcomes[outcome] += 1
                 if stored is not None:
                     settled.append(stored)
     finally:
-        _emit_metrics(outcomes, settled, len(failed))
+        _emit_metrics(outcomes, settled, reasons)
     return failed
 
 
 def _emit_metrics(
-    outcomes: Mapping[str, int], settled: list[StoredMedia], failures: int
+    outcomes: Mapping[str, int], settled: list[StoredMedia], reasons: Mapping[str, int]
 ) -> None:
     """One line per invocation. ``MediaRetryOutcomes`` has an ``Outcome`` dimension (a
     media status, or ``tombstoned``, ``media_not_listed``, ``already_settled`` or
-    ``settled_elsewhere``); the media totals include what a retry stored."""
-    metrics.emit({"MediaRetryFailures": failures, **media_values(settled)})
+    ``settled_elsewhere``); the media totals include what a retry stored.
+    ``MediaRetryFailures`` has a ``Reason`` dimension: ``malformed`` and ``error`` do
+    not heal by themselves, ``transient`` (a download error, an item not yet written)
+    usually does."""
+    metrics.emit(media_values(settled))
+    for reason, count in sorted(reasons.items()):
+        metrics.emit({"MediaRetryFailures": count}, {"Reason": reason})
     for outcome, count in sorted(outcomes.items()):
         metrics.emit({"MediaRetryOutcomes": count}, {"Outcome": outcome})
 

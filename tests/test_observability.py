@@ -53,6 +53,7 @@ from test_quarantine import run as quarantine_run
 from test_user_id import NEW_ID, OLD_ID, TTL, Api, go
 from test_user_id import Clock as UserClock
 
+from twitter_timeline_data_pipeline import metrics as metrics_module
 from twitter_timeline_data_pipeline.handlers import fetch, media_retry
 from twitter_timeline_data_pipeline.handlers.compliance import ComplianceError
 from twitter_timeline_data_pipeline.handlers.fetch import (
@@ -70,7 +71,7 @@ from twitter_timeline_data_pipeline.storage import (
 )
 from twitter_timeline_data_pipeline.x_api import TweetLookup
 
-U = {"Username": USERNAME}
+U: dict[str, str] = {}  # per-account series are opt-in; see the last fetch test
 
 
 # ---- fetch ---------------------------------------------------------------------
@@ -169,7 +170,7 @@ def test_quarantined_items_are_counted_by_kind_and_partial_errors_too(
 
     quarantine_run(aws, page, FakeSqs())
 
-    assert emf.one("QuarantinedItems", Username=USERNAME, Kind="tweet") == 1
+    assert emf.one("QuarantinedItems", Kind="tweet") == 1
     assert emf.total("QuarantinedItems") == 1  # the empty set sums over kinds
     assert emf.one("PartialErrors", **U) == 1
     assert emf.one("TweetsEnqueued", **U) == 2
@@ -193,7 +194,7 @@ def test_a_message_sqs_rejects_is_quarantined_with_kind_message(
 
     quarantine_run(aws, body_of([tweet(GOOD1)]), sqs)
 
-    assert emf.one("QuarantinedItems", Username=USERNAME, Kind="message") == 1
+    assert emf.one("QuarantinedItems", Kind="message") == 1
     assert emf.one("TweetsEnqueued", **U) == 0
 
 
@@ -223,7 +224,7 @@ def test_the_handler_adds_the_run_id_to_the_line_and_to_the_summary_log(
     (doc,) = emf.read()
     (summary,) = [r for r in caplog.records if r.getMessage().startswith("fetched ")]
     assert doc["run_id"] == summary.run_id  # type: ignore[attr-defined]
-    assert doc["Username"] == USERNAME
+    assert "Username" not in doc  # per-account series are opt-in
 
 
 # ---- process ---------------------------------------------------------------------
@@ -237,9 +238,7 @@ def cdn() -> CdnStub:
     return stub
 
 
-LATER = datetime(
-    2026, 10, 20, 12, 0, 30, tzinfo=UTC
-)  # make_message's created_at + 30 s
+LATER = datetime(2026, 10, 25, 0, 0, 30, tzinfo=UTC)  # FETCHED_AT + 30 s
 
 
 def test_a_mixed_batch_reports_stored_failures_retries_media_and_lag(
@@ -268,7 +267,7 @@ def test_a_mixed_batch_reports_stored_failures_retries_media_and_lag(
     assert emf.one("StaleWritesSkipped") == 0
     assert emf.one("MediaStored") == 1
     assert emf.one("MediaBytes") == len(b"jpeg-good")
-    assert emf.one("IngestLagSeconds") == [30.0, 30.0]
+    assert emf.one("ProcessingLagSeconds") == [30.0, 30.0]
     assert emf.one("RecordFailures", Reason="malformed") == 1
     assert emf.one("RecordFailures", Reason="error") == 1
     assert emf.total("RecordFailures") == 2  # dimensionless: the sum of the reasons
@@ -291,7 +290,7 @@ def test_units_are_the_declared_ones_on_every_line(
         for m in d["_aws"]["CloudWatchMetrics"][0]["Metrics"]
     }
     assert units["MediaBytes"] == "Bytes"
-    assert units["IngestLagSeconds"] == "Seconds"
+    assert units["ProcessingLagSeconds"] == "Seconds"
     assert units["TweetsStored"] == "Count"
 
 
@@ -313,7 +312,7 @@ def test_a_stale_write_is_counted_and_not_stored(
 
     assert emf.one("StaleWritesSkipped") == 1
     assert emf.one("TweetsStored") == 0
-    assert emf.find("IngestLagSeconds") == []  # nothing was stored, so no lag
+    assert emf.find("ProcessingLagSeconds") == []  # nothing was stored, so no lag
 
 
 def test_media_outcomes_are_counted_by_status(aws: Aws, emf: Emf) -> None:
@@ -484,7 +483,7 @@ def test_media_retry_emits_outcomes_failures_and_what_it_stored(
     assert emf.one("MediaRetryOutcomes", Outcome="stored") == 1
     assert emf.one("MediaRetryOutcomes", Outcome="already_settled") == 1
     assert emf.total("MediaRetryOutcomes") == 2  # the failed one has no outcome
-    assert emf.one("MediaRetryFailures") == 1
+    assert emf.one("MediaRetryFailures", Reason="transient") == 1
     assert emf.one("MediaStored") == 1
     assert emf.one("MediaBytes") == len(b"jpeg-good")
 
@@ -623,20 +622,320 @@ def test_compliance_logs_carry_the_tweet_id(
 
 
 @pytest.mark.parametrize(
-    ("created_at", "expected"),
+    ("fetched_at", "expected"),
     [
-        ("2026-10-20T12:00:00.000Z", 30.0),
-        ("2026-10-20T12:00:30Z", 0.0),
-        ("2026-10-20T12:01:00Z", 0.0),  # a clock a little behind: never negative
+        ("2026-10-25T00:00:00Z", 30.0),
+        ("2026-10-25T00:00:30Z", 0.0),
+        ("2026-10-25T00:01:00Z", 0.0),  # a clock a little behind: never negative
         (None, None),
         ("", None),
         ("yesterday", None),
-        ("2026-10-20T12:00:00", None),  # no zone: not comparable
+        ("2026-10-25T00:00:00", None),  # no zone: not comparable
     ],
 )
-def test_ingest_lag_needs_a_usable_creation_time(
-    created_at: str | None, expected: float | None
+def test_processing_lag_needs_a_usable_fetch_time(
+    fetched_at: str | None, expected: float | None
 ) -> None:
     from twitter_timeline_data_pipeline.handlers.process import _lag_seconds
 
-    assert _lag_seconds(created_at, LATER) == expected
+    assert _lag_seconds(fetched_at, LATER) == expected
+
+
+def test_lag_is_from_the_fetch_not_from_the_tweets_creation(
+    aws: Aws, cdn: CdnStub, emf: Emf
+) -> None:
+    ancient = make_message(GOOD, tweet={"created_at": "2019-01-01T00:00:00.000Z"})
+
+    process_records(
+        [sqs_record("m", body(ancient))],
+        media_store=MediaStore(aws.s3, aws.bucket, cdn.client()),
+        tweet_store=TweetStore(aws.tweets_table, aws.s3, aws.bucket),
+        now=lambda: LATER,
+    )
+
+    assert emf.one("ProcessingLagSeconds") == [30.0]  # a backfill is not "late"
+
+
+# ---- review round: heartbeat, last receive, log level, opt-in dimensions -----------
+
+
+def test_per_account_series_are_opt_in(
+    aws: Aws, emf: Emf, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fetch_run(aws, synthetic_timeline(ids(3)), FakeSqs())
+    (default,) = emf.read()
+    assert default["_aws"]["CloudWatchMetrics"][0]["Dimensions"] == [[]]
+    assert "Username" not in default
+    emf.reset()
+
+    monkeypatch.setenv("METRICS_PER_ACCOUNT", "true")
+    fetch_run(aws, synthetic_timeline(ids(3)), FakeSqs())
+
+    assert emf.one("TweetsFetched", Username=USERNAME) == 3
+    assert emf.one("TweetsFetched") == 3  # the total is there as well
+
+
+def test_per_account_quarantine_lines_carry_both_dimensions(
+    aws: Aws, emf: Emf, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("METRICS_PER_ACCOUNT", "1")
+
+    quarantine_run(aws, body_of([tweet(GOOD1), bad_tweet()]), FakeSqs())
+
+    assert emf.one("QuarantinedItems", Username=USERNAME, Kind="tweet") == 1
+    assert emf.one("QuarantinedItems") == 1
+
+
+def test_a_rate_limit_in_the_gap_phase_still_sends_the_heartbeat(
+    aws: Aws, emf: Emf
+) -> None:
+    from twitter_timeline_data_pipeline.storage import Gap
+
+    timeline = FakeTimeline(
+        100, window=50, inject=lambda n, _r: RATE_LIMITED if n == 2 else None
+    )
+    cursor_seed(aws, 100, Gap(until_id="30", since_id="5"))
+
+    result = cursor_run(aws, timeline, FakeSqs(), now=at(0))
+
+    assert result.stopped_reason == "rate_limited"
+    assert emf.one("RateLimitedRuns") == 1
+    assert emf.one("FetchRunSucceeded") == 1  # the new-Tweets phase had completed
+
+
+def test_a_rate_limit_in_the_new_tweets_phase_sends_no_heartbeat(
+    aws: Aws, emf: Emf
+) -> None:
+    timeline = FakeTimeline(100, inject=lambda n, _r: RATE_LIMITED if n == 1 else None)
+
+    cursor_run(aws, timeline, FakeSqs(), now=at(0))
+
+    assert emf.one("RateLimitedRuns") == 1
+    assert emf.one("FetchRunSucceeded") == 0
+
+
+def test_an_errors_only_timeline_sends_no_heartbeat(aws: Aws, emf: Emf) -> None:
+    from twitter_timeline_data_pipeline.x_api import XApiError
+
+    page = {
+        "errors": [
+            {
+                "title": "Authorization Error",
+                "detail": "protected",
+                "type": "https://api.twitter.com/2/problems/not-authorized-for-resource",
+            }
+        ]
+    }
+
+    with pytest.raises(XApiError):
+        quarantine_run(aws, page, FakeSqs())
+
+    assert emf.one("FetchRunSucceeded") == 0
+    assert emf.one("TweetsFetched") == 0
+
+
+def test_the_last_receive_counts_every_failure_as_a_failure(
+    aws: Aws, cdn: CdnStub, emf: Emf
+) -> None:
+    class Contended(TweetStore):
+        def put_tweet(self, *_a: Any, **_k: Any) -> PutResult:
+            raise WriteContentionError("changed")
+
+    queue = RecordingRetryQueue()
+    records = [receives(sqs_record("m1", body(make_message(GOOD))), "5")]
+    failed = process_records(
+        records,
+        media_store=MediaStore(aws.s3, aws.bucket, cdn.client()),
+        tweet_store=Contended(aws.tweets_table, aws.s3, aws.bucket),
+        max_receive_count=5,
+        retry_queue=queue,
+    )
+    failed += process_records(
+        [receives(sqs_record("m2", body(make_message(NO_MEDIA))), "5")],
+        media_store=MediaStore(aws.s3, aws.bucket, cdn.client()),
+        tweet_store=TweetStore(aws.tweets_table, aws.s3, aws.bucket),
+        max_receive_count=5,
+        retry_queue=queue,
+        remaining_ms=lambda: 0,  # no time even to write: straight to the DLQ
+    )
+
+    assert failed == ["m1", "m2"]
+    assert emf.one("RecordFailures", Reason="write_contention") == 1
+    assert emf.one("RecordFailures", Reason="out_of_time") == 1
+    assert emf.total("RecordFailures") == 2
+    assert emf.find("RecordRetries") == []
+
+
+def test_before_the_last_receive_the_same_failures_are_only_retries(
+    aws: Aws, cdn: CdnStub, emf: Emf
+) -> None:
+    process_records(
+        [receives(sqs_record("m", body(make_message(GOOD))), "4")],
+        media_store=MediaStore(aws.s3, aws.bucket, cdn.client()),
+        tweet_store=TweetStore(aws.tweets_table, aws.s3, aws.bucket),
+        max_receive_count=5,
+        retry_queue=RecordingRetryQueue(),
+        remaining_ms=lambda: 0,
+    )
+
+    assert emf.one("RecordRetries", Reason="out_of_time") == 1
+    assert emf.find("RecordFailures") == []
+
+
+def test_the_tally_is_emitted_even_when_the_loop_raises(
+    aws: Aws, cdn: CdnStub, emf: Emf
+) -> None:
+    records = [sqs_record("ok", body(make_message(GOOD))), {"body": "no messageId"}]
+
+    with pytest.raises(KeyError):
+        process_records(
+            records,
+            media_store=MediaStore(aws.s3, aws.bucket, cdn.client()),
+            tweet_store=TweetStore(aws.tweets_table, aws.s3, aws.bucket),
+        )
+
+    assert emf.one("TweetsStored") == 1
+
+
+def test_media_values_map_every_status() -> None:
+    from twitter_timeline_data_pipeline.handlers.process import media_values
+
+    def entry(status: Any, size: int | None = None) -> StoredMedia:
+        return StoredMedia(media_key="k", type="photo", status=status, size_bytes=size)
+
+    values = media_values(
+        [
+            entry("stored", 7),
+            entry("exists", 5),
+            entry("too_large", 900),
+            entry("skipped"),
+            entry("skipped_hls"),
+            entry("unavailable"),
+            entry("retrying", 3),
+            entry("missing"),
+        ]
+    )
+
+    assert values == {
+        "MediaStored": 1,
+        "MediaExisted": 1,
+        "MediaUnavailable": 1,
+        "MediaSkipped": 2,  # skipped_hls counts as skipped
+        "MediaTooLarge": 1,
+        "MediaBytes": 7,  # only what was uploaded now
+    }
+
+
+def test_a_delivery_that_lost_the_race_is_a_settled_elsewhere_outcome(
+    aws: Aws, emf: Emf
+) -> None:
+    cdn = CdnStub()
+    cdn.serve(PHOTO_URL, b"jpeg-good", "image/jpeg")
+    b = photo("3_b", PHOTO_URL)
+    put_item(aws, (b, retrying(b)))
+    winner = {"media_key": "3_b", "type": "photo", "status": "stored", "s3_key": "w"}
+
+    class RacingStore(TweetStore):
+        def get_media(self, tweet_id: str) -> list[dict[str, Any]] | None:
+            entries = super().get_media(tweet_id)
+            self._table.update_item(
+                Key={"tweet_id": tweet_id},
+                UpdateExpression="SET media[0] = :e",
+                ExpressionAttributeValues={":e": winner},
+            )
+            return entries
+
+    media_retry.retry_records(
+        [retry_record(b)],
+        media_store=MediaStore(aws.s3, aws.bucket, cdn.client()),
+        tweet_store=RacingStore(aws.tweets_table, aws.s3, aws.bucket),
+    )
+
+    assert emf.one("MediaRetryOutcomes", Outcome="settled_elsewhere") == 1
+    assert emf.one("MediaStored") == 0  # it did not store anything that counts
+
+
+def test_media_retry_failures_are_split_by_reason(aws: Aws, emf: Emf) -> None:
+    cdn = CdnStub()
+    cdn.fail(BROKEN_URL, 503)
+    b = photo("3_b", BROKEN_URL)
+    put_item(aws, (b, retrying(b)))
+
+    retry_run(
+        aws,
+        cdn,
+        [
+            sqs_record("bad", "{nope"),
+            retry_record(b, "r-b"),
+            retry_record(photo("3_x"), "r-x"),
+        ],
+    )
+
+    assert emf.one("MediaRetryFailures", Reason="malformed") == 1
+    assert emf.one("MediaRetryFailures", Reason="transient") == 1
+    assert emf.total("MediaRetryFailures") == 2 + emf.total(
+        "MediaRetryFailures", Reason="error"
+    )
+
+
+def test_the_timestamp_is_epoch_milliseconds_and_about_now(emf: Emf) -> None:
+    import time
+
+    before = time.time() * 1000
+    metrics_doc = metrics_module.build({"TweetsFetched": 1})
+    after = time.time() * 1000
+
+    assert int(before) <= metrics_doc["_aws"]["Timestamp"] <= int(after) + 1  # type: ignore[index]
+
+
+def test_warn_log_level_silences_python_info_but_not_the_metrics(
+    aws: Aws, cdn: CdnStub, emf: Emf
+) -> None:
+    from twitter_timeline_data_pipeline import handlers
+
+    package = logging.getLogger("twitter_timeline_data_pipeline")
+    before = package.level
+    try:
+        handlers.apply_log_level({"LOG_LEVEL": "WARN"})
+        records: list[logging.LogRecord] = []
+
+        class Collect(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                records.append(record)
+
+        collector = Collect(level=logging.DEBUG)
+        logging.getLogger().addHandler(collector)
+        try:
+            process_records(
+                [sqs_record("m", body(photo_message(GOOD))), sqs_record("bad", "{x")],
+                media_store=MediaStore(aws.s3, aws.bucket, cdn.client()),
+                tweet_store=TweetStore(aws.tweets_table, aws.s3, aws.bucket),
+            )
+        finally:
+            logging.getLogger().removeHandler(collector)
+    finally:
+        package.setLevel(before)
+
+    assert {r.levelno for r in records} == {logging.ERROR}  # the malformed one only
+    assert not any(r.getMessage().startswith("stored tweet") for r in records)
+    assert emf.one("TweetsStored") == 1  # stdout metrics are unaffected
+    assert emf.one("RecordFailures", Reason="malformed") == 1
+
+
+@pytest.mark.parametrize(
+    ("value", "level"),
+    [("DEBUG", 10), ("info", 20), ("WARN", 30), ("WARNING", 30), ("ERROR", 40)],
+)
+def test_apply_log_level_maps_the_template_values(value: str, level: int) -> None:
+    from twitter_timeline_data_pipeline import handlers
+
+    package = logging.getLogger("twitter_timeline_data_pipeline")
+    before = package.level
+    try:
+        handlers.apply_log_level({"LOG_LEVEL": value})
+        assert package.level == level
+        handlers.apply_log_level({"LOG_LEVEL": "nonsense"})  # ignored
+        handlers.apply_log_level({})
+        assert package.level == level
+    finally:
+        package.setLevel(before)

@@ -125,6 +125,15 @@ class _Tally:
     """Records reported failed, by reason: they are headed for the DLQ."""
     retries: Counter[str] = field(default_factory=Counter)
     """Records reported failed but expected to succeed on redelivery."""
+
+    def failed(self, reason: str, *, final: bool) -> None:
+        """Count a record reported failed. ``malformed``, ``error`` and
+        ``retry_queue`` never heal by themselves: always a failure. The others are
+        retries, except on the record's last receive: nothing is left to retry, the
+        DLQ is next."""
+        hopeless = reason in ("malformed", "error", "retry_queue")
+        (self.failures if final or hopeless else self.retries)[reason] += 1
+
     media: dict[str, float] = field(default_factory=lambda: media_values(()))
     lags: list[float] = field(default_factory=list)
 
@@ -142,7 +151,7 @@ class _Tally:
             **self.media,
         }
         if self.lags:
-            values["IngestLagSeconds"] = self.lags
+            values["ProcessingLagSeconds"] = self.lags
         metrics.emit(values)
         # Only per reason: each line's empty dimension set is the total, so a separate
         # total line would count every failure twice.
@@ -154,17 +163,19 @@ class _Tally:
                 metrics.emit({name: count}, {"Reason": reason})
 
 
-def _lag_seconds(created_at: str | None, now: datetime) -> float | None:
-    """Seconds from a Tweet's creation to ``now`` (None when it has no usable time)."""
-    if not created_at:
+def _lag_seconds(fetched_at: str | None, now: datetime) -> float | None:
+    """Seconds from the fetch that produced a message to ``now`` (None when it has no
+    usable time). Not from the Tweet's creation: a backfill or a DLQ redrive would
+    swamp that with the age of old Tweets."""
+    if not fetched_at:
         return None
     try:
-        created = datetime.fromisoformat(created_at)
+        fetched = datetime.fromisoformat(fetched_at)
     except ValueError:
         return None
-    if created.tzinfo is None:
+    if fetched.tzinfo is None:
         return None
-    return max(0.0, (now - created).total_seconds())
+    return max(0.0, (now - fetched).total_seconds())
 
 
 def process_records(
@@ -233,11 +244,10 @@ def _process_pending(
     for record in pending:
         message_id = record["messageId"]
         ids = {"message_id": message_id}  # log fields, so logs can be queried by them
-        last_receive = (
-            max_receive_count is not None
-            and retry_queue is not None
-            and _receive_count(record) >= max_receive_count
-        )
+        final = max_receive_count is not None and (
+            _receive_count(record) >= max_receive_count
+        )  # the DLQ is next: what fails now is a failure, not a retry
+        last_receive = final and retry_queue is not None
         if (
             remaining_ms is not None
             and remaining_ms() < SAFETY_MARGIN_MS
@@ -249,7 +259,7 @@ def _process_pending(
                 extra=ids,
             )
             failed.append(message_id)
-            tally.retries["out_of_time"] += 1
+            tally.failed("out_of_time", final=final)
             continue
         try:
             message = TweetMessage.from_json(record["body"])
@@ -331,19 +341,19 @@ def _process_pending(
         except MessageError:
             logger.exception("message %s is malformed", message_id, extra=ids)
             failed.append(message_id)
-            tally.failures["malformed"] += 1
+            tally.failed("malformed", final=final)
         except (TransientMediaError, WriteContentionError) as exc:
             logger.warning("message %s will be retried: %s", message_id, exc, extra=ids)
             failed.append(message_id)
             if isinstance(exc, WriteContentionError):
                 tally.contention += 1
-                tally.retries["write_contention"] += 1
+                tally.failed("write_contention", final=final)
             else:
-                tally.retries["media_transient"] += 1
+                tally.failed("media_transient", final=final)
         except Exception:
             logger.exception("message %s failed", message_id, extra=ids)
             failed.append(message_id)
-            tally.failures["error"] += 1
+            tally.failed("error", final=final)
         else:
             if result.tombstoned:
                 logger.info(
@@ -371,7 +381,7 @@ def _process_pending(
             tally.stored += 1
             tally.add_media(stored)
             tally.missing += len(message.missing_media_keys)
-            lag = _lag_seconds(message.tweet.created_at, now())
+            lag = _lag_seconds(message.fetched_at, now())
             if lag is not None:
                 tally.lags.append(lag)
             if retrying:
@@ -380,7 +390,7 @@ def _process_pending(
                 tally.retries_queued += queued
                 if queued < len(retrying):
                     failed.append(message_id)
-                    tally.failures["retry_queue"] += 1
+                    tally.failed("retry_queue", final=final)
                     continue
             logger.info(
                 "stored tweet %s media=%s",

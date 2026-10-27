@@ -17,7 +17,9 @@ def test_a_line_is_valid_emf_with_unit_namespace_and_both_dimension_sets(
 ) -> None:
     monkeypatch.setenv("METRICS_NAMESPACE", "Custom")
 
-    metrics.emit({"TweetsFetched": 3, "IngestLagSeconds": [1.5, 2]}, {"Username": "u"})
+    metrics.emit(
+        {"TweetsFetched": 3, "ProcessingLagSeconds": [1.5, 2]}, {"Username": "u"}
+    )
 
     (doc,) = emf.read()
     assert doc["_aws"]["Timestamp"] > 0
@@ -27,12 +29,12 @@ def test_a_line_is_valid_emf_with_unit_namespace_and_both_dimension_sets(
             "Dimensions": [["Username"], []],
             "Metrics": [
                 {"Name": "TweetsFetched", "Unit": "Count"},
-                {"Name": "IngestLagSeconds", "Unit": "Seconds"},
+                {"Name": "ProcessingLagSeconds", "Unit": "Seconds"},
             ],
         }
     ]
     assert (doc["Username"], doc["TweetsFetched"]) == ("u", 3)
-    assert doc["IngestLagSeconds"] == [1.5, 2]
+    assert doc["ProcessingLagSeconds"] == [1.5, 2]
 
 
 def test_without_dimensions_the_only_set_is_empty_and_properties_are_fields(
@@ -50,9 +52,9 @@ def test_without_dimensions_the_only_set_is_empty_and_properties_are_fields(
 
 
 def test_a_long_distribution_is_cut_to_the_cloudwatch_limit() -> None:
-    doc = metrics.build({"IngestLagSeconds": list(range(250))})
+    doc = metrics.build({"ProcessingLagSeconds": list(range(250))})
 
-    assert doc["IngestLagSeconds"] == list(range(metrics.MAX_VALUES))
+    assert doc["ProcessingLagSeconds"] == list(range(metrics.MAX_VALUES))
 
 
 def test_nothing_is_written_outside_lambda_unless_forced(
@@ -131,3 +133,31 @@ def test_documents_are_json_lines(emf: Emf, capsys: pytest.CaptureFixture[str]) 
         "TweetsFetched",
         "TweetsEnqueued",
     ]
+
+
+def test_the_emf_validator_rejects_a_timestamp_in_seconds() -> None:
+    from conftest import emf_problems
+
+    doc = metrics.build({"TweetsFetched": 1})
+    assert emf_problems(doc) == []
+
+    doc["_aws"]["Timestamp"] = int(doc["_aws"]["Timestamp"] / 1000)  # type: ignore[index]
+    assert any("Timestamp" in p for p in emf_problems(doc))
+    assert emf_problems({"x": 1}) == ["no _aws object"]
+
+
+def test_account_dimensions_follow_the_switch(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("METRICS_PER_ACCOUNT", raising=False)
+    assert metrics.account_dimensions("nasa") == {}
+    monkeypatch.setenv("METRICS_PER_ACCOUNT", "false")
+    assert metrics.account_dimensions("nasa") == {}
+    monkeypatch.setenv("METRICS_PER_ACCOUNT", "true")
+    assert metrics.account_dimensions("nasa") == {"Username": "nasa"}
+
+
+def test_the_new_settings_are_read() -> None:
+    settings = Settings.from_env({"METRICS_PER_ACCOUNT": "true", "LOG_LEVEL": "warn"})
+
+    assert (settings.metrics_per_account, settings.log_level) == (True, "WARN")
+    assert Settings.from_env({}).metrics_per_account is False
+    assert Settings.from_env({}).log_level == "INFO"

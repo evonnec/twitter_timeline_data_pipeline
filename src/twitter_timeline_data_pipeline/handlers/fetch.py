@@ -305,6 +305,8 @@ class _Run:
     tweets: int = 0
     enqueued: int = 0
     deferred_error: Exception | None = None
+    new_done: bool = False
+    """The new-Tweets phase finished (the timeline was read up to the cursor)."""
     gaps_dropped: int = 0
     partial_errors: int = 0
     quarantined: dict[str, int] = field(default_factory=dict)
@@ -683,7 +685,7 @@ def _check_identity(
     ID (``source`` says where that came from: the state item or the event)."""
     if expected is not None and expected != found:
         logger.error(IDENTITY_CHANGED_MESSAGE, username, source, expected, found)
-        metrics.emit({"IdentityChanged": 1}, {"Username": username})
+        metrics.emit({"IdentityChanged": 1}, metrics.account_dimensions(username))
         raise IdentityChangedError(
             IDENTITY_CHANGED_MESSAGE % (username, source, expected, found)
         )
@@ -793,6 +795,7 @@ def run_fetch(
                 run.max_pages = max(max_pages, 2)
             try:
                 run.fetch_new(since_id, run.max_pages - (1 if run.pending else 0))
+                run.new_done = True
                 run.fill_gaps()
             except NotFoundError:
                 if not cached:
@@ -841,11 +844,13 @@ def _emit_run_metrics(
 ) -> None:
     """One EMF line for the run (and one per quarantine kind), also when it failed:
     what was fetched and enqueued before the error still counts. ``FetchRunSucceeded``
-    is the freshness heartbeat: only a run that looked at the timeline and ended
-    without an error or a rate limit sends it."""
-    dims = {"Username": run.username}
+    is the freshness heartbeat: it is sent once the new-Tweets phase has completed,
+    so the timeline was read up to the cursor. What goes wrong afterwards, in the gap
+    phase (a rate limit, a failed gap), is the backlog's business:
+    ``RateLimitedRuns``, ``PageCapTruncations`` and the errors alarm."""
+    dims = metrics.account_dimensions(run.username)
     reason = None if result is None else result.stopped_reason
-    ok = result is not None and reason != "rate_limited"
+    ok = run.new_done
     metrics.emit(
         {
             "TweetsFetched": run.tweets,

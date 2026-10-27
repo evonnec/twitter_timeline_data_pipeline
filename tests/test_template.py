@@ -523,7 +523,8 @@ def test_media_retry_function_environment(template: Template) -> None:
         "TWEETS_TABLE": {"Ref": "TweetsTable"},
         "MEDIA_BUCKET": {"Ref": "MediaBucket"},
         "MAX_MEDIA_BYTES": {"Ref": "MaxMediaBytes"},
-        "METRICS_NAMESPACE": {"Ref": "MetricsNamespace"},
+        "METRICS_NAMESPACE": NAMESPACE,
+        "LOG_LEVEL": {"Ref": "LogLevel"},
     }
 
 
@@ -904,7 +905,14 @@ def test_no_function_sets_the_test_only_media_host_override(template: Template) 
 # --- queue retention (#37) and alarms on metrics (#19) ---------------------------
 
 FOURTEEN_DAYS = 1_209_600
-TEN_DAYS = 864_000
+SEVEN_DAYS = 604_800
+NAMESPACE = {
+    "Fn::If": [
+        "HasMetricsNamespace",
+        {"Ref": "MetricsNamespace"},
+        {"Fn::Sub": "TwitterTimelinePipeline/${AWS::StackName}"},
+    ]
+}
 ALARM_ACTIONS = {
     "Fn::If": ["HasAlarmTopic", [{"Ref": "AlarmTopicArn"}], {"Ref": "AWS::NoValue"}]
 }
@@ -981,7 +989,7 @@ def test_the_main_queue_age_alarm_is_a_parameter_defaulting_to_an_hour(
         ("MediaRetryDeadLetterQueueAgeAlarm", "MediaRetryDeadLetterQueue"),
     ],
 )
-def test_dead_letter_queue_age_alarms_fire_ten_days_in(
+def test_dead_letter_queue_age_alarms_fire_seven_days_in(
     template: Template, alarm: str, queue: str
 ) -> None:
     props = alarm_props(template, alarm)
@@ -991,9 +999,12 @@ def test_dead_letter_queue_age_alarms_fire_ten_days_in(
         "ApproximateAgeOfOldestMessage",
     )
     assert props["Dimensions"] == queue_dimension(queue)
-    assert props["Threshold"] == TEN_DAYS < FOURTEEN_DAYS
+    # A DLQ message's age counts from the move, its expiry from the first send: 7 days
+    # in the DLQ plus the longest the receive-count caps allow upstream stays under 14.
+    assert props["Threshold"] == SEVEN_DAYS < FOURTEEN_DAYS
     assert props["ComparisonOperator"] == "GreaterThanThreshold"
     assert props["Statistic"] == "Maximum"
+    assert (props["Period"], props["EvaluationPeriods"]) == (300, 1)
     assert props["TreatMissingData"] == "notBreaching"
 
 
@@ -1109,7 +1120,7 @@ def test_metric_alarms_watch_the_emitted_metric_with_the_documented_settings(
 ) -> None:
     props = alarm_props(template, name)
 
-    assert props["Namespace"] == {"Ref": "MetricsNamespace"}
+    assert props["Namespace"] == NAMESPACE
     assert props["MetricName"] == metric
     assert "Dimensions" not in props  # the dimensionless (total) metric
     assert props["Statistic"] == statistic
@@ -1138,8 +1149,9 @@ def test_freshness_alarms_breach_on_missing_heartbeats(
     resource_ = alarms(template)[name]
     props = resource_["Properties"]
 
-    assert props["Namespace"] == {"Ref": "MetricsNamespace"}
+    assert props["Namespace"] == NAMESPACE
     assert props["MetricName"] == metric
+    assert "Dimensions" not in props
     assert (props["Statistic"], props["Period"]) == ("Sum", 3600)
     assert props["ComparisonOperator"] == "LessThanThreshold"
     assert props["Threshold"] == 1
@@ -1167,7 +1179,7 @@ def test_freshness_windows_default_to_twice_the_default_schedules(
 def test_sustained_rate_limiting_needs_consecutive_hours(template: Template) -> None:
     props = alarm_props(template, "RateLimitedRunsAlarm")
 
-    assert props["Namespace"] == {"Ref": "MetricsNamespace"}
+    assert props["Namespace"] == NAMESPACE
     assert props["MetricName"] == "RateLimitedRuns"
     assert (props["Statistic"], props["Period"], props["Threshold"]) == ("Sum", 3600, 1)
     assert props["ComparisonOperator"] == "GreaterThanOrEqualToThreshold"
@@ -1184,9 +1196,7 @@ def test_sustained_rate_limiting_needs_consecutive_hours(template: Template) -> 
 def test_every_function_emits_into_the_stacks_namespace(
     template: Template, function: str
 ) -> None:
-    assert env_of(template, function)["METRICS_NAMESPACE"] == {
-        "Ref": "MetricsNamespace"
-    }
+    assert env_of(template, function)["METRICS_NAMESPACE"] == NAMESPACE
 
 
 def test_no_function_may_put_metric_data(template: Template) -> None:
@@ -1225,11 +1235,15 @@ def emitted_metric_names() -> set[str]:
 def test_an_alarm_never_watches_a_metric_nobody_emits(template: Template) -> None:
     from twitter_timeline_data_pipeline import metrics
 
-    watched = {
-        props["MetricName"]
-        for props in (a["Properties"] for a in alarms(template).values())
-        if props["Namespace"] == {"Ref": "MetricsNamespace"}
-    }
+    watched = set()
+    for res in alarms(template).values():
+        props = res["Properties"]
+        if props.get("Namespace") == NAMESPACE:
+            watched.add(props["MetricName"])
+        for m in props.get("Metrics", []):
+            stat = m.get("MetricStat")
+            if stat and stat["Metric"]["Namespace"] == NAMESPACE:
+                watched.add(stat["Metric"]["MetricName"])
 
     assert watched
     assert watched <= emitted_metric_names()
@@ -1240,3 +1254,127 @@ def test_every_declared_metric_is_emitted_somewhere() -> None:
     from twitter_timeline_data_pipeline import metrics
 
     assert set(metrics.UNITS) == emitted_metric_names()
+
+
+def test_receive_count_caps_keep_a_message_from_expiring_before_its_dlq(
+    template: Template,
+) -> None:
+    parameters = template["Parameters"]
+    main_visibility = properties(template, "TweetsQueue")["VisibilityTimeout"]
+    retry_visibility = properties(template, "MediaRetryQueue")["VisibilityTimeout"]
+
+    upstream = parameters["MaxReceiveCount"]["MaxValue"] * main_visibility
+    retry = parameters["MediaRetryMaxReceiveCount"]["MaxValue"] * retry_visibility
+
+    assert upstream + SEVEN_DAYS < FOURTEEN_DAYS
+    assert retry + SEVEN_DAYS < FOURTEEN_DAYS
+
+
+def test_the_queue_age_threshold_cannot_be_set_past_the_retention(
+    template: Template,
+) -> None:
+    parameter = template["Parameters"]["QueueAgeAlarmSeconds"]
+
+    assert parameter["MaxValue"] <= SEVEN_DAYS < FOURTEEN_DAYS
+
+
+def test_the_media_retry_queue_has_an_age_alarm(template: Template) -> None:
+    props = alarm_props(template, "MediaRetryQueueAgeAlarm")
+
+    assert (props["Namespace"], props["MetricName"]) == (
+        "AWS/SQS",
+        "ApproximateAgeOfOldestMessage",
+    )
+    assert props["Dimensions"] == queue_dimension("MediaRetryQueue")
+    assert (props["Statistic"], props["Period"], props["EvaluationPeriods"]) == (
+        "Maximum",
+        300,
+        1,
+    )
+    assert props["Threshold"] == 86_400
+    assert props["ComparisonOperator"] == "GreaterThanThreshold"
+    assert props["TreatMissingData"] == "notBreaching"
+
+
+def test_media_retry_record_failures_alarm_adds_only_the_reasons_that_do_not_heal(
+    template: Template,
+) -> None:
+    props = alarm_props(template, "MediaRetryRecordFailuresAlarm")
+
+    by_id = {m["Id"]: m for m in props["Metrics"]}
+    assert by_id["bad"]["Expression"] == "FILL(malformed, 0) + FILL(error, 0)"
+    for reason in ("malformed", "error"):
+        stat = by_id[reason]["MetricStat"]
+        assert stat["Metric"]["Namespace"] == NAMESPACE
+        assert stat["Metric"]["MetricName"] == "MediaRetryFailures"
+        assert stat["Metric"]["Dimensions"] == [{"Name": "Reason", "Value": reason}]
+        assert (stat["Stat"], stat["Period"]) == ("Sum", 300)
+        assert by_id[reason]["ReturnData"] is False
+    assert (props["Threshold"], props["EvaluationPeriods"]) == (0, 1)
+    assert props["ComparisonOperator"] == "GreaterThanThreshold"
+    assert props["TreatMissingData"] == "notBreaching"
+
+
+def test_the_application_log_level_never_exceeds_info(template: Template) -> None:
+    # Lambda's JSON log format files unlevelled stdout lines (the EMF metrics) under
+    # INFO, so WARN or ERROR there would drop every metric.
+    level = template["Globals"]["Function"]["LoggingConfig"]["ApplicationLogLevel"]
+
+    assert level == {"Fn::If": ["LogLevelIsDebug", "DEBUG", "INFO"]}
+    assert template["Conditions"]["LogLevelIsDebug"] == {
+        "Fn::Equals": [{"Ref": "LogLevel"}, "DEBUG"]
+    }
+    assert not {"WARN", "ERROR"} & set(level["Fn::If"][1:])
+
+
+@pytest.mark.parametrize(
+    "function",
+    ["FetchFunction", "ProcessFunction", "MediaRetryFunction", "ComplianceFunction"],
+)
+def test_the_requested_log_level_is_applied_in_code(
+    template: Template, function: str
+) -> None:
+    assert env_of(template, function)["LOG_LEVEL"] == {"Ref": "LogLevel"}
+
+
+def test_per_account_metrics_are_opt_in_and_only_the_fetch_function_needs_them(
+    template: Template,
+) -> None:
+    parameter = template["Parameters"]["MetricsPerAccount"]
+
+    assert parameter["Default"] == "false"
+    assert env_of(template, "FetchFunction")["METRICS_PER_ACCOUNT"] == {
+        "Ref": "MetricsPerAccount"
+    }
+
+
+def test_the_default_namespace_is_per_stack_and_never_aws(template: Template) -> None:
+    import re
+
+    parameter = template["Parameters"]["MetricsNamespace"]
+    pattern = re.compile(parameter["AllowedPattern"])
+
+    assert parameter["Default"] == ""
+    assert template["Conditions"]["HasMetricsNamespace"] == {
+        "Fn::Not": [{"Fn::Equals": [{"Ref": "MetricsNamespace"}, ""]}]
+    }
+    assert pattern.fullmatch("")
+    assert pattern.fullmatch("Team/Twitter Pipeline-1.0_x#y:z")
+    assert not pattern.fullmatch("AWS/Lambda")
+    assert not pattern.fullmatch("bad*char")
+    assert not pattern.fullmatch("x" * 256)
+    assert pattern.fullmatch("AWSome")  # only the AWS/ prefix is reserved
+
+
+def test_every_alarm_in_the_metrics_namespace_uses_the_total(
+    template: Template,
+) -> None:
+    custom = [
+        (name, res["Properties"])
+        for name, res in alarms(template).items()
+        if res["Properties"].get("Namespace") == NAMESPACE
+    ]
+
+    assert len(custom) >= 9
+    for name, props in custom:
+        assert "Dimensions" not in props, name  # the dimensionless set only

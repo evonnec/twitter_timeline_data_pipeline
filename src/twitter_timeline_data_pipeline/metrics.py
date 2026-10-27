@@ -34,6 +34,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_NAMESPACE: Final = DEFAULT_METRICS_NAMESPACE
 NAMESPACE_ENV: Final = "METRICS_NAMESPACE"
 FORCE_ENV: Final = "METRICS_EMIT"
+PER_ACCOUNT_ENV: Final = "METRICS_PER_ACCOUNT"
 
 # CloudWatch accepts up to 100 values per metric (and 100 metrics per line, far more
 # than the declared names).
@@ -56,7 +57,7 @@ UNITS: Final[Mapping[str, str]] = {
     "RecordFailures": "Count",
     "RecordRetries": "Count",
     "WriteContentionErrors": "Count",
-    "IngestLagSeconds": "Seconds",
+    "ProcessingLagSeconds": "Seconds",
     "MediaStored": "Count",
     "MediaExisted": "Count",
     "MediaUnavailable": "Count",
@@ -85,6 +86,20 @@ def enabled() -> bool:
     return bool(
         os.environ.get("AWS_LAMBDA_FUNCTION_NAME") or os.environ.get(FORCE_ENV) == "1"
     )
+
+
+def account_dimensions(username: str) -> dict[str, str]:
+    """``{"Username": ...}`` when per-account series are switched on (the
+    ``MetricsPerAccount`` parameter), else no dimension: every extra dimension value is
+    another billed series."""
+    if os.environ.get(PER_ACCOUNT_ENV, "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        return {"Username": username}
+    return {}
 
 
 def namespace() -> str:
