@@ -2,6 +2,7 @@
 cleared Tweet, copy scrubs over several runs, a failure after the redacted put, holder
 messages in quarantine, shared media) and the limits of a run."""
 
+import contextlib
 import json
 import logging
 from datetime import timedelta
@@ -544,13 +545,31 @@ def test_the_confirmation_waits_when_time_is_up(aws: Aws, clock: Clock) -> None:
     assert step.deferred == 2 and step.failures == []
 
 
-def test_a_scan_for_held_media_that_runs_out_of_time_defers_the_batch(
-    aws: Aws,
-) -> None:
-    store = store_for(aws)
+def paged_store(aws: Aws) -> ComplianceStore:
+    """A store whose table scans return one item a page."""
+    real = aws.tweets_table
+
+    class OneAtATime:
+        def scan(self, **kw: Any) -> Any:
+            return real.scan(Limit=1, **kw)
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(real, name)
+
+    return ComplianceStore(OneAtATime(), aws.state_table, aws.s3, aws.bucket)  # type: ignore[arg-type]
+
+
+def test_the_held_media_scan_resumes_from_its_cursor_across_runs(aws: Aws) -> None:
+    store = paged_store(aws)
     doomed = put(aws, 1, with_media=True)
+    others = [put(aws, n, with_media=True) for n in (2, 3, 4)]
     own_key = (item(aws, doomed) or {})["media_keys"][0]
-    quarantine(aws, "media", {"media_key": own_key, "type": "photo"})
+    aws.tweets_table.update_item(  # the last Tweet also lists the doomed one's key
+        Key={"tweet_id": others[-1]},
+        UpdateExpression="SET media_keys = :k",
+        ExpressionAttributeValues={":k": [own_key]},
+    )
+    key = quarantine(aws, "media", {"media_key": own_key, "type": "photo"})
     store.start_batch(
         "own#t",
         mode="own",
@@ -559,15 +578,57 @@ def test_a_scan_for_held_media_that_runs_out_of_time_defers_the_batch(
         first_day="2026-10-11",
         media_keys={own_key},
     )
-    gate = Gate(1)  # the quarantine listing's check is fine, the held scan's is not
 
-    stalled = store.advance("own#t", stop=gate)
+    stalled = store.advance("own#t", stop=Gate(3))  # the quarantine check, two pages
 
     assert stalled is not None and not stalled.done
     saved = store.load_batch("own#t") or {}
-    assert saved["quar_after"].startswith("quarantine/")  # not past the object
-    assert store.advance("own#t") is not None  # with time, it finishes
-    assert (store.load_batch("own#t") or {})["complete"] is True
+    assert saved["held_scan"]["cursor"]  # it kept its place
+    assert saved["quar_after"].startswith("quarantine/")  # and not past the object
+    finished = store.advance("own#t")  # the next run goes on from the cursor
+    assert finished is not None and finished.done
+    assert len(versions(aws, key)) == 1  # another Tweet lists the key: kept
+
+
+def test_a_held_media_scan_that_cannot_read_a_page_is_a_failure(aws: Aws) -> None:
+    store = store_for(aws)
+    doomed = put(aws, 1, with_media=True)
+    own_key = (item(aws, doomed) or {})["media_keys"][0]
+    quarantine(aws, "media", {"media_key": own_key, "type": "photo"})
+    store.start_batch(
+        "own#u",
+        mode="own",
+        author=USER_ID,
+        ids={doomed},
+        first_day="2026-10-11",
+        media_keys={own_key},
+    )
+
+    with pytest.raises(ComplianceError, match="made no progress"):
+        store.advance("own#u", stop=Gate(1))  # time is up before the first page
+
+
+def test_the_explicit_page_keys_stop_for_time_and_resume_where_they_were(
+    aws: Aws,
+) -> None:
+    store = store_for(aws)
+    doomed = put(aws, 1)
+    keys = []
+    for n in range(3):
+        key = f"raw/{USER_ID}/dt=2026-10-12/e{n}-1.json.gz"
+        land(aws, key, envelope(response(api_tweet(doomed))))
+        keys.append(key)
+    store.start_batch(
+        "own#e", mode="own", author=None, ids={doomed}, first_day="", explicit=keys
+    )
+
+    stalled = store.advance("own#e", stop=Gate(1))  # time for one page only
+
+    assert stalled is not None and not stalled.done and stalled.pages == 1
+    assert (store.load_batch("own#e") or {})["explicit_done"] == 1
+    finished = store.advance("own#e")
+    assert finished is not None and finished.done and finished.pages == 2
+    assert all(doomed not in ids_in(aws, k) for k in keys)
 
 
 # --- retention edges ---
@@ -626,7 +687,7 @@ def test_a_batch_is_capped_and_its_state_stays_small(aws: Aws) -> None:
         first_day="2026-01-01",
         holders=ids,
         explicit=[f"raw/{USER_ID}/dt=2026-01-01/{n}.json.gz" for n in range(2000)],
-        media_keys=[f"3_{n}" for n in range(9000)],
+        media_keys=[f"3_{n}" for n in range(4000)],
     )
 
     assert len(state["ids"]) == len(state["holders"]) == BATCH_CAP
@@ -635,6 +696,19 @@ def test_a_batch_is_capped_and_its_state_stays_small(aws: Aws) -> None:
     result = store.advance("own#big", stop=lambda: True)
     assert result is not None
     assert not result.covers(ids, "2026-01-01")  # the IDs past the cap wait
+
+
+def test_the_media_keys_of_a_batch_come_from_the_tweets_in_it(aws: Aws) -> None:
+    store = store_for(aws)
+    ids = [str(1700000000000000000 + n) for n in range(BATCH_CAP + 5)]
+    items = [{"tweet_id": i, "media_keys": [f"3_{i}"]} for i in ids]
+
+    store.redact_raw("own#k", items, ids, first_day="", author=None)
+
+    state = store.load_batch("own#k") or {}
+    assert len(state["ids"]) == BATCH_CAP
+    assert set(state["media_keys"]) == {f"3_{i}" for i in state["ids"]}  # none lost
+    assert f"3_{ids[-1]}" not in state["media_keys"]  # a Tweet that waits: not yet
 
 
 # --- the mutation gaps ---
@@ -711,3 +785,193 @@ def test_a_failure_to_begin_a_purge_is_reported(
 
     with pytest.raises(ComplianceError, match=f"purge {tweet}: ClientError"):
         job(aws, Lookup({tweet: "deleted"}), clock, max_lookups=4).run(HANDLE)
+
+
+# --- R3-1: own purges are not starved by copy batches ---
+
+
+class PageClock:
+    """``remaining_ms`` for a run with time for ``pages`` raw-page reads."""
+
+    def __init__(self, pages: int) -> None:
+        self.left = pages
+
+    def remaining(self) -> int:
+        return 10**6 if self.left > 0 else 0
+
+
+def run_with_pages(
+    aws: Aws,
+    clock: Clock,
+    lookup: Lookup,
+    pages: int,
+    monkeypatch: pytest.MonkeyPatch,
+    **kwargs: Any,
+) -> Any:
+    budget = PageClock(pages)
+    original = ComplianceStore._read
+
+    def costly(self: ComplianceStore, key: str) -> Any:
+        budget.left -= 1
+        return original(self, key)
+
+    monkeypatch.setattr(ComplianceStore, "_read", costly)
+    step = job(aws, lookup, clock, remaining_ms=budget.remaining, **kwargs)
+    with contextlib.suppress(ComplianceError):  # a deferred step may fail the run
+        step.run(HANDLE)
+    monkeypatch.setattr(ComplianceStore, "_read", original)
+    return step
+
+
+def seed_includes(aws: Aws, count: int, includes: list[str]) -> None:
+    for day in range(count):
+        stamp = f"2026-{11 + day // 28:02d}-{1 + day % 28:02d}"
+        body = response(api_tweet(tid(900 + day)))
+        body["includes"] = {"tweets": [api_tweet(i) for i in includes]}
+        land(aws, f"raw/{USER_ID}/dt={stamp}/p{day}-1.json.gz", envelope(body))
+
+
+def test_copy_batches_do_not_starve_an_own_purge(
+    aws: Aws, clock: Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    doomed = put(aws, 1)
+    for n, ref in enumerate((B, C, D)):
+        put_quote(aws, 10 + n, ref)
+    seed_includes(aws, 30, [B, C, D])  # each copy batch needs 30 reads; a run has 12
+    gone = {doomed: "deleted", B: "deleted", C: "deleted", D: "deleted"}
+
+    purged_at_run = None
+    for n in range(1, 13):
+        run_with_pages(
+            aws, clock, Lookup(gone), 12, monkeypatch, grace=timedelta(0), max_lookups=4
+        )
+        if purged_at_run is None and "purged_at" in (item(aws, doomed) or {}):
+            purged_at_run = n
+        clock.now += timedelta(hours=6)
+
+    assert purged_at_run is not None and purged_at_run <= 3  # as without copy batches
+
+
+def test_the_baseline_own_purge_without_copy_batches(
+    aws: Aws, clock: Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    doomed = put(aws, 1)
+    seed_includes(aws, 30, [])
+    purged_at_run = None
+    for n in range(1, 13):
+        run_with_pages(
+            aws,
+            clock,
+            Lookup({doomed: "deleted"}),
+            12,
+            monkeypatch,
+            grace=timedelta(0),
+            max_lookups=4,
+        )
+        if purged_at_run is None and "purged_at" in (item(aws, doomed) or {}):
+            purged_at_run = n
+        clock.now += timedelta(hours=6)
+    assert purged_at_run is not None and purged_at_run <= 3
+
+
+def test_copy_batches_keep_half_of_the_time_while_a_purge_runs(
+    aws: Aws, clock: Clock
+) -> None:
+    store = store_for(aws)
+    store.start_batch("copy#w", mode="copy", author="w", ids={B}, first_day="")
+    reserves: list[int] = []
+    step = job(aws, Lookup(), clock, remaining_ms=lambda: 230_000)
+    original = step._purge_due
+
+    def spying(tombstones: Any) -> None:
+        reserves.append(step._reserve_ms)
+        original(tombstones)
+
+    step._purge_due = spying  # type: ignore[method-assign]
+    step._walk = lambda tombstones: None  # type: ignore[method-assign]
+
+    step.run(HANDLE)
+
+    assert reserves == [30_000 + 100_000]  # half of the 200 s above the margin
+    assert step._reserve_ms == 30_000  # back to the margin for the copy batches
+
+
+# --- R3-P2: a stuck copy unit does not stop the grace clocks ---
+
+
+def test_a_waiting_holder_still_gets_its_first_sighting_recorded(
+    aws: Aws, clock: Clock
+) -> None:
+    waiting = put_quote(aws, 1, B)
+    store_for(aws).start_batch(
+        f"copy#{USER_ID}", mode="copy", author=USER_ID, ids={C}, first_day=""
+    )
+
+    step = job(aws, Lookup({B: "deleted"}), clock, grace=timedelta(0))
+    step._advance_copy_batches = lambda: None  # type: ignore[method-assign]
+    step.run(HANDLE)
+
+    marked = entry(aws, waiting)
+    assert (
+        marked["status"] == "unavailable" and "text" in marked
+    )  # marked, not scrubbed
+    assert step.copies_marked == 1 and step.copies_scrubbed == 0
+
+
+def test_marking_a_waiting_holder_that_fails_is_reported(
+    aws: Aws, clock: Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    put_quote(aws, 1, B)
+    store_for(aws).start_batch(
+        f"copy#{USER_ID}", mode="copy", author=USER_ID, ids={C}, first_day=""
+    )
+    original = ComplianceStore.update_copies
+
+    def failing(self: ComplianceStore, *args: Any, **kwargs: Any) -> Any:
+        if kwargs.get("mark_only"):
+            raise ClientError({"Error": {"Code": "Throttled"}}, "UpdateItem")
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(ComplianceStore, "update_copies", failing)
+    step = job(aws, Lookup({B: "deleted"}), clock, grace=timedelta(0))
+    step._advance_copy_batches = lambda: None  # type: ignore[method-assign]
+
+    with pytest.raises(ComplianceError, match="copies"):
+        step.run(HANDLE)
+
+
+def test_a_stuck_copy_unit_fails_the_run_every_time(aws: Aws, clock: Clock) -> None:
+    holder = put_quote(aws, 1, B)
+    key = f"raw/{USER_ID}/dt=2026-10-14/bad-1.json.gz"
+    land(aws, key, b"not gzip, but it names " + B.encode())  # unparseable, names B
+    store_for(aws).start_batch(
+        f"copy#{USER_ID}", mode="copy", author=USER_ID, ids={B}, first_day="2026-10-11"
+    )
+
+    for _ in range(2):
+        with pytest.raises(ComplianceError, match="raw pages of copies"):
+            job(aws, Lookup({B: "deleted"}), clock, grace=timedelta(0)).run(HANDLE)
+
+    assert "text" in entry(aws, holder)  # nothing is scrubbed while it is stuck
+
+
+def test_the_explicit_page_progress_is_saved_every_few_pages(aws: Aws) -> None:
+    store = store_for(aws)
+    keys = [f"raw/{USER_ID}/dt=2026-10-12/missing{n}.json.gz" for n in range(26)]
+    store.start_batch(
+        "own#p", mode="own", author=None, ids={"1"}, first_day="", explicit=keys
+    )
+
+    result = store.advance("own#p")
+
+    assert result is not None and result.done
+    assert (store.load_batch("own#p") or {})["explicit_done"] == 26
+
+
+def test_the_one_go_held_media_scan_raises_when_time_is_up(aws: Aws) -> None:
+    from twitter_timeline_data_pipeline.handlers.compliance import _OutOfTime
+
+    put(aws, 1, with_media=True)
+
+    with pytest.raises(_OutOfTime):
+        store_for(aws).media_keys_held_by_others({"3_1"}, set(), lambda: True)
