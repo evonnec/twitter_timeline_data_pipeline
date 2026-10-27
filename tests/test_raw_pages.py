@@ -404,7 +404,8 @@ def test_a_raw_page_is_never_overwritten(aws: Aws) -> None:
     pages.put(
         username=USERNAME,
         user_id=USER_ID,
-        fetched_at="2026-10-26T00:00:00Z",
+        # the day of the landed page's key (the run was today, not a fixed date)
+        fetched_at=keys(aws)[0].split("dt=")[1][:10] + "T00:00:00Z",
         page_no=1,
         page=RawPage(endpoint="/x", params={}, body={"other": 1}),
     )

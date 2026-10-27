@@ -91,7 +91,7 @@ def process_records(
     remaining_ms: Callable[[], int] | None = None,
     max_receive_count: int | None = None,
     retry_queue: MediaRetryQueue | None = None,
-    restore_notes: Callable[[TweetMessage], TweetMessage] | None = None,
+    restore_notes: Callable[..., TweetMessage] | None = None,
 ) -> list[str]:
     """Process SQS records; return the ``messageId`` of each one that failed.
 
@@ -150,7 +150,7 @@ def process_records(
                 try:
                     if restore_notes is None:
                         raise MessageError("content omitted, no raw page reader")
-                    message = restore_notes(message)
+                    message = restore_notes(message, best_effort=last_receive)
                 except Exception as exc:
                     if not last_receive:
                         raise

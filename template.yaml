@@ -426,12 +426,15 @@ Resources:
           MEDIA_RETRY_QUEUE_URL: !Ref MediaRetryQueue
           RETENTION_DAYS: !Ref RetentionDays
       Policies:
-        - DynamoDBWritePolicy:
-            TableName: !Ref TweetsTable
         - SQSSendMessagePolicy:
             QueueName: !GetAtt MediaRetryQueue.QueueName
         - Version: "2012-10-17"
           Statement:
+            # put_tweet reads the stored item (consistent) and merges it in before its
+            # conditional put. No UpdateItem, BatchWriteItem or DeleteItem.
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:PutItem]
+              Resource: !GetAtt TweetsTable.Arn
             - Effect: Allow
               Action: [s3:PutObject, s3:GetObject, s3:AbortMultipartUpload]
               Resource:

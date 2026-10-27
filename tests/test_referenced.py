@@ -2146,3 +2146,404 @@ def test_surrogates_are_replaced_in_every_json_string() -> None:
         {"id": TID, "text": "t\ud83d", "withheld": {"x": "\ud83d"}}
     ).withheld == {"x": "�"}
     assert Tweet.from_api({"id": TID, "text": "t\ud83d"}).text == "t\ud83d"
+
+
+# ---- re-check fixes: entities follow their text, per-type carry, key content ----
+
+
+def url_entities(n: int, tag: str) -> dict[str, Any]:
+    return {
+        "urls": [
+            {
+                "url": f"https://t.co/{tag}{i}",
+                "expanded_url": f"https://ex.com/{tag}/{i}",
+                "start": i * 24,
+                "end": i * 24 + 23,
+            }
+            for i in range(n)
+        ]
+    }
+
+
+def put_ref(
+    aws: Aws, copy: ReferencedPost, at: str, tweet: dict[str, Any] | None = None
+) -> None:
+    TweetStore(aws.tweets_table, aws.s3, aws.bucket).put_tweet(
+        make_message(
+            tweet=tweet
+            or {"text": "q", "referenced_tweets": [{"type": "quoted", "id": "7"}]},
+            referenced=(copy,),
+            fetched_at=at,
+        ),
+        [],
+    )
+
+
+def only_ref(aws: Aws) -> dict[str, Any]:
+    (ref,) = stored(aws, TID)["referenced_tweets"]
+    return cast(dict[str, Any], ref)
+
+
+def test_a_kept_long_copy_keeps_the_note_entities_not_the_previews(aws: Aws) -> None:
+    note = url_entities(40, "n")
+    put_ref(
+        aws,
+        ReferencedPost(
+            id="7",
+            type="quoted",
+            text="preview",
+            note_text="full " * 400,
+            entities=note,
+        ),
+        OLD,
+    )
+
+    put_ref(
+        aws,
+        ReferencedPost(
+            id="7", type="quoted", text="preview", entities=url_entities(1, "p")
+        ),
+        NEW,
+    )
+
+    ref = only_ref(aws)
+    assert ref["text"] == "full " * 400 and ref["is_long_post"] is True
+    assert ref["entities"] == compact_entities(note)
+
+
+def test_a_stored_long_copy_without_entities_drops_the_previews(aws: Aws) -> None:
+    put_ref(
+        aws,
+        ReferencedPost(id="7", type="quoted", text="preview", note_text="full " * 400),
+        OLD,
+    )
+
+    put_ref(
+        aws,
+        ReferencedPost(
+            id="7", type="quoted", text="preview", entities=url_entities(1, "p")
+        ),
+        NEW,
+    )
+
+    assert "entities" not in only_ref(aws)  # they index the preview, not the text
+
+
+def test_a_stored_previews_entities_are_not_carried_next_to_a_full_text(
+    aws: Aws,
+) -> None:
+    put_ref(
+        aws,
+        ReferencedPost(
+            id="7", type="quoted", text="preview", entities=url_entities(1, "p")
+        ),
+        OLD,
+    )
+
+    put_ref(
+        aws,
+        ReferencedPost(id="7", type="quoted", text="preview", note_text="full " * 400),
+        NEW,
+    )
+
+    ref = only_ref(aws)
+    assert ref["is_long_post"] is True and "entities" not in ref
+
+
+def test_a_reply_and_a_quote_of_the_same_post_are_both_carried(aws: Aws) -> None:
+    store = TweetStore(aws.tweets_table, aws.s3, aws.bucket)
+    both = [{"type": "replied_to", "id": "7"}, {"type": "quoted", "id": "7"}]
+    copy = ReferencedPost(id="7", type="replied_to", text="orig", author_id="111")
+    store.put_tweet(
+        make_message(
+            tweet={"text": "q", "referenced_tweets": both},
+            referenced=(copy, replace(copy, type="quoted")),
+            fetched_at=OLD,
+        ),
+        [],
+    )
+
+    store.put_tweet(make_message(tweet={"text": "q"}, fetched_at=NEW), [])
+
+    refs = stored(aws, TID)["referenced_tweets"]
+    assert [r["type"] for r in refs] == ["replied_to", "quoted"]
+    assert all(r["missing_since"] == NEW and r["text"] == "orig" for r in refs)
+
+
+def test_a_listed_type_leaves_the_other_stored_type_carried(aws: Aws) -> None:
+    store = TweetStore(aws.tweets_table, aws.s3, aws.bucket)
+    both = [{"type": "replied_to", "id": "7"}, {"type": "quoted", "id": "7"}]
+    copy = ReferencedPost(id="7", type="replied_to", text="orig")
+    store.put_tweet(
+        make_message(
+            tweet={"text": "q", "referenced_tweets": both},
+            referenced=(copy, replace(copy, type="quoted")),
+            fetched_at=OLD,
+        ),
+        [],
+    )
+
+    store.put_tweet(
+        make_message(
+            tweet={"text": "q", "referenced_tweets": [both[0]]},
+            referenced=(copy,),
+            fetched_at=NEW,
+        ),
+        [],
+    )
+
+    refs = stored(aws, TID)["referenced_tweets"]
+    assert [r["type"] for r in refs] == ["replied_to", "quoted"]
+    assert "missing_since" not in refs[0] and refs[1]["missing_since"] == NEW
+
+
+def test_the_entities_omitted_marker_stays_when_the_stored_copy_has_none(
+    aws: Aws,
+) -> None:
+    put_ref(aws, ReferencedPost(id="7", type="quoted", text="orig"), OLD)
+
+    put_ref(
+        aws,
+        ReferencedPost(id="7", type="quoted", text="orig", entities_omitted=True),
+        NEW,
+    )
+
+    ref = only_ref(aws)
+    assert "entities" not in ref and ref["entities_omitted"] is True
+
+
+def test_the_entities_omitted_marker_goes_when_the_stored_copy_has_entities(
+    aws: Aws,
+) -> None:
+    put_ref(
+        aws,
+        ReferencedPost(id="7", type="quoted", text="o", entities=url_entities(2, "s")),
+        OLD,
+    )
+
+    put_ref(
+        aws,
+        ReferencedPost(id="7", type="quoted", text="o", entities_omitted=True),
+        NEW,
+    )
+
+    ref = only_ref(aws)
+    assert len(ref["entities"]["urls"]) == 2 and "entities_omitted" not in ref
+
+
+PREVIEW = "the start of a long post \ud83d"  # cut mid-emoji: always offloaded
+
+
+def put_degraded_then_full(aws: Aws) -> str:
+    degraded = ReferencedPost(
+        id="7", type="quoted", text=PREVIEW, note_text_omitted=True
+    )
+    put_ref(aws, degraded, OLD)
+    first_key: str = only_ref(aws)["text_s3_key"]
+    big = {
+        "text": "x",
+        "note_text": "n" * 200_000,
+        "referenced_tweets": [{"type": "quoted", "id": "7"}],
+    }
+    full = ReferencedPost(id="7", type="quoted", text=PREVIEW, note_text="q" * 400_000)
+    put_ref(aws, full, NEW, big)
+    return first_key
+
+
+def test_a_taken_text_key_holding_another_text_sends_the_text_to_a_hashed_key(
+    aws: Aws,
+) -> None:
+    first_key = put_degraded_then_full(aws)
+
+    ref = only_ref(aws)
+    key = ref["text_s3_key"]
+    assert key != first_key and key.startswith(first_key.removesuffix(".json") + ".")
+    assert key.startswith(f"text/{USER_ID}/{TID}.") or key.startswith("text/")
+    assert read_json(aws, key) == "q" * 400_000
+    assert read_json(aws, first_key) == PREVIEW  # never overwritten
+
+
+def test_a_taken_text_key_holding_the_same_text_is_reused(aws: Aws) -> None:
+    put_degraded_then_full(aws)
+    key = only_ref(aws)["text_s3_key"]
+    big = {
+        "text": "x",
+        "note_text": "n" * 200_000,
+        "referenced_tweets": [{"type": "quoted", "id": "7"}],
+    }
+    full = ReferencedPost(id="7", type="quoted", text=PREVIEW, note_text="q" * 400_000)
+
+    put_ref(aws, full, "2026-10-23T00:00:00Z", big)
+
+    assert only_ref(aws)["text_s3_key"] == key
+
+
+def test_the_tweets_own_text_key_never_points_at_another_text(aws: Aws) -> None:
+    store = TweetStore(aws.tweets_table, aws.s3, aws.bucket)
+    first = make_message(tweet={"text": PREVIEW}, fetched_at=OLD)
+    store.put_tweet(first, [])
+    first_key = stored(aws, TID)["text_s3_key"]
+    other = make_message(tweet={"text": PREVIEW + " and more \ud83d"}, fetched_at=NEW)
+
+    store.put_tweet(other, [])
+
+    key = stored(aws, TID)["text_s3_key"]
+    assert key != first_key and read_json(aws, key) == PREVIEW + " and more \ud83d"
+    assert read_json(aws, first_key) == PREVIEW
+
+
+# ---- best-effort restore ---------------------------------------------------------
+
+
+def test_best_effort_restores_each_value_on_its_own(aws: Aws) -> None:
+    body = link_heavy_page(3, 100)
+    body["data"][0]["referenced_tweets"].append({"type": "replied_to", "id": "8"})
+    message = land_page(aws, body)
+    extra = ReferencedPost(
+        id="8", type="replied_to", text="p8", note_text="full 8", entities=None
+    )
+    message = replace(message, referenced=(message.referenced[0], extra))
+    slim = fully_slim(message)
+
+    restored = restore_omitted(aws.s3, aws.bucket, slim, best_effort=True)
+
+    seven, eight = restored.referenced
+    assert seven.note_text == "o" * 100 and not seven.note_text_omitted
+    assert seven.entities is not None and not seven.entities_omitted
+    assert eight.note_text_omitted and eight.note_text is None  # not on the page
+    assert restored.tweet.entities == message.tweet.entities
+    assert not restored.tweet.entities_omitted
+    with pytest.raises(RawPageError, match="no note for 8"):
+        restore_omitted(aws.s3, aws.bucket, slim)
+
+
+def test_best_effort_keeps_the_marker_of_a_missing_value(aws: Aws) -> None:
+    message = land_page(aws, link_heavy_page(3, 100))
+    envelope = Envelope(
+        username="u",
+        user_id=USER_ID,
+        fetched_at=NEW,
+        request={"endpoint": "/2/users/1/tweets", "params": PARAMS},
+        response={"data": [{"id": "9", "text": "other"}], "includes": {}},
+    )
+    aws.s3.put_object(Bucket=aws.bucket, Key=RAW_KEY, Body=envelope.to_bytes())
+
+    restored = restore_omitted(
+        aws.s3, aws.bucket, fully_slim(message), best_effort=True
+    )
+
+    assert restored.tweet.entities_omitted
+    assert restored.referenced[0].entities_omitted
+
+
+def test_best_effort_without_a_readable_page_restores_nothing(aws: Aws) -> None:
+    message = land_page(aws, link_heavy_page(3, 100))
+    slim = fully_slim(message)
+    gone = replace(slim, raw_key="raw/1/dt=2026-10-22/gone.json.gz")
+
+    assert restore_omitted(aws.s3, aws.bucket, gone, best_effort=True) == gone
+    assert restore_omitted(
+        aws.s3, aws.bucket, replace(slim, raw_key=None), best_effort=True
+    )
+    aws.s3.put_object(Bucket=aws.bucket, Key=RAW_KEY, Body=b"not gzip")
+    assert restore_omitted(aws.s3, aws.bucket, slim, best_effort=True) == slim
+    with pytest.raises(RawPageError):
+        restore_omitted(aws.s3, aws.bucket, slim)
+
+
+def test_one_missing_note_does_not_stop_the_rest_on_the_last_receive(
+    pipeline_env: Aws, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    aws = pipeline_env
+    monkeypatch.setenv("MAX_RECEIVE_COUNT", "5")
+    entities = url_entities(3, "t")
+    refs = [{"type": "quoted", "id": "7"}, {"type": "replied_to", "id": "8"}]
+    body = {
+        "data": [
+            {"id": TID, "text": "q", "entities": entities, "referenced_tweets": refs}
+        ],
+        "includes": {
+            "tweets": [{"id": "7", "text": "p7", "note_tweet": {"text": "full 7"}}]
+        },
+    }
+    envelope = Envelope(
+        username="u",
+        user_id=USER_ID,
+        fetched_at=NEW,
+        request={"endpoint": "/2/users/1/tweets", "params": {}},
+        response=body,
+    )
+    aws.s3.put_object(Bucket=aws.bucket, Key=RAW_KEY, Body=envelope.to_bytes())
+    message = make_message(
+        tweet={"text": "q", "entities": entities, "referenced_tweets": refs},
+        referenced=(
+            ReferencedPost(id="7", type="quoted", text="p7", note_text="full 7"),
+            ReferencedPost(id="8", type="replied_to", text="p8", note_text="full 8"),
+        ),
+        fetched_at=NEW,
+    )
+    slim = (
+        replace(message, raw_key=RAW_KEY).without_referenced_notes().without_entities()
+    )
+
+    early = process_handler({"Records": [sqs_last_receive(slim.to_json(), 4)]}, None)
+    assert early["batchItemFailures"] == [{"itemIdentifier": "m1"}]
+    last = process_handler({"Records": [sqs_last_receive(slim.to_json(), 5)]}, None)
+
+    assert last == {"batchItemFailures": []}
+    item = stored(aws, TID)
+    by_id = {r["id"]: r for r in item["referenced_tweets"]}
+    assert by_id["7"]["text"] == "full 7" and "note_text_omitted" not in by_id["7"]
+    assert by_id["7"]["is_long_post"] is True
+    assert by_id["8"]["note_text_omitted"] is True
+    assert item["entities"] == compact_entities(entities)
+    assert "entities_omitted" not in item
+
+
+# ---- DynamoDB's number range, both ends ----------------------------------------
+
+
+def test_the_edges_of_dynamodbs_number_range(aws: Aws) -> None:
+    from decimal import Decimal
+
+    inside = [9.99e125, -9.99e125, 1e-130]
+    outside = [1e126, -1e126, 9e-131]
+    entities = {"annotations": [{"probability": v} for v in (*inside, *outside)]}
+    message = make_message(tweet={"entities": entities}, fetched_at=NEW)
+
+    TweetStore(aws.tweets_table, aws.s3, aws.bucket).put_tweet(message, [])
+
+    stored_values = [
+        a["probability"] for a in stored(aws, TID)["entities"]["annotations"]
+    ]
+    assert stored_values[:3] == [Decimal(repr(v)) for v in inside]
+    assert stored_values[3:] == [repr(v) for v in outside]
+
+
+def test_a_restore_that_raises_on_the_last_receive_still_stores_the_tweet(
+    aws: Aws, caplog: pytest.LogCaptureFixture
+) -> None:
+    from twitter_timeline_data_pipeline.handlers.process import process_records
+    from twitter_timeline_data_pipeline.storage import MediaRetryQueue, MediaStore
+
+    message = replace(link_heavy(3, 50), raw_key=RAW_KEY).without_entities()
+    store = TweetStore(aws.tweets_table, aws.s3, aws.bucket)
+
+    def broken(_: TweetMessage, **__: Any) -> TweetMessage:
+        raise RuntimeError("S3 is down")
+
+    def run(count: int, restore: Any) -> list[str]:
+        return process_records(
+            [sqs_last_receive(message.to_json(), count)],
+            media_store=cast(MediaStore, None),
+            tweet_store=store,
+            max_receive_count=5,
+            retry_queue=MediaRetryQueue(aws.sqs, aws.retry_queue_url),
+            restore_notes=restore,
+        )
+
+    assert run(4, broken) == ["m1"]
+    assert run(5, broken) == []
+    assert run(5, None) == []
+    assert "S3 is down" in caplog.text
+    assert stored(aws, TID)["entities_omitted"] is True

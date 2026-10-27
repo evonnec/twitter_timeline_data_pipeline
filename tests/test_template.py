@@ -749,14 +749,12 @@ def test_only_the_compliance_function_can_delete(template: Template) -> None:
         has_delete = any(a.startswith(deleting_prefixes) for a in actions)
         assert has_delete == (name == "ComplianceFunction"), name
         assert not actions & deleting or name == "ComplianceFunction"
-        # SAM policy templates in use: Write (DynamoDB put/update/delete) is allowed
-        # for the process function only through DynamoDBWritePolicy, which cannot
-        # delete.
+        # SAM policy templates in use: none that writes DynamoDB (the process function
+        # has inline GetItem and PutItem only, pinned by its own test).
         for policy in managed:
             assert set(policy) <= {
                 "SQSSendMessagePolicy",
                 "AWSSecretsManagerGetSecretValuePolicy",
-                "DynamoDBWritePolicy",
             }
 
 
@@ -855,6 +853,30 @@ def test_process_function_s3_access_is_exactly_this_and_never_deletes(
     ]
     # (ComplianceFunction is the only one with a delete action; see
     # test_only_the_compliance_function_can_delete)
+
+
+def test_process_function_table_access_is_get_and_put_only(template: Template) -> None:
+    # put_tweet reads before it writes. moto and LocalStack don't enforce IAM, so a
+    # missing GetItem would only show up in AWS, as every message failing.
+    statements = [
+        s
+        for s in policy_statements(template, "ProcessFunction")
+        if any(a.startswith("dynamodb:") for a in _as_list(s["Action"]))
+    ]
+    policies = properties(template, "ProcessFunction")["Policies"]
+
+    assert [
+        (s["Effect"], sorted(_as_list(s["Action"])), s["Resource"]) for s in statements
+    ] == [
+        (
+            "Allow",
+            ["dynamodb:GetItem", "dynamodb:PutItem"],
+            {"Fn::GetAtt": ["TweetsTable", "Arn"]},
+        )
+    ]
+    assert not [
+        p for p in policies if isinstance(p, dict) and any("DynamoDB" in k for k in p)
+    ]
 
 
 def test_no_function_sets_the_test_only_media_host_override(template: Template) -> None:
