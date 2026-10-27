@@ -523,6 +523,7 @@ def test_media_retry_function_environment(template: Template) -> None:
         "TWEETS_TABLE": {"Ref": "TweetsTable"},
         "MEDIA_BUCKET": {"Ref": "MediaBucket"},
         "MAX_MEDIA_BYTES": {"Ref": "MaxMediaBytes"},
+        "METRICS_NAMESPACE": {"Ref": "MetricsNamespace"},
     }
 
 
@@ -896,3 +897,344 @@ def test_no_function_sets_the_test_only_media_host_override(template: Template) 
             "Variables", {}
         ), name
     assert MEDIA_HOSTS_OVERRIDE_ENV not in TEMPLATE.read_text()
+
+
+# --- queue retention (#37) and alarms on metrics (#19) ---------------------------
+
+FOURTEEN_DAYS = 1_209_600
+TEN_DAYS = 864_000
+ALARM_ACTIONS = {
+    "Fn::If": ["HasAlarmTopic", [{"Ref": "AlarmTopicArn"}], {"Ref": "AWS::NoValue"}]
+}
+
+
+@pytest.mark.parametrize(
+    "queue",
+    [
+        "TweetsQueue",
+        "TweetsDeadLetterQueue",
+        "MediaRetryQueue",
+        "MediaRetryDeadLetterQueue",
+    ],
+)
+def test_every_queue_keeps_messages_for_the_sqs_maximum(
+    template: Template, queue: str
+) -> None:
+    assert properties(template, queue)["MessageRetentionPeriod"] == FOURTEEN_DAYS
+
+
+def alarms(template: Template) -> dict[str, dict[str, Any]]:
+    return {
+        name: res
+        for name, res in template["Resources"].items()
+        if res["Type"] == "AWS::CloudWatch::Alarm"
+    }
+
+
+def alarm_props(template: Template, name: str) -> dict[str, Any]:
+    found: dict[str, Any] = alarms(template)[name]["Properties"]
+    return found
+
+
+def test_every_alarm_notifies_the_alarm_topic(template: Template) -> None:
+    for name, res in alarms(template).items():
+        assert res["Properties"]["AlarmActions"] == ALARM_ACTIONS, name
+
+
+def test_every_alarm_chooses_its_missing_data_treatment(template: Template) -> None:
+    for name, res in alarms(template).items():
+        assert res["Properties"]["TreatMissingData"] in {
+            "breaching",
+            "notBreaching",
+        }, name
+
+
+def queue_dimension(queue: str) -> list[dict[str, Any]]:
+    return [{"Name": "QueueName", "Value": {"Fn::GetAtt": [queue, "QueueName"]}}]
+
+
+def test_the_main_queue_age_alarm_is_a_parameter_defaulting_to_an_hour(
+    template: Template,
+) -> None:
+    alarm = alarm_props(template, "TweetsQueueAgeAlarm")
+
+    assert alarm["Namespace"] == "AWS/SQS"
+    assert alarm["MetricName"] == "ApproximateAgeOfOldestMessage"
+    assert alarm["Dimensions"] == queue_dimension("TweetsQueue")
+    assert alarm["Threshold"] == {"Ref": "QueueAgeAlarmSeconds"}
+    assert template["Parameters"]["QueueAgeAlarmSeconds"]["Default"] == 3600
+    assert (alarm["Statistic"], alarm["Period"], alarm["EvaluationPeriods"]) == (
+        "Maximum",
+        300,
+        1,
+    )
+    assert alarm["ComparisonOperator"] == "GreaterThanThreshold"
+    assert alarm["TreatMissingData"] == "notBreaching"  # an empty queue has no metric
+
+
+@pytest.mark.parametrize(
+    ("alarm", "queue"),
+    [
+        ("DeadLetterQueueAgeAlarm", "TweetsDeadLetterQueue"),
+        ("MediaRetryDeadLetterQueueAgeAlarm", "MediaRetryDeadLetterQueue"),
+    ],
+)
+def test_dead_letter_queue_age_alarms_fire_ten_days_in(
+    template: Template, alarm: str, queue: str
+) -> None:
+    props = alarm_props(template, alarm)
+
+    assert (props["Namespace"], props["MetricName"]) == (
+        "AWS/SQS",
+        "ApproximateAgeOfOldestMessage",
+    )
+    assert props["Dimensions"] == queue_dimension(queue)
+    assert props["Threshold"] == TEN_DAYS < FOURTEEN_DAYS
+    assert props["ComparisonOperator"] == "GreaterThanThreshold"
+    assert props["Statistic"] == "Maximum"
+    assert props["TreatMissingData"] == "notBreaching"
+
+
+@pytest.mark.parametrize(
+    "function",
+    ["FetchFunction", "ProcessFunction", "MediaRetryFunction", "ComplianceFunction"],
+)
+def test_every_function_has_a_throttles_alarm(
+    template: Template, function: str
+) -> None:
+    props = alarm_props(template, f"{function}ThrottlesAlarm")
+
+    assert (props["Namespace"], props["MetricName"]) == ("AWS/Lambda", "Throttles")
+    assert props["Dimensions"] == [{"Name": "FunctionName", "Value": {"Ref": function}}]
+    assert (props["Statistic"], props["Period"], props["Threshold"]) == (
+        "Sum",
+        300,
+        1,
+    )
+    assert props["ComparisonOperator"] == "GreaterThanOrEqualToThreshold"
+    assert props["TreatMissingData"] == "notBreaching"
+
+
+# (alarm, metric, statistic, period, evaluation periods, threshold, comparison,
+#  missing data). The metrics are in the stack's MetricsNamespace, dimensionless.
+METRIC_ALARMS = [
+    (
+        "RecordFailuresAlarm",
+        "RecordFailures",
+        "Sum",
+        300,
+        1,
+        0,
+        "GreaterThan",
+        "notBreaching",
+    ),
+    (
+        "IdentityChangedAlarm",
+        "IdentityChanged",
+        "Sum",
+        3600,
+        1,
+        0,
+        "GreaterThan",
+        "notBreaching",
+    ),
+    (
+        "QuarantinedItemsAlarm",
+        "QuarantinedItems",
+        "Sum",
+        3600,
+        1,
+        0,
+        "GreaterThan",
+        "notBreaching",
+    ),
+    (
+        "WriteContentionAlarm",
+        "WriteContentionErrors",
+        "Sum",
+        300,
+        1,
+        0,
+        "GreaterThan",
+        "notBreaching",
+    ),
+    (
+        "GapsDroppedAlarm",
+        "GapsDropped",
+        "Sum",
+        3600,
+        1,
+        0,
+        "GreaterThan",
+        "notBreaching",
+    ),
+    (
+        "CompliancePurgeDeferredAlarm",
+        "CompliancePurgeDeferred",
+        "Sum",
+        21600,
+        2,
+        0,
+        "GreaterThan",
+        "notBreaching",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    (
+        "name",
+        "metric",
+        "statistic",
+        "period",
+        "evaluations",
+        "threshold",
+        "op",
+        "missing",
+    ),
+    METRIC_ALARMS,
+)
+def test_metric_alarms_watch_the_emitted_metric_with_the_documented_settings(
+    template: Template,
+    name: str,
+    metric: str,
+    statistic: str,
+    period: int,
+    evaluations: int,
+    threshold: int,
+    op: str,
+    missing: str,
+) -> None:
+    props = alarm_props(template, name)
+
+    assert props["Namespace"] == {"Ref": "MetricsNamespace"}
+    assert props["MetricName"] == metric
+    assert "Dimensions" not in props  # the dimensionless (total) metric
+    assert props["Statistic"] == statistic
+    assert props["Period"] == period
+    assert props["EvaluationPeriods"] == evaluations
+    assert props.get("DatapointsToAlarm", evaluations) == evaluations
+    assert props["Threshold"] == threshold
+    assert props["ComparisonOperator"] == f"{op}Threshold"
+    assert props["TreatMissingData"] == missing
+
+
+@pytest.mark.parametrize(
+    ("name", "metric", "hours"),
+    [
+        ("FetchFreshnessAlarm", "FetchRunSucceeded", "FetchFreshnessHours"),
+        (
+            "ComplianceFreshnessAlarm",
+            "ComplianceRunSucceeded",
+            "ComplianceFreshnessHours",
+        ),
+    ],
+)
+def test_freshness_alarms_breach_on_missing_heartbeats(
+    template: Template, name: str, metric: str, hours: str
+) -> None:
+    resource_ = alarms(template)[name]
+    props = resource_["Properties"]
+
+    assert props["Namespace"] == {"Ref": "MetricsNamespace"}
+    assert props["MetricName"] == metric
+    assert (props["Statistic"], props["Period"]) == ("Sum", 3600)
+    assert props["ComparisonOperator"] == "LessThanThreshold"
+    assert props["Threshold"] == 1
+    assert props["TreatMissingData"] == "breaching"
+    assert props["EvaluationPeriods"] == {"Ref": hours}
+    assert props["DatapointsToAlarm"] == {"Ref": hours}
+    # a paused schedule (the first deploy, before the secret is set) must not alarm
+    assert resource_["Condition"] == "ScheduleIsEnabled"
+
+
+def test_freshness_windows_default_to_twice_the_default_schedules(
+    template: Template,
+) -> None:
+    parameters = template["Parameters"]
+
+    assert parameters["ScheduleExpression"]["Default"] == "rate(1 hour)"
+    assert parameters["FetchFreshnessHours"]["Default"] == 2
+    assert parameters["ComplianceSchedule"]["Default"] == "rate(6 hours)"
+    assert parameters["ComplianceFreshnessHours"]["Default"] == 12
+    # the window is hourly periods, at most a day
+    assert parameters["FetchFreshnessHours"]["MaxValue"] <= 24
+    assert parameters["ComplianceFreshnessHours"]["MaxValue"] <= 24
+
+
+def test_sustained_rate_limiting_needs_consecutive_hours(template: Template) -> None:
+    props = alarm_props(template, "RateLimitedRunsAlarm")
+
+    assert props["Namespace"] == {"Ref": "MetricsNamespace"}
+    assert props["MetricName"] == "RateLimitedRuns"
+    assert (props["Statistic"], props["Period"], props["Threshold"]) == ("Sum", 3600, 1)
+    assert props["ComparisonOperator"] == "GreaterThanOrEqualToThreshold"
+    assert props["EvaluationPeriods"] == {"Ref": "RateLimitedRunsToAlarm"}
+    assert props["DatapointsToAlarm"] == {"Ref": "RateLimitedRunsToAlarm"}
+    assert template["Parameters"]["RateLimitedRunsToAlarm"]["Default"] == 3
+    assert props["TreatMissingData"] == "notBreaching"  # freshness covers a silence
+
+
+@pytest.mark.parametrize(
+    "function",
+    ["FetchFunction", "ProcessFunction", "MediaRetryFunction", "ComplianceFunction"],
+)
+def test_every_function_emits_into_the_stacks_namespace(
+    template: Template, function: str
+) -> None:
+    assert env_of(template, function)["METRICS_NAMESPACE"] == {
+        "Ref": "MetricsNamespace"
+    }
+
+
+def test_no_function_may_put_metric_data(template: Template) -> None:
+    # EMF goes through the log group, so the functions need no CloudWatch permission
+    assert "cloudwatch:PutMetricData" not in TEMPLATE.read_text()
+
+
+def emitted_metric_names() -> set[str]:
+    """Metric names written in modules that call ``metrics.emit``."""
+    from twitter_timeline_data_pipeline import metrics
+
+    names: set[str] = set()
+    for path in SRC.rglob("*.py"):
+        if path.name == "metrics.py":
+            continue
+        tree = ast.parse(path.read_text())
+        calls_emit = any(
+            isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Attribute)
+            and n.func.attr == "emit"
+            and isinstance(n.func.value, ast.Name)
+            and n.func.value.id == "metrics"
+            for n in ast.walk(tree)
+        )
+        if calls_emit:
+            names |= {
+                n.value
+                for n in ast.walk(tree)
+                if isinstance(n, ast.Constant)
+                and isinstance(n.value, str)
+                and n.value in metrics.UNITS
+            }
+    return names
+
+
+def test_an_alarm_never_watches_a_metric_nobody_emits(template: Template) -> None:
+    from twitter_timeline_data_pipeline import metrics
+
+    watched = {
+        props["MetricName"]
+        for props in (a["Properties"] for a in alarms(template).values())
+        if props["Namespace"] == {"Ref": "MetricsNamespace"}
+    }
+
+    assert watched
+    assert watched <= emitted_metric_names()
+    assert watched <= set(metrics.UNITS)
+
+
+def test_every_declared_metric_is_emitted_somewhere() -> None:
+    from twitter_timeline_data_pipeline import metrics
+
+    assert set(metrics.UNITS) == emitted_metric_names()

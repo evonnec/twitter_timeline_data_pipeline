@@ -8,14 +8,17 @@ the invocation has left.
 
 import functools
 import logging
+from collections import Counter
 from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 import boto3
 import httpx
 from botocore.config import Config
 
-from twitter_timeline_data_pipeline import USER_AGENT
+from twitter_timeline_data_pipeline import USER_AGENT, metrics
 from twitter_timeline_data_pipeline.config import Settings
 from twitter_timeline_data_pipeline.models import (
     Media,
@@ -83,6 +86,87 @@ def _receive_count(record: Mapping[str, Any]) -> int:
         return 0
 
 
+_MEDIA_METRIC = {
+    "stored": "MediaStored",
+    "exists": "MediaExisted",
+    "unavailable": "MediaUnavailable",
+    "skipped": "MediaSkipped",
+    "skipped_hls": "MediaSkipped",
+    "too_large": "MediaTooLarge",
+}
+"""MediaStatus -> metric. ``retrying`` is counted when its retry message is queued and
+``missing`` as MediaMissingFromIncludes."""
+
+
+def media_values(stored: Iterable[StoredMedia]) -> dict[str, float]:
+    """The media metrics of finished entries (every one of them, zeros included) and
+    the bytes of those uploaded now."""
+    values: dict[str, float] = dict.fromkeys(
+        (*dict.fromkeys(_MEDIA_METRIC.values()), "MediaBytes"), 0
+    )
+    for entry in stored:
+        if name := _MEDIA_METRIC.get(entry.status):
+            values[name] += 1
+        if entry.status == "stored":
+            values["MediaBytes"] += entry.size_bytes or 0
+    return values
+
+
+@dataclass(slots=True)
+class _Tally:
+    """What one invocation did, for its single EMF line."""
+
+    stored: int = 0
+    stale: int = 0
+    contention: int = 0
+    missing: int = 0
+    retries_queued: int = 0
+    failures: Counter[str] = field(default_factory=Counter)
+    """Records reported failed, by reason: they are headed for the DLQ."""
+    retries: Counter[str] = field(default_factory=Counter)
+    """Records reported failed but expected to succeed on redelivery."""
+    media: dict[str, float] = field(default_factory=lambda: media_values(()))
+    lags: list[float] = field(default_factory=list)
+
+    def add_media(self, stored: Iterable[StoredMedia]) -> None:
+        for name, value in media_values(stored).items():
+            self.media[name] += value
+
+    def emit(self) -> None:
+        values: dict[str, float | list[float]] = {
+            "TweetsStored": self.stored,
+            "StaleWritesSkipped": self.stale,
+            "WriteContentionErrors": self.contention,
+            "MediaMissingFromIncludes": self.missing,
+            "MediaRetriesQueued": self.retries_queued,
+            **self.media,
+        }
+        if self.lags:
+            values["IngestLagSeconds"] = self.lags
+        metrics.emit(values)
+        # Only per reason: each line's empty dimension set is the total, so a separate
+        # total line would count every failure twice.
+        for name, counter in (
+            ("RecordFailures", self.failures),
+            ("RecordRetries", self.retries),
+        ):
+            for reason, count in sorted(counter.items()):
+                metrics.emit({name: count}, {"Reason": reason})
+
+
+def _lag_seconds(created_at: str | None, now: datetime) -> float | None:
+    """Seconds from a Tweet's creation to ``now`` (None when it has no usable time)."""
+    if not created_at:
+        return None
+    try:
+        created = datetime.fromisoformat(created_at)
+    except ValueError:
+        return None
+    if created.tzinfo is None:
+        return None
+    return max(0.0, (now - created).total_seconds())
+
+
 def process_records(
     records: Iterable[Mapping[str, Any]],
     *,
@@ -92,6 +176,7 @@ def process_records(
     max_receive_count: int | None = None,
     retry_queue: MediaRetryQueue | None = None,
     restore_notes: Callable[..., TweetMessage] | None = None,
+    now: Callable[[], datetime] = lambda: datetime.now(UTC),
 ) -> list[str]:
     """Process SQS records; return the ``messageId`` of each one that failed.
 
@@ -113,8 +198,41 @@ def process_records(
     """
     pending = sorted(records, key=_download_cost)
     failed: list[str] = []
+    tally = _Tally()
+    try:
+        _process_pending(
+            pending,
+            failed,
+            tally,
+            media_store=media_store,
+            tweet_store=tweet_store,
+            remaining_ms=remaining_ms,
+            max_receive_count=max_receive_count,
+            retry_queue=retry_queue,
+            restore_notes=restore_notes,
+            now=now,
+        )
+    finally:
+        tally.emit()
+    return failed
+
+
+def _process_pending(
+    pending: list[Mapping[str, Any]],
+    failed: list[str],
+    tally: _Tally,
+    *,
+    media_store: MediaStore,
+    tweet_store: TweetStore,
+    remaining_ms: Callable[[], int] | None,
+    max_receive_count: int | None,
+    retry_queue: MediaRetryQueue | None,
+    restore_notes: Callable[..., TweetMessage] | None,
+    now: Callable[[], datetime],
+) -> None:
     for record in pending:
         message_id = record["messageId"]
+        ids = {"message_id": message_id}  # log fields, so logs can be queried by them
         last_receive = (
             max_receive_count is not None
             and retry_queue is not None
@@ -125,11 +243,17 @@ def process_records(
             and remaining_ms() < SAFETY_MARGIN_MS
             and not (last_receive and remaining_ms() >= MIN_WRITE_MS)
         ):
-            logger.warning("message %s not started: out of time", message_id)
+            logger.warning(
+                "message %s not started: out of time",
+                message_id,
+                extra=ids,
+            )
             failed.append(message_id)
+            tally.retries["out_of_time"] += 1
             continue
         try:
             message = TweetMessage.from_json(record["body"])
+            ids["tweet_id"] = message.tweet.id
             # Before any download: a Tweet removed at the source must not get its media
             # back from a replay or a redrive (put_tweet refuses it too, but that is
             # after the files are already in S3).
@@ -139,6 +263,7 @@ def process_records(
                     "dropped, nothing downloaded",
                     message.tweet.id,
                     message_id,
+                    extra=ids,
                 )
                 continue
             if message.has_omitted:
@@ -160,6 +285,7 @@ def process_records(
                         message_id,
                         message.raw_key,
                         exc,
+                        extra=ids,
                     )
             if message.missing_media_keys:
                 logger.warning(
@@ -167,6 +293,7 @@ def process_records(
                     "missing: %s",
                     message.tweet.id,
                     list(message.missing_media_keys),
+                    extra=ids,
                 )
             # Media first: a transient failure must leave no metadata that points at
             # media that isn't there.
@@ -190,6 +317,7 @@ def process_records(
                         message_id,
                         m.media_key,
                         exc,
+                        extra=ids,
                     )
                     entry = media_store.precheck(
                         message,
@@ -201,20 +329,28 @@ def process_records(
                         retrying.append(m)
             result = tweet_store.put_tweet(message, stored)
         except MessageError:
-            logger.exception("message %s is malformed", message_id)
+            logger.exception("message %s is malformed", message_id, extra=ids)
             failed.append(message_id)
+            tally.failures["malformed"] += 1
         except (TransientMediaError, WriteContentionError) as exc:
-            logger.warning("message %s will be retried: %s", message_id, exc)
+            logger.warning("message %s will be retried: %s", message_id, exc, extra=ids)
             failed.append(message_id)
+            if isinstance(exc, WriteContentionError):
+                tally.contention += 1
+                tally.retries["write_contention"] += 1
+            else:
+                tally.retries["media_transient"] += 1
         except Exception:
-            logger.exception("message %s failed", message_id)
+            logger.exception("message %s failed", message_id, extra=ids)
             failed.append(message_id)
+            tally.failures["error"] += 1
         else:
             if result.tombstoned:
                 logger.info(
                     "write refused for tombstoned tweet %s (message %s)",
                     message.tweet.id,
                     message_id,
+                    extra=ids,
                 )
                 continue
             if not result.written:
@@ -228,19 +364,30 @@ def process_records(
                     message.schema_version,
                     result.stored_fetched_at,
                     result.stored_schema_version,
+                    extra=ids,
                 )
+                tally.stale += 1
                 continue
+            tally.stored += 1
+            tally.add_media(stored)
+            tally.missing += len(message.missing_media_keys)
+            lag = _lag_seconds(message.tweet.created_at, now())
+            if lag is not None:
+                tally.lags.append(lag)
             if retrying:
                 assert retry_queue is not None  # only the last receive collects any
-                if not _enqueue_retries(retry_queue, message, retrying, message_id):
+                queued = _enqueue_retries(retry_queue, message, retrying, message_id)
+                tally.retries_queued += queued
+                if queued < len(retrying):
                     failed.append(message_id)
+                    tally.failures["retry_queue"] += 1
                     continue
             logger.info(
                 "stored tweet %s media=%s",
                 message.tweet.id,
                 [f"{s.media_key}:{s.status}" for s in stored],
+                extra=ids,
             )
-    return failed
 
 
 def _enqueue_retries(
@@ -248,10 +395,10 @@ def _enqueue_retries(
     message: TweetMessage,
     media: Iterable[Media],
     message_id: str,
-) -> bool:
+) -> int:
     """Send a media-retry message per item (all of them, even if one send fails);
-    False if any send failed."""
-    ok = True
+    returns how many were sent."""
+    sent = 0
     for m in media:
         try:
             retry_queue.send(
@@ -263,14 +410,15 @@ def _enqueue_retries(
                     media=m,
                 )
             )
+            sent += 1
         except Exception:
             logger.exception(
                 "message %s: could not queue a retry for media %s",
                 message_id,
                 m.media_key,
+                extra={"message_id": message_id, "tweet_id": message.tweet.id},
             )
-            ok = False
-    return ok
+    return sent
 
 
 def _short_timeouts() -> Config:

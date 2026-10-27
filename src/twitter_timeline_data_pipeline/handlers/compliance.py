@@ -66,6 +66,7 @@ import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
 
+from twitter_timeline_data_pipeline import metrics
 from twitter_timeline_data_pipeline.config import Settings
 from twitter_timeline_data_pipeline.credentials import clear_cache, get_bearer_token
 from twitter_timeline_data_pipeline.models import utc_now_iso
@@ -1095,8 +1096,26 @@ class Compliance:
             self.deferred,
             self.swept,
         )
+        self._emit_metrics()
         if self.failures:
             raise ComplianceError("; ".join(self.failures))
+
+    def _emit_metrics(self) -> None:
+        """One EMF line per run. ``ComplianceRunSucceeded`` (the heartbeat the freshness
+        alarm watches) is 1 only when no step failed; the run then raises, or not."""
+        metrics.emit(
+            {
+                "ComplianceRunSucceeded": int(not self.failures),
+                "ComplianceFailures": len(self.failures),
+                "ComplianceChecked": self.checked,
+                "ComplianceTombstoned": self.tombstoned,
+                "ComplianceCleared": self.cleared,
+                "CompliancePurged": self.purged,
+                "ComplianceCopiesScrubbed": self.copies_scrubbed,
+                "CompliancePurgeDeferred": self.deferred,
+                "ComplianceUnknownAnswers": self.unknown,
+            }
+        )
 
     def _time_low(self) -> bool:
         return (
@@ -1275,12 +1294,17 @@ class Compliance:
                     tweet_id,
                     reason,
                     now,
+                    extra={"tweet_id": tweet_id},
                 )
         for tweet_id in result.present:
             if tweet_id in tombstones and self._store.clear_tombstone(tweet_id):
                 del tombstones[tweet_id]
                 self.cleared += 1
-                logger.info("tweet %s is available again: tombstone cleared", tweet_id)
+                logger.info(
+                    "tweet %s is available again: tombstone cleared",
+                    tweet_id,
+                    extra={"tweet_id": tweet_id},
+                )
         if result.unknown:
             self.unknown += len(result.unknown)
             logger.info(
@@ -1312,6 +1336,7 @@ class Compliance:
                         "tweet %s is available again: tombstone cleared before its "
                         "purge",
                         tweet_id,
+                        extra={"tweet_id": tweet_id},
                     )
             confirmed += [i for i in chunk if i in result.unavailable]
             unsure = [i for i in chunk if i in result.unknown]
@@ -1409,6 +1434,7 @@ class Compliance:
             result.pages,
             result.quarantined,
             item["deleted_at"],
+            extra={"tweet_id": tweet_id},
         )
 
     def _sweep(self, sweeping: Mapping[str, str]) -> None:

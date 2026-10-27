@@ -1,7 +1,9 @@
 """Shared fixtures: fake AWS credentials, moto resources, cache resets."""
 
+import json
 from collections.abc import Iterator
 from dataclasses import dataclass
+from typing import Any
 
 import boto3
 import pytest
@@ -140,3 +142,65 @@ def pipeline_env(monkeypatch: pytest.MonkeyPatch, aws: Aws) -> Aws:
     monkeypatch.setenv("TWITTER_BEARER_TOKEN", "test-bearer-token-not-real")
     monkeypatch.setenv("TWITTER_USERNAME", "example_user")
     return aws
+
+
+class Emf:
+    """The EMF lines the code under test wrote to stdout (see ``metrics.emit``)."""
+
+    def __init__(self, capsys: pytest.CaptureFixture[str]) -> None:
+        self._capsys = capsys
+        self.documents: list[dict[str, Any]] = []
+
+    def read(self) -> list[dict[str, Any]]:
+        """Drain stdout; return the EMF documents written since the last read."""
+        fresh = []
+        for line in self._capsys.readouterr().out.splitlines():
+            if line.startswith("{") and '"_aws"' in line:
+                fresh.append(json.loads(line))
+        self.documents += fresh
+        return fresh
+
+    def reset(self) -> None:
+        """Forget everything emitted so far."""
+        self.read()
+        self.documents.clear()
+
+    def find(self, name: str, **dimensions: str) -> list[Any]:
+        """Values of ``name`` in lines that define a dimension set of exactly these
+        dimensions (``find(name)`` is the dimensionless set), with the values given."""
+        self.read()
+        found = []
+        for doc in self.documents:
+            (block,) = doc["_aws"]["CloudWatchMetrics"]
+            if name not in {m["Name"] for m in block["Metrics"]}:
+                continue
+            if any(
+                set(s) == set(dimensions)
+                and all(doc[k] == v for k, v in dimensions.items())
+                for s in block["Dimensions"]
+            ):
+                found.append(doc[name])
+        return found
+
+    def one(self, name: str, **dimensions: str) -> Any:
+        (value,) = self.find(name, **dimensions)
+        return value
+
+    def total(self, name: str, **dimensions: str) -> float:
+        return float(sum(self.find(name, **dimensions)))
+
+    def names(self) -> set[str]:
+        self.read()
+        return {
+            m["Name"]
+            for doc in self.documents
+            for block in doc["_aws"]["CloudWatchMetrics"]
+            for m in block["Metrics"]
+        }
+
+
+@pytest.fixture
+def emf(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> Emf:
+    """Turn metrics on outside Lambda and capture what is emitted."""
+    monkeypatch.setenv("METRICS_EMIT", "1")
+    return Emf(capsys)

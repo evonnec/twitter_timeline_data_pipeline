@@ -746,6 +746,8 @@ class TimelinePage:
     # ``errors`` array names as such (a deleted or protected original). Nothing else
     # marks a reference unavailable.
     unavailable: Mapping[TweetId, str] = field(default_factory=dict)
+    partial_errors: int = field(default=0, compare=False)
+    """How many entries the response's ``errors`` array held next to its data."""
 
     def _referenced(self, tweet: Tweet) -> tuple[ReferencedPost, ...]:
         expanded = self.requested.get("expansions", False)

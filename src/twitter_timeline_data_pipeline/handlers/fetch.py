@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any
 
 import boto3
 
+from twitter_timeline_data_pipeline import metrics
 from twitter_timeline_data_pipeline.config import ConfigError, Settings
 from twitter_timeline_data_pipeline.credentials import clear_cache, get_bearer_token
 from twitter_timeline_data_pipeline.models import (
@@ -304,6 +305,10 @@ class _Run:
     tweets: int = 0
     enqueued: int = 0
     deferred_error: Exception | None = None
+    gaps_dropped: int = 0
+    partial_errors: int = 0
+    quarantined: dict[str, int] = field(default_factory=dict)
+    """Objects written to quarantine in this run, by kind."""
     observed: set[tuple[str | None, str | None]] = field(default_factory=set)
     """Ranges (``since_id``, ``until_id``) already seen empty in this run."""
     ended_empty: bool = False
@@ -337,6 +342,7 @@ class _Run:
                 self.requests += 1
                 self.pages += 1
                 last = page
+                self.partial_errors += page.partial_errors
                 yield page
         except PageParseError as exc:
             self.requests += 1
@@ -414,6 +420,7 @@ class _Run:
             fetched_at=stamp,
             page_no=self.pages,
         )
+        self.quarantined[kind] = self.quarantined.get(kind, 0) + 1
 
     def quarantine_items(
         self, page: TimelinePage, raw_key: str | None, stamp: str
@@ -636,6 +643,7 @@ class _Run:
                 runs,
                 first,
             )
+            self.gaps_dropped += 1
             self.commit([], others)
             return
         logger.info(
@@ -675,6 +683,7 @@ def _check_identity(
     ID (``source`` says where that came from: the state item or the event)."""
     if expected is not None and expected != found:
         logger.error(IDENTITY_CHANGED_MESSAGE, username, source, expected, found)
+        metrics.emit({"IdentityChanged": 1}, {"Username": username})
         raise IdentityChangedError(
             IDENTITY_CHANGED_MESSAGE % (username, source, expected, found)
         )
@@ -770,56 +779,88 @@ def run_fetch(
         raw_pages=raw_pages,
         quarantine=quarantine,
     )
-    since_id = since_id or run.state.newest_id
-    stopped_reason: str | None = None
+    result: FetchResult | None = None
     try:
-        backfill = _anchored(backfill, run.state.newest_id)
-        if backfill and backfill not in run.state.gaps:
-            run.commit([], [*run.state.gaps, backfill])
-        if run.pending:
-            # One request checks for new Tweets and one goes to the oldest gap, so
-            # neither can starve the other even with MAX_PAGES=1.
-            run.max_pages = max(max_pages, 2)
+        since_id = since_id or run.state.newest_id
+        stopped_reason: str | None = None
         try:
-            run.fetch_new(since_id, run.max_pages - (1 if run.pending else 0))
-            run.fill_gaps()
-        except NotFoundError:
-            if not cached:
+            backfill = _anchored(backfill, run.state.newest_id)
+            if backfill and backfill not in run.state.gaps:
+                run.commit([], [*run.state.gaps, backfill])
+            if run.pending:
+                # One request checks for new Tweets and one goes to the oldest gap, so
+                # neither can starve the other even with MAX_PAGES=1.
+                run.max_pages = max(max_pages, 2)
+            try:
+                run.fetch_new(since_id, run.max_pages - (1 if run.pending else 0))
+                run.fill_gaps()
+            except NotFoundError:
+                if not cached:
+                    raise
+                # The cached ID may be stale: look the handle up again. A different
+                # ID is an identity change; the same one means the user is gone.
+                _check_identity(username, user_id, x_client.get_user_id(username))
                 raise
-            # The cached ID may be stale: look the handle up again. A different ID is
-            # an identity change; the same one means the user really is gone.
-            _check_identity(username, user_id, x_client.get_user_id(username))
-            raise
-        run.remember_user()
-    except RateLimitError as exc:
-        logger.warning("rate limited, stopping early; progress is saved: %s", exc)
-        stopped_reason = "rate_limited"
-    except _StateConflict:
-        logger.warning(
-            "state for %s changed during the run; stopping. Messages already "
-            "enqueued are harmless duplicates",
-            username,
+            run.remember_user()
+        except RateLimitError as exc:
+            logger.warning("rate limited, stopping early; progress is saved: %s", exc)
+            stopped_reason = "rate_limited"
+        except _StateConflict:
+            logger.warning(
+                "state for %s changed during the run; stopping. Messages already "
+                "enqueued are harmless duplicates",
+                username,
+            )
+            stopped_reason = "state_conflict"
+            run.state = checkpoints.load(username)  # report what is stored now
+        if run.deferred_error:
+            raise run.deferred_error
+        gaps_open = len(run.state.gaps)
+        if stopped_reason is None and run.outstanding:
+            stopped_reason = "page_cap" if run.budget <= 0 else "gaps_pending"
+        if gaps_open:
+            logger.info("open gaps for %s: %s", username, run.state.gaps)
+        result = FetchResult(
+            username=username,
+            user_id=user_id,
+            since_id=since_id,
+            newest_id=run.state.newest_id,
+            pages=run.pages,
+            tweets=run.tweets,
+            enqueued=run.enqueued,
+            gaps_open=gaps_open,
+            stopped_reason=stopped_reason,
         )
-        stopped_reason = "state_conflict"
-        run.state = checkpoints.load(username)  # report what is stored now
-    if run.deferred_error:
-        raise run.deferred_error
-    gaps_open = len(run.state.gaps)
-    if stopped_reason is None and run.outstanding:
-        stopped_reason = "page_cap" if run.budget <= 0 else "gaps_pending"
-    if gaps_open:
-        logger.info("open gaps for %s: %s", username, run.state.gaps)
-    return FetchResult(
-        username=username,
-        user_id=user_id,
-        since_id=since_id,
-        newest_id=run.state.newest_id,
-        pages=run.pages,
-        tweets=run.tweets,
-        enqueued=run.enqueued,
-        gaps_open=gaps_open,
-        stopped_reason=stopped_reason,
+        return result
+    finally:
+        _emit_run_metrics(run, result, run_id=raw_pages.run_id if raw_pages else None)
+
+
+def _emit_run_metrics(
+    run: _Run, result: FetchResult | None, *, run_id: str | None
+) -> None:
+    """One EMF line for the run (and one per quarantine kind), also when it failed:
+    what was fetched and enqueued before the error still counts. ``FetchRunSucceeded``
+    is the freshness heartbeat: only a run that looked at the timeline and ended
+    without an error or a rate limit sends it."""
+    dims = {"Username": run.username}
+    reason = None if result is None else result.stopped_reason
+    ok = result is not None and reason != "rate_limited"
+    metrics.emit(
+        {
+            "TweetsFetched": run.tweets,
+            "TweetsEnqueued": run.enqueued,
+            "PageCapTruncations": int(reason == "page_cap"),
+            "RateLimitedRuns": int(reason == "rate_limited"),
+            "GapsDropped": run.gaps_dropped,
+            "PartialErrors": run.partial_errors,
+            "FetchRunSucceeded": int(ok),
+        },
+        dims,
+        {"run_id": run_id},
     )
+    for kind, count in sorted(run.quarantined.items()):
+        metrics.emit({"QuarantinedItems": count}, {**dims, "Kind": kind})
 
 
 @functools.cache
@@ -916,5 +957,6 @@ def handler(event: Any, context: Any) -> dict[str, Any]:
         result.newest_id,
         result.gaps_open,
         result.stopped_reason,
+        extra={"run_id": raw_pages.run_id},
     )
     return dataclasses.asdict(result)
