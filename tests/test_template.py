@@ -681,6 +681,30 @@ def test_process_function_s3_access_is_exactly_this_and_never_deletes(
     assert "s3:DeleteObject" not in TEMPLATE.read_text()
 
 
+def test_process_function_table_access_is_get_and_put_only(template: Template) -> None:
+    # put_tweet reads before it writes. moto and LocalStack don't enforce IAM, so a
+    # missing GetItem would only show up in AWS, as every message failing.
+    statements = [
+        s
+        for s in policy_statements(template, "ProcessFunction")
+        if any(a.startswith("dynamodb:") for a in _as_list(s["Action"]))
+    ]
+    policies = properties(template, "ProcessFunction")["Policies"]
+
+    assert [
+        (s["Effect"], sorted(_as_list(s["Action"])), s["Resource"]) for s in statements
+    ] == [
+        (
+            "Allow",
+            ["dynamodb:GetItem", "dynamodb:PutItem"],
+            {"Fn::GetAtt": ["TweetsTable", "Arn"]},
+        )
+    ]
+    assert not [
+        p for p in policies if isinstance(p, dict) and any("DynamoDB" in k for k in p)
+    ]
+
+
 def test_no_function_sets_the_test_only_media_host_override(template: Template) -> None:
     for name, props in functions(template).items():
         assert MEDIA_HOSTS_OVERRIDE_ENV not in props.get("Environment", {}).get(
