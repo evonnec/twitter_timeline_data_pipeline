@@ -153,7 +153,11 @@ def _fetch(args: argparse.Namespace) -> int:
 
     token = get_bearer_token(settings)
     with XClient(
-        token, base_url=settings.x_api_base_url, timeout=settings.http_timeout
+        token,
+        base_url=settings.x_api_base_url,
+        timeout=settings.http_timeout,
+        expand_referenced=settings.expand_referenced_tweets,
+        request_entities=settings.request_entities,
     ) as x_client:
         if args.dry_run:
             username = normalize_username(args.username)
@@ -218,6 +222,9 @@ def _replay(args: argparse.Namespace) -> int:
         settings.require("queue_url")
         assert settings.queue_url  # narrowed by require()
         sqs, queue_url = sqs_client(), settings.queue_url
+        # A message too big for SQS is sent without some content, which the processor
+        # reads back from the raw page, in its own MEDIA_BUCKET only.
+        slim_ok = bucket == settings.media_bucket
         quarantine = QuarantineStore(s3_client(), bucket)
 
         def reject(body: str, error: str) -> None:
@@ -236,7 +243,9 @@ def _replay(args: argparse.Namespace) -> int:
             )
 
         def send(messages: list[TweetMessage]) -> int:
-            return send_messages(sqs, queue_url, messages, time.sleep, reject)
+            return send_messages(
+                sqs, queue_url, messages, time.sleep, reject, allow_slim=slim_ok
+            )
 
     result = run_replay(
         s3=s3_client(),

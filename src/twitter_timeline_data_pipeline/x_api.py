@@ -25,6 +25,7 @@ from twitter_timeline_data_pipeline.models import (
     Media,
     QuarantinedItem,
     RawPage,
+    ReferencedPost,
     TimelinePage,
     Tweet,
     valid_tweet_id,
@@ -47,7 +48,22 @@ TWEET_FIELDS = (
     "public_metrics",
     "referenced_tweets",
 )
+# Requested with ``request_entities`` (the default): expanded URLs, mentions, hashtags
+# and the other per-Tweet metadata.
+ENTITY_FIELDS = (
+    "edit_controls",
+    "entities",
+    "in_reply_to_user_id",
+    "possibly_sensitive",
+    "withheld",
+)
 EXPANSIONS = ("attachments.media_keys",)
+# Requested with ``expand_referenced`` (the default): the posts a Tweet retweets,
+# quotes or replies to, and their authors. The media of those posts is not requested:
+# ``referenced_tweets.id.attachments.media_keys`` is not in the endpoint's current
+# list of expansions.
+REFERENCE_EXPANSIONS = ("referenced_tweets.id", "referenced_tweets.id.author_id")
+USER_FIELDS = ("name", "username")
 MEDIA_FIELDS = (
     "alt_text",
     "duration_ms",
@@ -119,7 +135,7 @@ _PROBLEM_ERRORS: dict[str, type[XApiError]] = {
 
 def _quarantine(kind: str, item: Any, exc: Exception) -> QuarantinedItem:
     tweet_id = None
-    if kind == "tweet" and isinstance(item, Mapping):
+    if kind == "tweet" and isinstance(item, Mapping):  # an included one is not a Tweet
         raw_id = item.get("id")
         if valid_tweet_id(raw_id):
             tweet_id = raw_id
@@ -140,9 +156,13 @@ def parse_timeline_page(
     meta: Mapping[str, Any] = body.get("meta") or {}
     data = body.get("data")
     next_token = meta.get("next_token")
+    requested = _requested(raw)
     if not data:
-        return TimelinePage(tweets=(), media={}, next_token=next_token, raw=raw)
-    media_objects = (body.get("includes") or {}).get("media") or []
+        return TimelinePage(
+            tweets=(), media={}, next_token=next_token, raw=raw, requested=requested
+        )
+    includes: Mapping[str, Any] = body.get("includes") or {}
+    media_objects = includes.get("media") or []
     if not isinstance(data, list) or not isinstance(media_objects, list):
         # No item boundary to quarantine at: fail the page (the cursor keeps it).
         raise ValueError("response has a non-list data or includes.media")
@@ -155,6 +175,7 @@ def parse_timeline_page(
             quarantined.append(_quarantine("media", entry, exc))
         else:
             media[item.media_key] = item
+    included = _parse_includes(includes, quarantined)
     tweets: list[Tweet] = []
     for entry in data:
         try:
@@ -169,7 +190,80 @@ def parse_timeline_page(
         next_token=next_token,
         raw=raw,
         quarantined=tuple(quarantined),
+        included=included,
+        requested=requested,
+        unavailable=_unavailable_posts(body.get("errors")),
     )
+
+
+# The ``errors`` problem types that say a referenced post is gone, with the reason
+# stored for it. No other error (and no absence of one) marks a post unavailable.
+_UNAVAILABLE_PROBLEMS = {
+    "resource-not-found": "not_found",
+    "not-authorized-for-resource": "not_authorized",
+}
+
+
+def _unavailable_posts(errors: Any) -> dict[str, str]:
+    """Post ID -> ``not_found`` / ``not_authorized`` for the entries of a response's
+    ``errors`` that name a post by ``resource_id`` with one of those two problem types
+    (a deleted, or a protected, original). Anything else is ignored."""
+    out: dict[str, str] = {}
+    for entry in errors if isinstance(errors, list) else ():
+        if not isinstance(entry, Mapping) or entry.get("resource_type") == "user":
+            continue
+        kind, post_id = entry.get("type"), entry.get("resource_id")
+        if not isinstance(kind, str) or not isinstance(post_id, str):
+            continue
+        if not valid_tweet_id(post_id):
+            continue
+        if reason := _UNAVAILABLE_PROBLEMS.get(kind.rstrip("/").rsplit("/", 1)[-1]):
+            out.setdefault(post_id, reason)
+    return out
+
+
+def _requested(raw: RawPage | None) -> dict[str, bool]:
+    """What the request behind ``raw`` asked for (nothing when there is no request)."""
+    params = raw.params if raw is not None else {}
+    return {
+        "entities": "entities" in str(params.get("tweet.fields", "")).split(","),
+        "expansions": "referenced_tweets.id"
+        in str(params.get("expansions", "")).split(","),
+    }
+
+
+def _parse_includes(
+    includes: Mapping[str, Any], quarantined: list[QuarantinedItem]
+) -> dict[str, ReferencedPost]:
+    """The referenced posts of ``includes`` by ID, authors resolved from
+    ``includes.users``. An entry that fails to parse is quarantined (as
+    ``included_tweet`` / ``included_user``, never counted by the cursor). A post that
+    could not be read is not one the API said is gone: its reference stays bare, so a
+    stored copy of it is kept."""
+
+    def entries(*names: str) -> list[Any]:
+        for name in names:
+            value = includes.get(name)
+            if value:
+                return value if isinstance(value, list) else [value]
+        return []
+
+    usernames: dict[str, str] = {}
+    for entry in entries("users"):
+        try:
+            usernames[str(entry["id"])] = str(entry["username"])
+        except Exception as exc:  # any shape problem: quarantine, keep the page
+            quarantined.append(_quarantine("included_user", entry, exc))
+    posts: dict[str, ReferencedPost] = {}
+    # X is renaming tweets to posts (``includes.posts``), like ``note_post``.
+    for entry in entries("tweets", "posts"):
+        try:
+            post = ReferencedPost.from_api(entry, usernames)
+        except Exception as exc:
+            quarantined.append(_quarantine("included_tweet", entry, exc))
+        else:
+            posts[post.id] = post
+    return posts
 
 
 class XClient:
@@ -188,6 +282,8 @@ class XClient:
         timeout: float = 10.0,
         max_retries: int = 3,
         max_rate_limit_wait: float = 60.0,
+        expand_referenced: bool = True,
+        request_entities: bool = True,
         http_client: httpx.Client | None = None,
         sleep: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.time,
@@ -197,6 +293,8 @@ class XClient:
         self._auth_header = {"Authorization": f"Bearer {bearer_token}"}
         self._max_retries = max_retries
         self._max_rate_limit_wait = max_rate_limit_wait
+        self._expand_referenced = expand_referenced
+        self._request_entities = request_entities
         self._sleep = sleep
         self._clock = clock
         self._owns_client = http_client is None
@@ -275,12 +373,20 @@ class XClient:
         max_results: int,
         max_pages: int,
     ) -> Iterator[TimelinePage]:
+        tweet_fields: tuple[str, ...] = TWEET_FIELDS
+        if self._request_entities:
+            tweet_fields = tuple(sorted({*tweet_fields, *ENTITY_FIELDS}))
+        expansions: tuple[str, ...] = EXPANSIONS
+        if self._expand_referenced:
+            expansions += REFERENCE_EXPANSIONS
         params: dict[str, str | int] = {
             "max_results": max_results,
-            "tweet.fields": ",".join(TWEET_FIELDS),
-            "expansions": ",".join(EXPANSIONS),
+            "tweet.fields": ",".join(tweet_fields),
+            "expansions": ",".join(expansions),
             "media.fields": ",".join(MEDIA_FIELDS),
         }
+        if self._expand_referenced:
+            params["user.fields"] = ",".join(USER_FIELDS)
         if since_id:
             params["since_id"] = since_id
         if until_id:

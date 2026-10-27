@@ -203,6 +203,17 @@ def test_max_media_bytes_parameter_feeds_the_process_function(
     assert "MAX_MEDIA_BYTES" not in env_of(template, "FetchFunction")
 
 
+def test_expansion_parameters_feed_the_fetch_function_only(template: Template) -> None:
+    for parameter, variable in (
+        ("ExpandReferencedTweets", "EXPAND_REFERENCED_TWEETS"),
+        ("RequestEntities", "REQUEST_ENTITIES"),
+    ):
+        assert template["Parameters"][parameter]["Default"] == "true"
+        assert template["Parameters"][parameter]["AllowedValues"] == ["true", "false"]
+        assert env_of(template, "FetchFunction")[variable] == {"Ref": parameter}
+        assert variable not in env_of(template, "ProcessFunction")
+
+
 def test_dead_letter_queue_keeps_messages_longer_than_the_source(
     template: Template,
 ) -> None:
@@ -636,6 +647,61 @@ def test_process_function_cannot_write_raw_pages(template: Template) -> None:
     assert objects["Resource"] == [
         {"Fn::Sub": "${MediaBucket.Arn}/media/*"},
         {"Fn::Sub": "${MediaBucket.Arn}/text/*"},
+    ]
+
+
+def test_process_function_s3_access_is_exactly_this_and_never_deletes(
+    template: Template,
+) -> None:
+    statements = [
+        s
+        for s in policy_statements(template, "ProcessFunction")
+        if any(a.startswith("s3:") for a in _as_list(s["Action"]))
+    ]
+
+    assert [
+        (
+            s["Effect"],
+            sorted(_as_list(s["Action"])),
+            s["Resource"] if isinstance(s["Resource"], list) else [s["Resource"]],
+        )
+        for s in statements
+    ] == [
+        (
+            "Allow",
+            ["s3:AbortMultipartUpload", "s3:GetObject", "s3:PutObject"],
+            [
+                {"Fn::Sub": "${MediaBucket.Arn}/media/*"},
+                {"Fn::Sub": "${MediaBucket.Arn}/text/*"},
+            ],
+        ),
+        ("Allow", ["s3:GetObject"], [{"Fn::Sub": "${MediaBucket.Arn}/raw/*"}]),
+        ("Allow", ["s3:ListBucket"], [{"Fn::GetAtt": ["MediaBucket", "Arn"]}]),
+    ]
+    assert "s3:DeleteObject" not in TEMPLATE.read_text()
+
+
+def test_process_function_table_access_is_get_and_put_only(template: Template) -> None:
+    # put_tweet reads before it writes. moto and LocalStack don't enforce IAM, so a
+    # missing GetItem would only show up in AWS, as every message failing.
+    statements = [
+        s
+        for s in policy_statements(template, "ProcessFunction")
+        if any(a.startswith("dynamodb:") for a in _as_list(s["Action"]))
+    ]
+    policies = properties(template, "ProcessFunction")["Policies"]
+
+    assert [
+        (s["Effect"], sorted(_as_list(s["Action"])), s["Resource"]) for s in statements
+    ] == [
+        (
+            "Allow",
+            ["dynamodb:GetItem", "dynamodb:PutItem"],
+            {"Fn::GetAtt": ["TweetsTable", "Arn"]},
+        )
+    ]
+    assert not [
+        p for p in policies if isinstance(p, dict) and any("DynamoDB" in k for k in p)
     ]
 
 

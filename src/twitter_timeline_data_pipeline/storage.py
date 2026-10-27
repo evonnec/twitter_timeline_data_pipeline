@@ -7,8 +7,9 @@ re-send a Tweet after a retry:
   stored item only if it is not older (by ``fetched_at`` and ``schema_version``), so a
   stale redelivery can't overwrite newer data. A repeat of the same delivery rewrites
   the same data.
-- A post too big for a DynamoDB item has its text uploaded (create-only) to a
-  deterministic S3 key first.
+- A post too big for a DynamoDB item has its text, and if that is not enough its
+  entities, uploaded (create-only) to S3 keys under the Tweet's own prefix first. A
+  write never deletes an S3 object.
 - A preview-only message can't replace a stored long post.
 - Media objects get a deterministic S3 key, and an object that already exists is not
   downloaded again.
@@ -17,6 +18,7 @@ re-send a Tweet after a retry:
   replaces only that entry.
 """
 
+import hashlib
 import io
 import json
 import logging
@@ -27,6 +29,7 @@ import re
 import time
 from collections.abc import Buffer, Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
+from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Literal, cast, override
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -642,7 +645,31 @@ def estimate_item_size(value: Any) -> int:
 # of the stored item and its put; after that it raises ``WriteContentionError``.
 MERGE_ATTEMPTS = 3
 # What is read from the stored item to merge from, and to guard the put with.
-_MERGE_PROJECTION = "media, fetched_at, revision"
+_MERGE_PROJECTION = (
+    "media, referenced_tweets, entities, entities_s3_key, display_entities, "
+    "display_entities_s3_key, entities_omitted, in_reply_to_user_id, "
+    "possibly_sensitive, edit_controls, withheld, fetched_at, revision"
+)
+# The fields of a stored referenced-post entry, in groups that are merged as a unit (a
+# text is its inline value with its S3 pointer; they must not come from two copies).
+_TEXT_GROUPS = (
+    ("text", "text_truncated", "text_s3_key"),
+    ("display_text", "display_text_truncated", "display_text_s3_key"),
+    ("is_long_post",),
+)
+_ENTITIES_GROUP = ("entities", "entities_s3_key")
+_OTHER_GROUPS = (("author_id",), ("author_username",), ("created_at",))
+_TWEET_ENTITY_KEYS = frozenset(
+    {"entities", "entities_s3_key", "display_entities", "display_entities_s3_key"}
+)
+_UNAVAILABLE_KEYS = ("status", "unavailable_reason", "unavailable_since")
+# Fields a message only carries when the API was asked for entities: when it wasn't,
+# a stored value is kept (when it was, the API's answer wins, absent included).
+_ENTITY_REQUEST_FIELDS = ("possibly_sensitive", "edit_controls", "withheld")
+# DynamoDB's limits: numbers between 1E-130 and 9.99E+125 in magnitude, and 32 levels
+# of nesting (the item itself is level 1).
+_NUMBER_EXPONENTS = range(-130, 126)
+MAX_NESTING = 32
 
 
 class WriteContentionError(RuntimeError):
@@ -650,8 +677,162 @@ class WriteContentionError(RuntimeError):
     message must be retried (nothing is stored), not treated as stale."""
 
 
-def carry_forward(
+def _json_text(value: Any) -> str:
+    """``value`` (a stored attribute, ``Decimal`` numbers included) as JSON text that
+    reads back with ``json.loads`` and is strict UTF-8."""
+
+    def number(d: Decimal) -> int | float:  # the only type DynamoDB hands back
+        return int(d) if d == d.to_integral_value() else float(d)
+
+    body = json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=number)
+    return escape_disallowed_chars(body)
+
+
+def _dynamo(value: Any, depth: int = 1) -> Any:
+    """``value`` as DynamoDB takes it (``depth`` is the level of ``value``'s parent).
+
+    Floats become ``Decimal(repr(f))`` (the resource API rejects floats), so an
+    annotation's probability is stored exactly as the API sent it; one outside
+    DynamoDB's number range is stored as its ``repr`` string instead. A container
+    nested deeper than DynamoDB allows is stored as its JSON text."""
+    match value:
+        case float():
+            number = Decimal(repr(value))
+            if number and number.adjusted() not in _NUMBER_EXPONENTS:
+                return repr(value)
+            return number
+        case dict() | list():
+            if depth + 1 > MAX_NESTING:
+                return _json_text(value)
+            if isinstance(value, dict):
+                return {k: _dynamo(v, depth + 1) for k, v in value.items()}
+            return [_dynamo(v, depth + 1) for v in value]
+        case _:
+            return value
+
+
+def _is_bare(ref: Mapping[str, Any]) -> bool:
+    """A reference entry with nothing but its type and ID: the response said nothing
+    about the original."""
+    return set(ref) <= {"type", "id"}
+
+
+def _take(
+    merged: dict[str, Any], kept: Mapping[str, Any], group: Sequence[str]
+) -> None:
+    for name in group:
+        if name in kept:
+            merged[name] = kept[name]
+
+
+def _has(entry: Mapping[str, Any], group: Sequence[str]) -> bool:
+    return any(name in entry for name in group)
+
+
+def _merge_reference(
+    fresh: Mapping[str, Any],
+    kept: Mapping[str, Any],
+    fetched_at: str,
+    previous_fetched_at: str,
+) -> dict[str, Any]:
+    """The entry for a referenced post that the new item lists, merged field by field
+    with its stored entry ``kept`` (same ``id``).
+
+    A bare reference keeps the stored entry (with ``stale_since`` and
+    ``last_seen_fetched_at`` when it has a text). Otherwise the fresh values win, and a
+    field the fresh copy lacks is kept from the stored one. A stored long copy is not
+    replaced by a short one (the text fields, ``display_text*`` and ``is_long_post``
+    stay). A fresh ``unavailable`` entry keeps the stored copy whole, with
+    ``unavailable_since`` carried from the first fetch that saw it so. A copy that is
+    present again carries no status."""
+    merged = dict(fresh)
+    if _is_bare(fresh):
+        for group in (*_TEXT_GROUPS, _ENTITIES_GROUP, *_OTHER_GROUPS):
+            _take(merged, kept, group)
+        _take(
+            merged, kept, (*_UNAVAILABLE_KEYS, "note_text_omitted", "entities_omitted")
+        )
+        if "text" in kept:
+            merged["stale_since"] = kept.get("stale_since", fetched_at)
+            merged["last_seen_fetched_at"] = kept.get(
+                "last_seen_fetched_at", previous_fetched_at
+            )
+        return merged
+    if fresh.get("status") == "unavailable":
+        merged["unavailable_since"] = kept.get("unavailable_since", fetched_at)
+    keep_long = bool(kept.get("is_long_post")) and not fresh.get("is_long_post")
+    text_from_kept = keep_long or "text" not in fresh
+    if text_from_kept:
+        for group in _TEXT_GROUPS:
+            for name in group:
+                merged.pop(name, None)
+            _take(merged, kept, group)
+        merged.pop("note_text_omitted", None)
+        _take(merged, kept, ("note_text_omitted",))
+    else:
+        for group in _TEXT_GROUPS:
+            if not _has(merged, group):
+                _take(merged, kept, group)
+    # Entities describe the text stored with them: they follow a text kept from the
+    # stored copy, and a stored preview's are not carried next to a fresh full text.
+    preview_under_full_text = bool(fresh.get("is_long_post")) and not kept.get(
+        "is_long_post"
+    )
+    if text_from_kept or (
+        not _has(fresh, _ENTITIES_GROUP) and not preview_under_full_text
+    ):
+        for name in _ENTITIES_GROUP:
+            merged.pop(name, None)
+        _take(merged, kept, _ENTITIES_GROUP)
+        if _has(kept, _ENTITIES_GROUP):  # the marker goes only if they came
+            merged.pop("entities_omitted", None)
+            _take(merged, kept, ("entities_omitted",))
+    for group in _OTHER_GROUPS:
+        if not _has(merged, group):
+            _take(merged, kept, group)
+    return merged
+
+
+def _carry_references(
     item: dict[str, Any], previous: Mapping[str, Any], fetched_at: str
+) -> None:
+    stored: list[Mapping[str, Any]] = list(previous.get("referenced_tweets") or ())
+    previous_fetched_at = previous.get("fetched_at", fetched_at)
+    refs: list[dict[str, Any]] = item.get("referenced_tweets") or []
+    used: set[int] = set()
+    for i, ref in enumerate(refs):
+        # The stored copy of the same post: the same type first, else any (the same
+        # post can be listed under another type later).
+        candidates = [
+            (j, r)
+            for j, r in enumerate(stored)
+            if j not in used and r.get("id") == ref.get("id")
+        ]
+        candidates.sort(key=lambda c: c[1].get("type") != ref.get("type"))
+        if candidates:
+            j, kept = candidates[0]
+            used.add(j)
+            refs[i] = _merge_reference(ref, kept, fetched_at, previous_fetched_at)
+    for j, kept in enumerate(stored):
+        if j not in used:
+            refs.append(
+                {
+                    **kept,
+                    "missing_since": kept.get("missing_since", fetched_at),
+                    "last_seen_fetched_at": kept.get(
+                        "last_seen_fetched_at", previous_fetched_at
+                    ),
+                }
+            )
+    if refs:
+        item["referenced_tweets"] = refs
+
+
+def carry_forward(
+    item: dict[str, Any],
+    previous: Mapping[str, Any],
+    fetched_at: str,
+    requested: Mapping[str, bool] | None = None,
 ) -> None:
     """Merge what the stored item ``previous`` knows into the new ``item``, in place.
 
@@ -664,7 +845,33 @@ def carry_forward(
     keys), unless it is itself ``missing``. A kept entry gets ``missing_since`` (the
     first fetch that lost it) and ``last_seen_fetched_at`` (the fetch that last saw
     it). A key that is present again simply replaces its entry.
+
+    ``in_reply_to_user_id`` (it never changes) is always kept when the new item lacks
+    it.
+
+    Entities (``entities`` and ``display_entities``, or the ``*_s3_key`` pointer to
+    an offloaded one) come from immutable text, so a stored one is kept whenever the
+    new item lacks it, requested or not. ``possibly_sensitive``, ``edit_controls``
+    and ``withheld`` are kept only when the message did not ask the API for entities.
+
+    Referenced posts, matched by ``id``: see ``_merge_reference``. A stored reference
+    the new item does not list is kept whole after the new ones, with ``missing_since``
+    (the first fetch that lacked it) and ``last_seen_fetched_at``.
     """
+    if "in_reply_to_user_id" not in item and "in_reply_to_user_id" in previous:
+        item["in_reply_to_user_id"] = previous["in_reply_to_user_id"]
+    for name in ("entities", "display_entities"):
+        if name not in item:
+            _take(item, previous, (name, f"{name}_s3_key"))
+    if set(item) & _TWEET_ENTITY_KEYS:
+        item.pop("entities_omitted", None)
+    else:
+        _take(item, previous, ("entities_omitted",))
+    if not (requested or {}).get("entities"):
+        for name in _ENTITY_REQUEST_FIELDS:
+            if name not in item and name in previous:
+                item[name] = previous[name]
+    _carry_references(item, previous, fetched_at)
     media: list[dict[str, Any]] = item.setdefault("media", [])
     index = {e["media_key"]: i for i, e in enumerate(media)}
     for kept in previous.get("media") or ():
@@ -705,23 +912,46 @@ class TweetStore:
         suffix = "" if field == "text" else f".{field}"
         return f"text/{owner}/{message.tweet.id}{suffix}.json"
 
-    def _offload(self, message: TweetMessage, item: dict[str, Any], field: str) -> None:
+    def _offload(
+        self,
+        message: TweetMessage,
+        item: dict[str, Any],
+        field: str,
+        key: str | None = None,
+    ) -> None:
         """Upload ``item[field]`` to S3 and leave a prefix and pointer in the item.
+        ``item`` is the dict holding the field (the item, or a referenced post's
+        entry) and ``key`` the S3 key (default: the Tweet's text key for ``field``).
 
         The object is the text as a JSON string (strict UTF-8; characters SQS and UTF-8
         reject are escaped the same way as in the message), so any text, a lone
         surrogate included, reads back exactly with ``json.loads``. The write is
-        create-only: a redelivery, or a stale message for the same Tweet (same ID, same
-        text), finds it already there and writes nothing.
+        create-only and never overwrites. When the key is taken, the object is read
+        back: the same text (a redelivery, or a stale message for the same Tweet) is
+        already there and nothing is written; a different one (a preview stored here
+        earlier, say) sends this text to the sibling key ``<key>.<sha256[:16]>.json``
+        instead, so the pointer always names an object that holds this text.
         """
-        key = self.text_key(message, field)
+        key = key or self.text_key(message, field)
         text: str = item[field]
-        body = escape_disallowed_chars(json.dumps(text, ensure_ascii=False))
+        body = escape_disallowed_chars(json.dumps(text, ensure_ascii=False)).encode()
+        if not self._put_once(message, key, body):
+            held = self._s3.get_object(Bucket=self._bucket, Key=key)["Body"].read()
+            if held != body:
+                digest = hashlib.sha256(body).hexdigest()[:16]
+                key = f"{key.removesuffix('.json')}.{digest}.json"
+                self._put_once(message, key, body)  # same hash, same content
+        item[field] = _LONE_SURROGATE.sub("\ufffd", text[:TEXT_PREVIEW_CHARS])
+        item[f"{field}_truncated"] = True
+        item[f"{field}_s3_key"] = key
+
+    def _put_once(self, message: TweetMessage, key: str, body: bytes) -> bool:
+        """Create ``key`` unless it exists; whether this call created it."""
         try:
             self._s3.put_object(
                 Bucket=self._bucket,
                 Key=key,
-                Body=body.encode("utf-8"),
+                Body=body,
                 ContentType="application/json",
                 Metadata={"tweet-id": message.tweet.id},
                 IfNoneMatch="*",
@@ -729,9 +959,27 @@ class TweetStore:
         except ClientError as exc:
             if exc.response.get("Error", {}).get("Code") != "PreconditionFailed":
                 raise
-        item[field] = _LONE_SURROGATE.sub("\ufffd", text[:TEXT_PREVIEW_CHARS])
-        item[f"{field}_truncated"] = True
-        item[f"{field}_s3_key"] = key
+            return False
+        return True
+
+    def _offload_entities(
+        self,
+        message: TweetMessage,
+        holder: dict[str, Any],
+        name: str,
+        key_base: str,
+    ) -> None:
+        """Upload ``holder[name]`` (an ``entities`` object) to S3 as JSON and leave the
+        pointer ``<name>_s3_key`` in its place. The key ends in a hash of the content
+        and the write is create-only, so a key always holds exactly what the item
+        that names it expects; objects of older contents are left where they are (a
+        write never deletes)."""
+        body = _json_text(holder[name])
+        digest = hashlib.sha256(body.encode()).hexdigest()[:16]
+        key = f"{key_base}.{digest}.json"
+        self._put_once(message, key, body.encode("utf-8"))
+        del holder[name]
+        holder[f"{name}_s3_key"] = key
 
     def build_item(
         self,
@@ -748,10 +996,15 @@ class TweetStore:
         size. Items that fit make no S3 call. This runs before the conditional write.
         ``previous`` (the stored item) is merged in first, see ``carry_forward``, so the
         size estimate counts what will be written.
+
+        When the item is still over the limit after the texts, the entities go to S3
+        too, the largest first (the Tweet's ``entities`` and ``display_entities``, and
+        each referenced post's): the item keeps ``<name>_s3_key``, the key of a JSON
+        object ``text/<owner>/<tweet_id>.[ref.<id>.]<name>.<hash>.json``.
         """
         item = self.to_item(message, media)
         if previous is not None:
-            carry_forward(item, previous, message.fetched_at)
+            carry_forward(item, previous, message.fetched_at, message.requested)
         fields = [f for f in ("text", "display_text") if f in item]
         for field in sorted(fields, key=lambda f: len(item[f]), reverse=True):
             over = (
@@ -760,7 +1013,77 @@ class TweetStore:
             )
             if over or _LONE_SURROGATE.search(item[field]):
                 self._offload(message, item, field)
+        # Referenced posts' texts: kept inline unless the item is still too big (a
+        # long original quoted by a long post) or the text can't be stored inline.
+        owner = message.tweet.author_id or message.username.lower()
+        refs = [
+            (ref, f)
+            for ref in item.get("referenced_tweets", ())
+            for f in ("text", "display_text")
+            if f in ref
+        ]
+        for ref, name in sorted(refs, key=lambda r: len(r[0][r[1]]), reverse=True):
+            over = (
+                estimate_item_size(item) > ITEM_LIMIT_BYTES
+                and len(ref[name]) > TEXT_PREVIEW_CHARS
+            )
+            if over or _LONE_SURROGATE.search(ref[name]):
+                suffix = "" if name == "text" else f".{name}"
+                key = f"text/{owner}/{message.tweet.id}.ref.{ref['id']}{suffix}.json"
+                self._offload(message, ref, name, key)
+        # Entities: still inline unless the item is over budget after all the texts.
+        spots: list[tuple[dict[str, Any], str, str]] = [
+            (item, name, f"text/{owner}/{message.tweet.id}.{name}")
+            for name in ("entities", "display_entities")
+            if name in item
+        ]
+        spots += [
+            (
+                ref,
+                "entities",
+                f"text/{owner}/{message.tweet.id}.ref.{ref['id']}.entities",
+            )
+            for ref in item.get("referenced_tweets", ())
+            if "entities" in ref
+        ]
+        for holder, name, key_base in sorted(
+            spots, key=lambda s: estimate_item_size(s[0][s[1]]), reverse=True
+        ):
+            if estimate_item_size(item) <= ITEM_LIMIT_BYTES:
+                break
+            self._offload_entities(message, holder, name, key_base)
         return item
+
+    @staticmethod
+    def referenced_entries(message: TweetMessage) -> list[dict[str, Any]]:
+        """``referenced_tweets`` for the item: the Tweet's ``{type, id}`` pairs with the
+        copies the message carries merged in (original text and author). A copy the
+        Tweet doesn't list is appended, so nothing in the message is dropped."""
+        copies = {(r.type, r.id): r for r in message.referenced}
+        pairs = [(r.type, r.id) for r in message.tweet.referenced_tweets]
+        pairs += [k for k in copies if k not in pairs]
+        entries = []
+        for type_, id_ in pairs:
+            entry: dict[str, Any] = {"type": type_, "id": id_}
+            if (copy := copies.get((type_, id_))) is not None:
+                entry |= {
+                    "text": copy.full_text,
+                    "display_text": copy.text if copy.note_text else None,
+                    "is_long_post": True if copy.note_text else None,
+                    "author_id": copy.author_id,
+                    "author_username": copy.author_username,
+                    "created_at": copy.created_at,
+                    "entities": dict(copy.entities) if copy.entities else None,
+                    "status": copy.status,
+                    "unavailable_reason": copy.unavailable_reason,
+                    "unavailable_since": (
+                        message.fetched_at if copy.status == "unavailable" else None
+                    ),
+                    "note_text_omitted": True if copy.note_text_omitted else None,
+                    "entities_omitted": True if copy.entities_omitted else None,
+                }
+            entries.append({k: v for k, v in entry.items() if v is not None})
+        return entries
 
     @staticmethod
     def to_item(message: TweetMessage, media: Sequence[StoredMedia]) -> dict[str, Any]:
@@ -796,9 +1119,16 @@ class TweetStore:
             "created_at": tweet.created_at,
             "conversation_id": tweet.conversation_id,
             "lang": tweet.lang,
-            "referenced_tweets": [
-                {"type": r.type, "id": r.id} for r in tweet.referenced_tweets
-            ],
+            "entities": dict(tweet.entities) if tweet.entities else None,
+            "display_entities": (
+                dict(tweet.display_entities) if tweet.display_entities else None
+            ),
+            "entities_omitted": True if tweet.entities_omitted else None,
+            "in_reply_to_user_id": tweet.in_reply_to_user_id,
+            "possibly_sensitive": tweet.possibly_sensitive,
+            "edit_controls": dict(tweet.edit_controls) if tweet.edit_controls else None,
+            "withheld": dict(tweet.withheld) if tweet.withheld else None,
+            "referenced_tweets": TweetStore.referenced_entries(message),
             "public_metrics": dict(tweet.public_metrics),
             "edit_history_tweet_ids": list(tweet.edit_history_tweet_ids),
             "media_keys": keys,
@@ -809,7 +1139,7 @@ class TweetStore:
             "stored_at": utc_now_iso(),
             "schema_version": message.schema_version,
         }
-        return {k: v for k, v in item.items() if v is not None}
+        return {k: _dynamo(v) for k, v in item.items() if v is not None}
 
     def put_tweet(
         self, message: TweetMessage, media: Sequence[StoredMedia]

@@ -17,6 +17,7 @@ from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
 from twitter_timeline_data_pipeline.models import (
+    RawPage,
     TimelinePage,
     TweetMessage,
     normalize_fetched_at,
@@ -44,7 +45,8 @@ class ReplayResult:
 
 
 def without_redactions(page: TimelinePage, redactions: tuple[str, ...]) -> TimelinePage:
-    """``page`` minus the redacted Tweets and the media only they used."""
+    """``page`` minus the redacted Tweets, the media only they used, and the redacted
+    posts among the included ones (so no Tweet's copy restores their text)."""
     if not redactions:
         return page
     gone = set(redactions)
@@ -53,7 +55,14 @@ def without_redactions(page: TimelinePage, redactions: tuple[str, ...]) -> Timel
     dropped = {key for t in page.tweets if t.id in gone for key in t.media_keys}
     media = {k: m for k, m in page.media.items() if k in used or k not in dropped}
     quarantined = tuple(q for q in page.quarantined if q.tweet_id not in gone)
-    return replace(page, tweets=kept, media=media, quarantined=quarantined)
+    return replace(
+        page,
+        tweets=kept,
+        media=media,
+        quarantined=quarantined,
+        included={k: v for k, v in page.included.items() if k not in gone},
+        unavailable={k: v for k, v in page.unavailable.items() if k not in gone},
+    )
 
 
 def messages_from_raw(
@@ -87,8 +96,15 @@ def messages_from_raw(
         try:
             envelope = Envelope.from_bytes(body)
             fetched_at = normalize_fetched_at(envelope.fetched_at)
+            # The request's params say what was asked for (entities, expansions),
+            # which the messages record, so a replay builds the fetch's own messages.
+            raw = RawPage(
+                endpoint=str(envelope.request.get("endpoint", "")),
+                params=dict(envelope.request.get("params") or {}),
+                body=envelope.response,
+            )
             page = without_redactions(
-                parse_timeline_page(envelope.response), envelope.redactions
+                parse_timeline_page(envelope.response, raw=raw), envelope.redactions
             )
             messages = page.messages(
                 envelope.username, fetched_at=fetched_at, raw_key=key

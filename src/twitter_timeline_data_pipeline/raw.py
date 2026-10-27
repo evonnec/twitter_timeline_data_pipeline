@@ -22,7 +22,7 @@ import logging
 import uuid
 import zlib
 from collections.abc import Iterator, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
@@ -30,7 +30,13 @@ import boto3
 from botocore.exceptions import ClientError
 
 from twitter_timeline_data_pipeline.config import ConfigError
-from twitter_timeline_data_pipeline.models import JSONObject, RawPage
+from twitter_timeline_data_pipeline.models import (
+    JSONObject,
+    RawPage,
+    ReferencedPost,
+    TweetMessage,
+    split_entities,
+)
 
 if TYPE_CHECKING:
     from mypy_boto3_s3 import S3Client
@@ -212,3 +218,85 @@ def iter_raw_objects(
                 continue
             body = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
             yield key, body
+
+
+def restore_omitted(
+    s3: S3Client, bucket: str, message: TweetMessage, *, best_effort: bool = False
+) -> TweetMessage:
+    """``message`` with what the fetch Lambda left out to keep the body under SQS's
+    limit read back from the raw page it names: the referenced posts' ``note_text``
+    and ``entities``, and the Tweet's own ``entities`` and ``display_entities``. A
+    message that omitted nothing is returned as it is.
+
+    The envelope's ``redactions`` are honoured: a referenced post that is redacted
+    comes back as a bare reference (nothing of it is restored). Entries of
+    ``includes`` that are not posts are skipped. Raises ``RawPageError`` (and
+    ``ClientError`` for S3) when the page or a value can't be found. With
+    ``best_effort`` (the last receive) each value is restored on its own: one that
+    can't be found keeps its omitted marker and the rest is still restored, and an
+    unreadable page restores nothing instead of raising."""
+    if not message.has_omitted:
+        return message
+    if message.raw_key is None:
+        if best_effort:
+            return message
+        raise RawPageError("content was omitted but there is no raw_key")
+    try:
+        body = s3.get_object(Bucket=bucket, Key=message.raw_key)["Body"].read()
+        envelope = Envelope.from_bytes(body)
+    except (ClientError, RawPageError) as exc:
+        if not best_effort:
+            raise
+        logger.warning("raw page %s unreadable: %r", message.raw_key, exc)
+        return message
+    redacted = set(envelope.redactions)
+    includes = envelope.response.get("includes")
+    posts: dict[str, ReferencedPost] = {}
+    for name in ("tweets", "posts"):  # X is renaming tweets to posts
+        entries = includes.get(name) if isinstance(includes, Mapping) else None
+        for entry in entries if isinstance(entries, list) else ():
+            try:
+                parsed = ReferencedPost.from_api(entry)
+            except Exception:  # quarantined by the fetch; nothing to restore from
+                continue
+            posts[parsed.id] = parsed
+
+    def missing(what: str) -> None:
+        if not best_effort:
+            raise RawPageError(f"raw page {message.raw_key} has no {what}")
+
+    restored = []
+    for ref in message.referenced:
+        if ref.id in redacted:
+            ref = ReferencedPost(id=ref.id, type=ref.type)
+        else:
+            post = posts.get(ref.id)
+            if ref.note_text_omitted:
+                if post is None or post.note_text is None:
+                    missing(f"note for {ref.id}")
+                else:
+                    ref = replace(
+                        ref, note_text=post.note_text, note_text_omitted=False
+                    )
+            if ref.entities_omitted:
+                if post is None or post.entities is None:
+                    missing(f"entities for {ref.id}")
+                else:
+                    ref = replace(ref, entities=post.entities, entities_omitted=False)
+        restored.append(ref)
+    tweet = message.tweet
+    if tweet.entities_omitted:
+        data = envelope.response.get("data")
+        for entry in data if isinstance(data, list) else ():
+            if isinstance(entry, Mapping) and str(entry.get("id")) == tweet.id:
+                entities, display = split_entities(entry)
+                tweet = replace(
+                    tweet,
+                    entities=entities,
+                    display_entities=display,
+                    entities_omitted=False,
+                )
+                break
+        else:
+            missing(f"tweet {tweet.id}")
+    return replace(message, tweet=tweet, referenced=tuple(restored))

@@ -27,7 +27,12 @@ ENV_VARS: Mapping[str, str] = {
     "max_media_bytes": "MAX_MEDIA_BYTES",
     "max_receive_count": "MAX_RECEIVE_COUNT",
     "media_retry_queue_url": "MEDIA_RETRY_QUEUE_URL",
+    "expand_referenced_tweets": "EXPAND_REFERENCED_TWEETS",
+    "request_entities": "REQUEST_ENTITIES",
 }
+
+_TRUE = frozenset({"1", "true", "yes", "on"})
+_FALSE = frozenset({"0", "false", "no", "off"})
 
 
 class ConfigError(RuntimeError):
@@ -65,6 +70,12 @@ class Settings:
     instead of failing the record. None disables that."""
     media_retry_queue_url: str | None = None
     """Queue the process function sends media-retry messages to."""
+    expand_referenced_tweets: bool = True
+    """Ask the API for the posts a Tweet retweets, quotes or replies to and their
+    authors. Those posts may be billed as reads under pay-per-use."""
+    request_entities: bool = True
+    """Ask the API for ``entities`` (expanded URLs, mentions, hashtags) and the other
+    per-Tweet metadata fields."""
 
     def __post_init__(self) -> None:
         if not 5 <= self.max_results <= 100:
@@ -117,6 +128,16 @@ class Settings:
                     f"{ENV_VARS[attr]} must be {kind.__name__}, got {raw!r}"
                 ) from None
 
+        def get_flag(attr: str, default: bool) -> bool:
+            raw = get(attr)
+            if raw is None:
+                return default
+            if raw.lower() in _TRUE:
+                return True
+            if raw.lower() in _FALSE:
+                return False
+            raise ConfigError(f"{ENV_VARS[attr]} must be true or false, got {raw!r}")
+
         return cls(
             username=get("username"),
             bearer_token_secret_id=get("bearer_token_secret_id"),
@@ -139,6 +160,8 @@ class Settings:
                 else get_number("max_receive_count", int, 1)
             ),
             media_retry_queue_url=get("media_retry_queue_url"),
+            expand_referenced_tweets=get_flag("expand_referenced_tweets", True),
+            request_entities=get_flag("request_entities", True),
         )
 
     def require(self, *attrs: str) -> None:

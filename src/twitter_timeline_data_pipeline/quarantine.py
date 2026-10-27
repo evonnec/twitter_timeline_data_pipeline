@@ -9,7 +9,10 @@ Key layout::
 
 Each object is plain JSON::
 
-    {"kind": "tweet" | "media" | "message", "raw_key", "error", "item": <the JSON>}
+    {"kind", "raw_key", "error", "item": <the JSON>}
+
+``kind`` is ``tweet``, ``media``, ``included_tweet`` or ``included_user`` (an entry of
+the page's ``includes``) or ``message``.
 
 Fix the parser, then replay the raw prefix (``twitter-pipeline replay``): replay
 re-parses the raw pages, so the fixed parser picks the item up again.

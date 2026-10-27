@@ -23,6 +23,7 @@ from twitter_timeline_data_pipeline.models import (
     MessageError,
     TweetMessage,
 )
+from twitter_timeline_data_pipeline.raw import restore_omitted
 from twitter_timeline_data_pipeline.storage import (
     MEDIA_HOSTS_OVERRIDE_ENV,
     MediaRetryQueue,
@@ -90,6 +91,7 @@ def process_records(
     remaining_ms: Callable[[], int] | None = None,
     max_receive_count: int | None = None,
     retry_queue: MediaRetryQueue | None = None,
+    restore_notes: Callable[..., TweetMessage] | None = None,
 ) -> list[str]:
     """Process SQS records; return the ``messageId`` of each one that failed.
 
@@ -128,6 +130,26 @@ def process_records(
             continue
         try:
             message = TweetMessage.from_json(record["body"])
+            if message.has_omitted:
+                # Left out of the body to fit SQS's limit; read back from the raw page.
+                # An error here retries the record, until its last receive: then the
+                # Tweet is stored with what the message has (the omitted markers stay
+                # on the copies, and never replace richer stored data) rather than
+                # not at all; a replay of the raw page fills the rest in.
+                try:
+                    if restore_notes is None:
+                        raise MessageError("content omitted, no raw page reader")
+                    message = restore_notes(message, best_effort=last_receive)
+                except Exception as exc:
+                    if not last_receive:
+                        raise
+                    logger.error(
+                        "message %s: omitted content could not be read back from %s "
+                        "(%r); storing the tweet without it",
+                        message_id,
+                        message.raw_key,
+                        exc,
+                    )
             if message.missing_media_keys:
                 logger.warning(
                     "tweet %s: media keys missing from includes, recorded as "
@@ -310,5 +332,8 @@ def handler(event: Any, context: Any) -> dict[str, list[dict[str, str]]]:
         remaining_ms=getattr(context, "get_remaining_time_in_millis", None),
         max_receive_count=settings.max_receive_count,
         retry_queue=MediaRetryQueue(_sqs_client(), settings.media_retry_queue_url),
+        restore_notes=functools.partial(
+            restore_omitted, _s3_client(), settings.media_bucket
+        ),
     )
     return {"batchItemFailures": [{"itemIdentifier": i} for i in failed]}

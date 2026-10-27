@@ -94,7 +94,8 @@ class EnqueueError(RuntimeError):
 class MessageTooLargeError(EnqueueError):
     """A Tweet's message body is over the SQS limit. Nothing is dropped: the page is
     left unfetched in the cursor and the run fails (alarm fires), so the data can be
-    handled deliberately."""
+    handled deliberately. (Referenced posts' long texts are left out first when the
+    Tweet has a raw page to read them back from.)"""
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -165,15 +166,53 @@ def _send_batch(
     raise EnqueueError(f"{len(pending)} messages still failing after retries")
 
 
-def _encode(messages: Sequence[TweetMessage]) -> list[str]:
-    """The JSON bodies, or ``MessageTooLargeError`` if any exceeds the SQS limit."""
+def _encode(messages: Sequence[TweetMessage], *, allow_slim: bool = True) -> list[str]:
+    """The JSON bodies, or ``MessageTooLargeError`` if any exceeds the SQS limit.
+
+    A body over the limit is slimmed in stages while it has the raw page to read the
+    content back from: the referenced posts' ``note_text``, then their ``entities``,
+    then the Tweet's own ``entities`` (each marked omitted; the processor refills them
+    from the raw page, so nothing is lost). With ``allow_slim`` false (a replay whose
+    raw pages are not in the processor's bucket) that is refused instead."""
     bodies = []
     for message in messages:
         body = message.to_json()
         size = len(body.encode())
+        tweet = message.tweet
+        if (
+            size > SQS_MAX_MESSAGE_BYTES
+            and message.raw_key
+            and (message.referenced or tweet.entities or tweet.display_entities)
+        ):
+            if not allow_slim:
+                raise MessageTooLargeError(
+                    f"tweet {tweet.id}: message body is {size} bytes, over the "
+                    f"{SQS_MAX_MESSAGE_BYTES} byte SQS limit, and slimming it needs "
+                    f"the processor to read {message.raw_key} back, which it does "
+                    "only from its own MEDIA_BUCKET; replay from the configured "
+                    "media bucket instead"
+                )
+            slim = message
+            for stage in (
+                TweetMessage.without_referenced_notes,
+                TweetMessage.without_referenced_entities,
+                TweetMessage.without_entities,
+            ):
+                slim = stage(slim)
+                body = slim.to_json()
+                size = len(body.encode())
+                if size <= SQS_MAX_MESSAGE_BYTES:
+                    break
+            logger.warning(
+                "tweet %s: message body is over the limit; notes and entities left "
+                "out (now %d bytes), to be read from %s",
+                tweet.id,
+                size,
+                message.raw_key,
+            )
         if size > SQS_MAX_MESSAGE_BYTES:
             raise MessageTooLargeError(
-                f"tweet {message.tweet.id}: message body is {size} bytes, over the "
+                f"tweet {tweet.id}: message body is {size} bytes, over the "
                 f"{SQS_MAX_MESSAGE_BYTES} byte SQS limit"
             )
         bodies.append(body)
@@ -186,12 +225,14 @@ def send_messages(
     messages: Sequence[TweetMessage],
     sleep: Callable[[float], None],
     reject: Callable[[str, str], None] | None = None,
+    *,
+    allow_slim: bool = True,
 ) -> int:
     """Encode (and size-check) every message, then send them in batches; returns the
     number sent (``reject``ed ones, see ``_send_batch``, are not counted). Nothing is
     sent if any message is over the limit. Shared by the fetch run and ``replay``."""
     sent = 0
-    for chunk in _chunk_bodies(_encode(messages)):
+    for chunk in _chunk_bodies(_encode(messages, allow_slim=allow_slim)):
         sent += _send_batch(sqs, queue_url, chunk, sleep, reject)
     return sent
 
@@ -844,6 +885,8 @@ def handler(event: Any, context: Any) -> dict[str, Any]:
             base_url=settings.x_api_base_url,
             timeout=settings.http_timeout,
             max_rate_limit_wait=max_rate_limit_wait,
+            expand_referenced=settings.expand_referenced_tweets,
+            request_entities=settings.request_entities,
         ) as x_client:
             result = run_fetch(
                 username=username,
