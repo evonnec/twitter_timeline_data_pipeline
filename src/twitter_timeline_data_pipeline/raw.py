@@ -220,7 +220,9 @@ def iter_raw_objects(
             yield key, body
 
 
-def restore_omitted(s3: S3Client, bucket: str, message: TweetMessage) -> TweetMessage:
+def restore_omitted(
+    s3: S3Client, bucket: str, message: TweetMessage, *, best_effort: bool = False
+) -> TweetMessage:
     """``message`` with what the fetch Lambda left out to keep the body under SQS's
     limit read back from the raw page it names: the referenced posts' ``note_text``
     and ``entities``, and the Tweet's own ``entities`` and ``display_entities``. A
@@ -229,13 +231,24 @@ def restore_omitted(s3: S3Client, bucket: str, message: TweetMessage) -> TweetMe
     The envelope's ``redactions`` are honoured: a referenced post that is redacted
     comes back as a bare reference (nothing of it is restored). Entries of
     ``includes`` that are not posts are skipped. Raises ``RawPageError`` (and
-    ``ClientError`` for S3) when the page or a value can't be found."""
+    ``ClientError`` for S3) when the page or a value can't be found. With
+    ``best_effort`` (the last receive) each value is restored on its own: one that
+    can't be found keeps its omitted marker and the rest is still restored, and an
+    unreadable page restores nothing instead of raising."""
     if not message.has_omitted:
         return message
     if message.raw_key is None:
+        if best_effort:
+            return message
         raise RawPageError("content was omitted but there is no raw_key")
-    body = s3.get_object(Bucket=bucket, Key=message.raw_key)["Body"].read()
-    envelope = Envelope.from_bytes(body)
+    try:
+        body = s3.get_object(Bucket=bucket, Key=message.raw_key)["Body"].read()
+        envelope = Envelope.from_bytes(body)
+    except (ClientError, RawPageError) as exc:
+        if not best_effort:
+            raise
+        logger.warning("raw page %s unreadable: %r", message.raw_key, exc)
+        return message
     redacted = set(envelope.redactions)
     includes = envelope.response.get("includes")
     posts: dict[str, ReferencedPost] = {}
@@ -247,6 +260,11 @@ def restore_omitted(s3: S3Client, bucket: str, message: TweetMessage) -> TweetMe
             except Exception:  # quarantined by the fetch; nothing to restore from
                 continue
             posts[parsed.id] = parsed
+
+    def missing(what: str) -> None:
+        if not best_effort:
+            raise RawPageError(f"raw page {message.raw_key} has no {what}")
+
     restored = []
     for ref in message.referenced:
         if ref.id in redacted:
@@ -255,16 +273,16 @@ def restore_omitted(s3: S3Client, bucket: str, message: TweetMessage) -> TweetMe
             post = posts.get(ref.id)
             if ref.note_text_omitted:
                 if post is None or post.note_text is None:
-                    raise RawPageError(
-                        f"raw page {message.raw_key} has no note for {ref.id}"
+                    missing(f"note for {ref.id}")
+                else:
+                    ref = replace(
+                        ref, note_text=post.note_text, note_text_omitted=False
                     )
-                ref = replace(ref, note_text=post.note_text, note_text_omitted=False)
             if ref.entities_omitted:
                 if post is None or post.entities is None:
-                    raise RawPageError(
-                        f"raw page {message.raw_key} has no entities for {ref.id}"
-                    )
-                ref = replace(ref, entities=post.entities, entities_omitted=False)
+                    missing(f"entities for {ref.id}")
+                else:
+                    ref = replace(ref, entities=post.entities, entities_omitted=False)
         restored.append(ref)
     tweet = message.tweet
     if tweet.entities_omitted:
@@ -280,5 +298,5 @@ def restore_omitted(s3: S3Client, bucket: str, message: TweetMessage) -> TweetMe
                 )
                 break
         else:
-            raise RawPageError(f"raw page {message.raw_key} has no tweet {tweet.id}")
+            missing(f"tweet {tweet.id}")
     return replace(message, tweet=tweet, referenced=tuple(restored))

@@ -761,7 +761,8 @@ def _merge_reference(
     if fresh.get("status") == "unavailable":
         merged["unavailable_since"] = kept.get("unavailable_since", fetched_at)
     keep_long = bool(kept.get("is_long_post")) and not fresh.get("is_long_post")
-    if keep_long or "text" not in fresh:
+    text_from_kept = keep_long or "text" not in fresh
+    if text_from_kept:
         for group in _TEXT_GROUPS:
             for name in group:
                 merged.pop(name, None)
@@ -772,10 +773,20 @@ def _merge_reference(
         for group in _TEXT_GROUPS:
             if not _has(merged, group):
                 _take(merged, kept, group)
-    if not _has(fresh, _ENTITIES_GROUP):
+    # Entities describe the text stored with them: they follow a text kept from the
+    # stored copy, and a stored preview's are not carried next to a fresh full text.
+    preview_under_full_text = bool(fresh.get("is_long_post")) and not kept.get(
+        "is_long_post"
+    )
+    if text_from_kept or (
+        not _has(fresh, _ENTITIES_GROUP) and not preview_under_full_text
+    ):
+        for name in _ENTITIES_GROUP:
+            merged.pop(name, None)
         _take(merged, kept, _ENTITIES_GROUP)
-        merged.pop("entities_omitted", None)
-        _take(merged, kept, ("entities_omitted",))
+        if _has(kept, _ENTITIES_GROUP):  # the marker goes only if they came
+            merged.pop("entities_omitted", None)
+            _take(merged, kept, ("entities_omitted",))
     for group in _OTHER_GROUPS:
         if not _has(merged, group):
             _take(merged, kept, group)
@@ -785,15 +796,25 @@ def _merge_reference(
 def _carry_references(
     item: dict[str, Any], previous: Mapping[str, Any], fetched_at: str
 ) -> None:
-    stored = {r.get("id"): r for r in previous.get("referenced_tweets") or ()}
+    stored: list[Mapping[str, Any]] = list(previous.get("referenced_tweets") or ())
     previous_fetched_at = previous.get("fetched_at", fetched_at)
     refs: list[dict[str, Any]] = item.get("referenced_tweets") or []
+    used: set[int] = set()
     for i, ref in enumerate(refs):
-        if (kept := stored.get(ref.get("id"))) is not None:
+        # The stored copy of the same post: the same type first, else any (the same
+        # post can be listed under another type later).
+        candidates = [
+            (j, r)
+            for j, r in enumerate(stored)
+            if j not in used and r.get("id") == ref.get("id")
+        ]
+        candidates.sort(key=lambda c: c[1].get("type") != ref.get("type"))
+        if candidates:
+            j, kept = candidates[0]
+            used.add(j)
             refs[i] = _merge_reference(ref, kept, fetched_at, previous_fetched_at)
-    listed = {r.get("id") for r in refs}
-    for kept in stored.values():
-        if kept.get("id") not in listed:
+    for j, kept in enumerate(stored):
+        if j not in used:
             refs.append(
                 {
                     **kept,
@@ -905,17 +926,32 @@ class TweetStore:
         The object is the text as a JSON string (strict UTF-8; characters SQS and UTF-8
         reject are escaped the same way as in the message), so any text, a lone
         surrogate included, reads back exactly with ``json.loads``. The write is
-        create-only: a redelivery, or a stale message for the same Tweet (same ID, same
-        text), finds it already there and writes nothing.
+        create-only and never overwrites. When the key is taken, the object is read
+        back: the same text (a redelivery, or a stale message for the same Tweet) is
+        already there and nothing is written; a different one (a preview stored here
+        earlier, say) sends this text to the sibling key ``<key>.<sha256[:16]>.json``
+        instead, so the pointer always names an object that holds this text.
         """
         key = key or self.text_key(message, field)
         text: str = item[field]
-        body = escape_disallowed_chars(json.dumps(text, ensure_ascii=False))
+        body = escape_disallowed_chars(json.dumps(text, ensure_ascii=False)).encode()
+        if not self._put_once(message, key, body):
+            held = self._s3.get_object(Bucket=self._bucket, Key=key)["Body"].read()
+            if held != body:
+                digest = hashlib.sha256(body).hexdigest()[:16]
+                key = f"{key.removesuffix('.json')}.{digest}.json"
+                self._put_once(message, key, body)  # same hash, same content
+        item[field] = _LONE_SURROGATE.sub("\ufffd", text[:TEXT_PREVIEW_CHARS])
+        item[f"{field}_truncated"] = True
+        item[f"{field}_s3_key"] = key
+
+    def _put_once(self, message: TweetMessage, key: str, body: bytes) -> bool:
+        """Create ``key`` unless it exists; whether this call created it."""
         try:
             self._s3.put_object(
                 Bucket=self._bucket,
                 Key=key,
-                Body=body.encode("utf-8"),
+                Body=body,
                 ContentType="application/json",
                 Metadata={"tweet-id": message.tweet.id},
                 IfNoneMatch="*",
@@ -923,9 +959,8 @@ class TweetStore:
         except ClientError as exc:
             if exc.response.get("Error", {}).get("Code") != "PreconditionFailed":
                 raise
-        item[field] = _LONE_SURROGATE.sub("\ufffd", text[:TEXT_PREVIEW_CHARS])
-        item[f"{field}_truncated"] = True
-        item[f"{field}_s3_key"] = key
+            return False
+        return True
 
     def _offload_entities(
         self,
@@ -942,18 +977,7 @@ class TweetStore:
         body = _json_text(holder[name])
         digest = hashlib.sha256(body.encode()).hexdigest()[:16]
         key = f"{key_base}.{digest}.json"
-        try:
-            self._s3.put_object(
-                Bucket=self._bucket,
-                Key=key,
-                Body=body.encode("utf-8"),
-                ContentType="application/json",
-                Metadata={"tweet-id": message.tweet.id},
-                IfNoneMatch="*",
-            )
-        except ClientError as exc:
-            if exc.response.get("Error", {}).get("Code") != "PreconditionFailed":
-                raise
+        self._put_once(message, key, body.encode("utf-8"))
         del holder[name]
         holder[f"{name}_s3_key"] = key
 
