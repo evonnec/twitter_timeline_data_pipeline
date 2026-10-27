@@ -119,9 +119,9 @@ class Settings:
             raise ConfigError(
                 f"{ENV_VARS['retention_days']} must be >= 0, got {self.retention_days}"
             )
-        if self.compliance_max_lookups < 1:
+        if self.compliance_max_lookups < 4:
             raise ConfigError(
-                f"{ENV_VARS['compliance_max_lookups']} must be >= 1, "
+                f"{ENV_VARS['compliance_max_lookups']} must be >= 4, "
                 f"got {self.compliance_max_lookups}"
             )
         if self.deletion_grace_hours < 0:

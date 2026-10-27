@@ -867,8 +867,8 @@ def test_the_sweep_stops_when_time_is_up_and_reports_a_failure(
     assert len(left) == 1
 
 
-def test_an_unfinished_raw_redaction_defers_the_copy_scrub(
-    aws: Aws, clock: Clock, caplog: pytest.LogCaptureFixture
+def test_an_unfinished_raw_redaction_defers_the_copy_scrub_to_a_later_run(
+    aws: Aws, clock: Clock
 ) -> None:
     quoting = put_quote(aws, 1, B)
     land(
@@ -876,14 +876,23 @@ def test_an_unfinished_raw_redaction_defers_the_copy_scrub(
         f"raw/{USER_ID}/dt=2026-10-12/h-1.json.gz",
         envelope(response(api_tweet(quoting))),
     )
-    caplog.set_level(logging.INFO)
     deferred = job(aws, Lookup({B: "deleted"}), clock, grace=timedelta(0))
     deferred._time_low = CallsThenTimeOut(1)  # type: ignore[method-assign]
 
     deferred.run(HANDLE)
 
-    assert "not yet redacted" in caplog.text
     assert entry(aws, quoting)["text"] == "what the original said"  # kept, retried
+    assert store_for(aws).active_units() == [f"copy#{USER_ID}"]
+
+    # The next run goes on with the batch and scrubs the holder: it does not have to
+    # wait for the walk to reach it again.
+    nothing_to_walk = job(aws, Lookup({B: "deleted"}), clock, grace=timedelta(0))
+    nothing_to_walk._walk = lambda tombstones: None  # type: ignore[method-assign]
+    nothing_to_walk.run(HANDLE)
+
+    assert nothing_to_walk.copies_scrubbed == 1
+    assert "text" not in entry(aws, quoting)
+    assert store_for(aws).active_units() == []
 
 
 def test_a_present_answer_at_the_confirmation_clears_the_tombstones(

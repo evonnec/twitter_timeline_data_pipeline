@@ -561,8 +561,13 @@ def test_raw_page_store_pages_round_trip_through_redaction(aws: Aws) -> None:
 
 def test_a_missing_quarantine_object_is_skipped(aws: Aws) -> None:
     assert (
-        store_for(aws)._drop_quarantined(
-            "quarantine/1/dt=2026-10-12/x.json", {"1"}, None, set(), set
+        store_for(aws)._quarantined(
+            "quarantine/1/dt=2026-10-12/x.json",
+            {"1"},
+            True,
+            set(),
+            set,
+            lambda key, pending: None,
         )
         == 0
     )

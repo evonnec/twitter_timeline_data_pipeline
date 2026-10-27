@@ -619,11 +619,8 @@ def test_tweets_table_has_ttl_on_expires_at_only_with_retention(
     template: Template,
 ) -> None:
     assert properties(template, "TweetsTable")["TimeToLiveSpecification"] == {
-        "Fn::If": [
-            "HasRetention",
-            {"AttributeName": "expires_at", "Enabled": True},
-            {"Ref": "AWS::NoValue"},
-        ]
+        "AttributeName": "expires_at",
+        "Enabled": {"Fn::If": ["HasRetention", True, False]},
     }
 
 
@@ -690,6 +687,8 @@ def test_compliance_function_has_its_own_schedule_and_settings(
     assert props["EventInvokeConfig"]["MaximumRetryAttempts"] == 0
     env = env_of(template, "ComplianceFunction")
     assert env["COMPLIANCE_MAX_LOOKUPS"] == {"Ref": "ComplianceMaxLookups"}
+    assert env["RETENTION_DAYS"] == {"Ref": "RetentionDays"}
+    assert parameters["ComplianceMaxLookups"]["MinValue"] == 4
     assert env["DELETION_GRACE_HOURS"] == {"Ref": "DeletionGraceHours"}
     assert env["MEDIA_BUCKET"] == {"Ref": "MediaBucket"}
     log_group = resource(template, "ComplianceFunctionLogGroup")
@@ -726,9 +725,12 @@ def test_compliance_function_permissions(template: Template) -> None:
         json_key({"Fn::Sub": f"${{MediaBucket.Arn}}/{prefix}/*"})
         for prefix in ("raw", "quarantine")
     ]
-    # the only write it has is the raw-page rewrite
+    # the only writes it has are the rewrites without a deleted post's copy
     writes = by_actions[frozenset({"s3:PutObject"})]
-    assert writes["Resource"] == {"Fn::Sub": "${MediaBucket.Arn}/raw/*"}
+    assert writes["Resource"] == [
+        {"Fn::Sub": "${MediaBucket.Arn}/raw/*"},
+        {"Fn::Sub": "${MediaBucket.Arn}/quarantine/*"},
+    ]
     listing = by_actions[frozenset({"s3:ListBucketVersions", "s3:ListBucket"})]
     assert listing["Condition"]["StringLike"]["s3:prefix"] == [
         "media/*",
